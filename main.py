@@ -463,22 +463,18 @@ async def create_checkout(api_key: str = Security(verify_api_key)):
     payload = {
         "data": {
             "type": "checkouts",
-            "attributes": {
-                "checkout_options": {
-                    "embed": False
-                }
-            },
+            "attributes": {},
             "relationships": {
                 "store": {
                     "data": {
                         "type": "stores",
-                        "id": os.getenv("LEMONSQUEEZY_STORE_ID")
+                        "id": str(os.getenv("LEMONSQUEEZY_STORE_ID"))
                     }
                 },
                 "variant": {
                     "data": {
                         "type": "variants",
-                        "id": os.getenv("LEMONSQUEEZY_PRODUCT_ID")
+                        "id": str(os.getenv("LEMONSQUEEZY_PRODUCT_ID"))
                     }
                 }
             }
@@ -493,5 +489,10 @@ async def create_checkout(api_key: str = Security(verify_api_key)):
         )
     
     data = response.json()
+    print("Lemon Squeezy response:", data)  # shows in Railway logs
+    
+    if "data" not in data:
+        raise HTTPException(status_code=400, detail=str(data))
+    
     checkout_url = data["data"]["attributes"]["url"]
     return {"url": checkout_url}
