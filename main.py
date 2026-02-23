@@ -76,7 +76,7 @@ def root():
 # Example: /products?min_score=65&trend_phase=rising&limit=10
 # ==============================================================================
 @app.get("/products")
-async def get_products(api_key: str = Security(verify_api_key)):
+async def get_products(
     min_score:   int            = Query(default=0,   ge=0, le=100),
     max_score:   int            = Query(default=100, ge=0, le=100),
     trend_phase: Optional[str]  = Query(default=None),
@@ -85,7 +85,8 @@ async def get_products(api_key: str = Security(verify_api_key)):
     max_price:   Optional[float]= Query(default=None),
     limit:       int            = Query(default=20,  ge=1, le=100),
     offset:      int            = Query(default=0,   ge=0),
-
+    api_key:     str            = Security(verify_api_key),
+):
     try:
         query = (
             supabase.table("tiktok_products")
@@ -97,7 +98,6 @@ async def get_products(api_key: str = Security(verify_api_key)):
             .range(offset, offset + limit - 1)
         )
 
-        # Apply optional filters
         if trend_phase:
             query = query.eq("trend_phase", trend_phase)
         if category:
@@ -119,7 +119,6 @@ async def get_products(api_key: str = Security(verify_api_key)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ==============================================================================
 # ENDPOINT 3 — Get Single Product Detail
