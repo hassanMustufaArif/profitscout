@@ -5,6 +5,7 @@ Run with:  uvicorn main:app --reload
 API Docs:  http://127.0.0.1:8000/docs
 """
 import os
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from typing import Optional
+
 
 load_dotenv()
 
@@ -24,7 +26,9 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # open for now, restrict after launch
+    allow_origins=[
+        "*",  # or replace with your specific Lovable URL
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -447,3 +451,47 @@ def get_suppliers(product_id: str, api_key: str = Security(verify_api_key)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+
+@app.post("/create-checkout")
+async def create_checkout(api_key: str = Security(verify_api_key)):
+    headers = {
+        "Authorization": f"Bearer {os.getenv('LEMONSQUEEZY_API_KEY')}",
+        "Content-Type": "application/vnd.api+json",
+        "Accept": "application/vnd.api+json",
+    }
+    
+    payload = {
+        "data": {
+            "type": "checkouts",
+            "attributes": {
+                "checkout_options": {
+                    "embed": False
+                }
+            },
+            "relationships": {
+                "store": {
+                    "data": {
+                        "type": "stores",
+                        "id": os.getenv("LEMONSQUEEZY_STORE_ID")
+                    }
+                },
+                "variant": {
+                    "data": {
+                        "type": "variants",
+                        "id": os.getenv("LEMONSQUEEZY_PRODUCT_ID")
+                    }
+                }
+            }
+        }
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.lemonsqueezy.com/v1/checkouts",
+            json=payload,
+            headers=headers
+        )
+    
+    data = response.json()
+    checkout_url = data["data"]["attributes"]["url"]
+    return {"url": checkout_url}
