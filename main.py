@@ -8,6 +8,7 @@ import os
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timezone, timedelta
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -451,9 +452,49 @@ from supplier_engine import find_suppliers
 # ENDPOINT 8 — Find Suppliers for a Product
 # GET /products/{product_id}/suppliers
 # ==============================================================================
+from datetime import datetime, timezone, timedelta
+
 @app.get("/products/{product_id}/suppliers")
-def get_suppliers(product_id: str, api_key: str = Security(verify_api_key)):
+async def get_suppliers(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
     try:
+        # Check user plan
+        plan = await get_user_plan(request)
+
+        # Free users: 1 supplier lookup per day
+        if plan != "pro":
+            # Get user email from token
+            auth_header = request.headers.get("Authorization")
+            user_email = "anonymous"
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.replace("Bearer ", "")
+                try:
+                    user_response = supabase.auth.get_user(token)
+                    user_email = user_response.user.email
+                except Exception:
+                    pass
+
+            # Check lookups in last 24 hours
+            since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            lookups = (
+                supabase.table("supplier_lookups")
+                .select("id")
+                .eq("user_email", user_email)
+                .gte("looked_up_at", since)
+                .execute()
+            )
+
+            if len(lookups.data) >= 1:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Free plan allows 1 supplier search per day. Upgrade to Pro for unlimited searches."
+                )
+
+            # Log this lookup
+            supabase.table("supplier_lookups").insert({
+                "user_email": user_email,
+                "product_id": product_id
+            }).execute()
+
         # Get product from Supabase
         product_result = (
             supabase.table("tiktok_products")
@@ -481,56 +522,7 @@ def get_suppliers(product_id: str, api_key: str = Security(verify_api_key)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
 
-from pydantic import BaseModel
-
-class CheckoutRequest(BaseModel):
-    email: str
-
-@app.post("/create-checkout")
-async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Security(verify_api_key)):
-    headers = {
-        "Authorization": f"Bearer {os.getenv('LEMONSQUEEZY_API_KEY')}",
-        "Content-Type": "application/vnd.api+json",
-        "Accept": "application/vnd.api+json",
-    }
-    
-    payload = {
-        "data": {
-            "type": "checkouts",
-            "attributes": {
-                "checkout_data": {
-                    "email": checkout_data.email,
-                    "custom": {
-                        "email": checkout_data.email
-                    }
-                }
-            },
-            "relationships": {
-                "store": {
-                    "data": {
-                        "type": "stores",
-                        "id": str(os.getenv("LEMONSQUEEZY_STORE_ID"))
-                    }
-                },
-                "variant": {
-                    "data": {
-                        "type": "variants",
-                        "id": str(os.getenv("LEMONSQUEEZY_PRODUCT_ID"))
-                    }
-                }
-            }
-        }
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.lemonsqueezy.com/v1/checkouts",
-            json=payload,
-            headers=headers
-        )
-    
 LEMONSQUEEZY_WEBHOOK_SECRET = os.getenv("LEMONSQUEEZY_WEBHOOK_SECRET")
 
 @app.post("/lemonsqueezy-webhook")
