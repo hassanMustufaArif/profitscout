@@ -6,13 +6,16 @@ API Docs:  http://127.0.0.1:8000/docs
 """
 import os
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Security
+from fastapi import FastAPI, HTTPException, Query, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from typing import Optional
+import hmac
+import hashlib
+import json
 
 
 load_dotenv()
@@ -451,8 +454,13 @@ def get_suppliers(product_id: str, api_key: str = Security(verify_api_key)):
         raise HTTPException(status_code=500, detail=str(e))
     
 
+from pydantic import BaseModel
+
+class CheckoutRequest(BaseModel):
+    email: str
+
 @app.post("/create-checkout")
-async def create_checkout(api_key: str = Security(verify_api_key)):
+async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Security(verify_api_key)):
     headers = {
         "Authorization": f"Bearer {os.getenv('LEMONSQUEEZY_API_KEY')}",
         "Content-Type": "application/vnd.api+json",
@@ -462,7 +470,14 @@ async def create_checkout(api_key: str = Security(verify_api_key)):
     payload = {
         "data": {
             "type": "checkouts",
-            "attributes": {},
+            "attributes": {
+                "checkout_data": {
+                    "email": checkout_data.email,
+                    "custom": {
+                        "email": checkout_data.email
+                    }
+                }
+            },
             "relationships": {
                 "store": {
                     "data": {
@@ -487,6 +502,63 @@ async def create_checkout(api_key: str = Security(verify_api_key)):
             headers=headers
         )
     
+LEMONSQUEEZY_WEBHOOK_SECRET = os.getenv("LEMONSQUEEZY_WEBHOOK_SECRET")
+
+@app.post("/lemonsqueezy-webhook")
+async def lemonsqueezy_webhook(request: Request):
+    # Step 1: Get raw body and verify signature
+    body = await request.body()
+    signature = request.headers.get("x-signature")
+    
+    if not signature:
+        raise HTTPException(status_code=401, detail="No signature")
+    
+    # Verify HMAC signature
+    digest = hmac.new(
+        LEMONSQUEEZY_WEBHOOK_SECRET.encode(),
+        body,
+        hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(digest, signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    
+    # Step 2: Parse the event
+    payload = json.loads(body)
+    event_name = payload.get("meta", {}).get("event_name")
+    custom_data = payload.get("meta", {}).get("custom_data", {})
+    user_email = custom_data.get("email")
+    
+    # Also try to get email from attributes
+    if not user_email:
+        user_email = payload.get("data", {}).get("attributes", {}).get("user_email")
+    
+    if not user_email:
+        print(f"Webhook {event_name}: no email found in payload")
+        return {"status": "ok"}
+    
+    # Step 3: Update user plan based on event
+    if event_name == "subscription_created":
+        # Upgrade to pro
+        supabase.table("users").update({"plan": "pro"}).eq("email", user_email).execute()
+        print(f"Upgraded {user_email} to pro")
+    
+    elif event_name in ["subscription_cancelled", "subscription_expired"]:
+        # Downgrade to free
+        supabase.table("users").update({"plan": "free"}).eq("email", user_email).execute()
+        print(f"Downgraded {user_email} to free")
+    
+    elif event_name == "subscription_updated":
+        # Check if subscription is active or not
+        status = payload.get("data", {}).get("attributes", {}).get("status")
+        if status == "active":
+            supabase.table("users").update({"plan": "pro"}).eq("email", user_email).execute()
+        elif status in ["cancelled", "expired", "past_due"]:
+            supabase.table("users").update({"plan": "free"}).eq("email", user_email).execute()
+        print(f"Updated {user_email} plan based on status: {status}")
+    
+    return {"status": "ok"}
+
     data = response.json()
     print("Lemon Squeezy response:", data)  # shows in Railway logs
     
