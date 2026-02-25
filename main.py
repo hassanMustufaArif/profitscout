@@ -45,7 +45,26 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
         raise HTTPException(status_code=403)
     return api_key
 
-
+async def get_user_plan(request: Request):
+    """Extract user email from Supabase auth token and return their plan."""
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return "free"
+    
+    token = auth_header.replace("Bearer ", "")
+    try:
+        # Verify token with Supabase to get user
+        user_response = supabase.auth.get_user(token)
+        email = user_response.user.email
+        
+        # Look up plan in users table
+        result = supabase.table("users").select("plan").eq("email", email).execute()
+        if result.data and len(result.data) > 0:
+            return result.data[0].get("plan", "free")
+        return "free"
+    except Exception:
+        return "free"
+    
 
 # ==============================================================================
 # ENDPOINT 1 — Health Check
@@ -80,6 +99,7 @@ def root():
 # ==============================================================================
 @app.get("/products")
 async def get_products(
+    request:     Request,
     min_score:   int            = Query(default=0,   ge=0, le=100),
     max_score:   int            = Query(default=100, ge=0, le=100),
     trend_phase: Optional[str]  = Query(default=None),
@@ -91,6 +111,14 @@ async def get_products(
     api_key:     str            = Security(verify_api_key),
 ):
     try:
+        # Check user plan
+        plan = await get_user_plan(request)
+        
+        # Free users: max 10 products, no offset
+        if plan != "pro":
+            limit = min(limit, 10)
+            offset = 0
+
         query = (
             supabase.table("tiktok_products")
             .select("*")
@@ -117,6 +145,7 @@ async def get_products(
             "count":   len(result.data),
             "offset":  offset,
             "limit":   limit,
+            "plan":    plan,
             "products": result.data
         }
 
