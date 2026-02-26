@@ -1,22 +1,16 @@
 """
-ProfitScout — Supplier Matching Engine
-=======================================
-Finds the best Alibaba/AliExpress suppliers for a TikTok viral product.
-Now includes automatic profit calculation for each supplier.
-
-Flow:
-1. Takes a product title from TikTok
-2. Uses GPT-4o to normalize the title (removes marketing language)
-3. Searches Alibaba via Apify actor
-4. Uses GPT-4o to rank and score suppliers
-5. Calculates net profit for each supplier after ALL TikTok fees
-6. Saves top 3 suppliers to Supabase with profit data
+ProfitScout — Supplier Matching Engine v2
+==========================================
+Multi-platform supplier search with credit system.
+Searches Alibaba, AliExpress, and Amazon individually.
+Each search costs 1 credit.
 """
 
 from apify_client import ApifyClient
 from openai import OpenAI
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 import os
 import json
 
@@ -32,8 +26,99 @@ supabase: Client = create_client(
 
 
 # ==============================================================================
-# PROFIT CALCULATOR — Calculates net profit after ALL TikTok fees
-# Uses the same formula as POST /calculate-profit endpoint
+# CREDIT SYSTEM
+# ==============================================================================
+def check_credits(user_email: str) -> dict:
+    """Check user's remaining credits."""
+    try:
+        result = supabase.table("user_credits").select("*").eq("user_email", user_email).execute()
+        if not result.data:
+            return {"credits_remaining": 0, "plan": "free", "credits_total": 0, "credits_used": 0}
+        
+        record = result.data[0]
+        now = datetime.now(timezone.utc)
+        period_end = datetime.fromisoformat(record["period_end"].replace("Z", "+00:00"))
+        
+        # If period expired, reset credits
+        if now > period_end:
+            new_total = 50 if record["plan"] == "pro" else 120 if record["plan"] == "ultimate" else 0
+            supabase.table("user_credits").update({
+                "credits_used": 0,
+                "credits_total": new_total,
+                "period_start": now.isoformat(),
+                "period_end": (now.replace(day=1) + __import__('datetime').timedelta(days=32)).replace(day=1).isoformat()
+            }).eq("user_email", user_email).execute()
+            return {"credits_remaining": new_total, "plan": record["plan"], "credits_total": new_total, "credits_used": 0}
+        
+        remaining = record["credits_total"] - record["credits_used"]
+        return {
+            "credits_remaining": max(remaining, 0),
+            "plan": record["plan"],
+            "credits_total": record["credits_total"],
+            "credits_used": record["credits_used"]
+        }
+    except Exception as e:
+        print(f"Credit check error: {e}")
+        return {"credits_remaining": 0, "plan": "free", "credits_total": 0, "credits_used": 0}
+
+
+def deduct_credit(user_email: str, product_id: str, platform: str) -> bool:
+    """Deduct 1 credit and log the usage. Returns True if successful."""
+    try:
+        # Increment credits_used
+        result = supabase.table("user_credits").select("credits_used").eq("user_email", user_email).execute()
+        if not result.data:
+            return False
+        
+        current_used = result.data[0]["credits_used"]
+        supabase.table("user_credits").update({
+            "credits_used": current_used + 1
+        }).eq("user_email", user_email).execute()
+        
+        # Log the usage
+        supabase.table("credit_logs").insert({
+            "user_email": user_email,
+            "product_id": product_id,
+            "platform": platform,
+            "credits_deducted": 1
+        }).execute()
+        
+        return True
+    except Exception as e:
+        print(f"Credit deduction error: {e}")
+        return False
+
+
+def initialize_credits(user_email: str, plan: str):
+    """Create or update credits when user subscribes."""
+    credits = 50 if plan == "pro" else 120 if plan == "ultimate" else 0
+    now = datetime.now(timezone.utc)
+    
+    try:
+        existing = supabase.table("user_credits").select("id").eq("user_email", user_email).execute()
+        if existing.data:
+            supabase.table("user_credits").update({
+                "plan": plan,
+                "credits_total": credits,
+                "credits_used": 0,
+                "period_start": now.isoformat(),
+                "period_end": (now.replace(day=1) + __import__('datetime').timedelta(days=32)).replace(day=1).isoformat()
+            }).eq("user_email", user_email).execute()
+        else:
+            supabase.table("user_credits").insert({
+                "user_email": user_email,
+                "plan": plan,
+                "credits_total": credits,
+                "credits_used": 0,
+                "period_start": now.isoformat(),
+                "period_end": (now.replace(day=1) + __import__('datetime').timedelta(days=32)).replace(day=1).isoformat()
+            }).execute()
+    except Exception as e:
+        print(f"Credit initialization error: {e}")
+
+
+# ==============================================================================
+# PROFIT CALCULATOR
 # ==============================================================================
 def calculate_profit(
     sale_price: float,
@@ -46,21 +131,11 @@ def calculate_profit(
     ad_spend_per_unit: float = 0.0,
     is_new_seller: bool = False,
 ) -> dict:
-    """
-    Calculate exact net profit after every TikTok Shop fee.
-    Returns profit amount, margin %, and rating.
-    """
-    # TikTok Referral Fee: 6% standard, 3% for new sellers (first 30 days)
     referral_rate = 0.03 if is_new_seller else 0.06
     referral_fee = sale_price * referral_rate
-
-    # Transaction Fee: 2.9% of sale price
     transaction_fee = sale_price * 0.029
-
-    # Affiliate Commission
     affiliate_commission = sale_price * (affiliate_commission_rate / 100)
 
-    # FBT Fulfillment Fee (based on weight)
     if fbt_enabled:
         if product_weight_oz <= 8:
             fbt_fee = 3.15
@@ -75,18 +150,12 @@ def calculate_profit(
     else:
         fbt_fee = 0.0
 
-    # Return Buffer
     return_buffer = sale_price * (return_rate_pct / 100)
-
-    # Total Costs
     total_fees = referral_fee + transaction_fee + affiliate_commission + fbt_fee + inbound_shipping + return_buffer + ad_spend_per_unit
     total_cost = cogs + total_fees
-
-    # Net Profit
     net_profit = sale_price - total_cost
     margin_pct = (net_profit / sale_price * 100) if sale_price > 0 else 0
 
-    # Rating
     if margin_pct >= 35:
         rating = "green"
         label = "Highly Profitable"
@@ -112,7 +181,6 @@ def calculate_profit(
         "fbt_fee": round(fbt_fee, 2),
         "inbound_shipping": round(inbound_shipping, 2),
         "return_buffer": round(return_buffer, 2),
-        "ad_spend": round(ad_spend_per_unit, 2),
         "total_fees": round(total_fees, 2),
         "net_profit": round(net_profit, 2),
         "margin_pct": round(margin_pct, 1),
@@ -122,20 +190,19 @@ def calculate_profit(
 
 
 # ==============================================================================
-# STEP 1 — Normalize Product Title
+# STEP 1 — Normalize Product Title (using GPT-4o-mini for cost savings)
 # ==============================================================================
 def normalize_product_title(raw_title: str) -> str:
     print(f"  Normalizing title: {raw_title[:60]}...")
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
                     "content": """You are a product search expert for Alibaba sourcing.
-Your job is to convert TikTok product titles into simple, clean search keywords
-that will find matching products on Alibaba.
+Convert TikTok product titles into simple, clean search keywords for Alibaba.
 
 Rules:
 - Remove brand names, shop names in brackets like [Brand Name]
@@ -173,8 +240,9 @@ Portable Mini Face Massager Roller Skincare Tool 2024 → face massager roller""
 
 
 # ==============================================================================
-# STEP 2 — Search Alibaba via Apify
+# STEP 2 — Platform-Specific Search Functions
 # ==============================================================================
+
 def search_alibaba(keyword: str, max_results: int = 15) -> list:
     print(f"  Searching Alibaba for: '{keyword}'...")
 
@@ -184,8 +252,6 @@ def search_alibaba(keyword: str, max_results: int = 15) -> list:
         f"spm=a2700.galleryofferlist.the-new-header_fy23_pc_search_bar.keydown__Enter"
         f"&tab=all&SearchText={keyword_encoded}&has4Tab=true"
     )
-
-    print(f"  Search URL: {search_url}")
 
     try:
         run = apify.actor("shareze001/scrape-alibaba-products-by-keywords").call(
@@ -204,14 +270,13 @@ def search_alibaba(keyword: str, max_results: int = 15) -> list:
         print(f"  Found {len(results)} Alibaba results")
 
         if not results:
-            print("  Primary actor returned 0 — trying backup actor...")
+            print("  Primary actor returned 0 — trying backup...")
             results = search_alibaba_backup(keyword, max_results)
 
         return results
 
     except Exception as e:
-        print(f"  Primary Alibaba actor error: {e}")
-        print("  Trying backup actor...")
+        print(f"  Primary Alibaba error: {e}")
         return search_alibaba_backup(keyword, max_results)
 
 
@@ -228,17 +293,14 @@ def search_alibaba_backup(keyword: str, max_results: int = 15) -> list:
         for item in apify.dataset(run["defaultDatasetId"]).iterate_items():
             results.append(item)
 
-        print(f"  Backup actor found {len(results)} results")
+        print(f"  Backup found {len(results)} results")
         return results
 
     except Exception as e:
-        print(f"  Backup Alibaba actor error: {e}")
+        print(f"  Backup error: {e}")
         return []
 
 
-# ==============================================================================
-# STEP 2B — Search AliExpress via Apify (backup / low MOQ option)
-# ==============================================================================
 def search_aliexpress(keyword: str, max_results: int = 10) -> list:
     print(f"  Searching AliExpress for: '{keyword}'...")
 
@@ -247,7 +309,8 @@ def search_aliexpress(keyword: str, max_results: int = 10) -> list:
             run_input={
                 "searchQuery": keyword,
                 "maxItems":    max_results,
-            }
+            },
+            timeout_secs=120
         )
 
         results = []
@@ -258,41 +321,86 @@ def search_aliexpress(keyword: str, max_results: int = 10) -> list:
         return results
 
     except Exception as e:
-        print(f"  AliExpress search error: {e}")
+        print(f"  AliExpress error: {e}")
+        return []
+
+
+def search_amazon(keyword: str, max_results: int = 10) -> list:
+    print(f"  Searching Amazon for: '{keyword}'...")
+
+    try:
+        run = apify.actor("junglee/amazon-crawler").call(
+            run_input={
+                "keyword": keyword,
+                "maxItems": max_results,
+                "country": "US",
+            },
+            timeout_secs=120
+        )
+
+        results = []
+        for item in apify.dataset(run["defaultDatasetId"]).iterate_items():
+            results.append(item)
+
+        print(f"  Found {len(results)} Amazon results")
+        return results
+
+    except Exception as e:
+        print(f"  Amazon error: {e}")
         return []
 
 
 # ==============================================================================
-# STEP 3 — Rank and Score Suppliers with GPT-4o
+# STEP 3 — Rank Suppliers with GPT-4o
 # ==============================================================================
 def rank_suppliers(
-    raw_suppliers:  list,
-    tiktok_price:   float,
-    product_title:  str
+    raw_suppliers: list,
+    tiktok_price: float,
+    product_title: str,
+    platform: str = "alibaba"
 ) -> list:
-    print(f"  Ranking {len(raw_suppliers)} suppliers with GPT-4o...")
+    print(f"  Ranking {len(raw_suppliers)} {platform} suppliers with GPT-4o...")
 
     if not raw_suppliers:
         return []
 
     supplier_summaries = []
     for i, s in enumerate(raw_suppliers[:15]):
-        price_obj  = s.get("price") or {}
-        ladder     = price_obj.get("productLadderPrices") or []
-        unit_price = float(ladder[0].get("dollarPrice") or 0) if ladder else 0
-
-        supplier_info = s.get("supplierInfo") or {}
+        if platform == "alibaba":
+            price_obj  = s.get("price") or {}
+            ladder     = price_obj.get("productLadderPrices") or []
+            unit_price = float(ladder[0].get("dollarPrice") or 0) if ladder else 0
+            supplier_info = s.get("supplierInfo") or {}
+            name = supplier_info.get("name") or "Unknown"
+            years = supplier_info.get("joinYears") or 0
+            moq = s.get("moq") or 1
+            title = s.get("subject") or ""
+        elif platform == "aliexpress":
+            unit_price = float(s.get("price") or s.get("salePrice") or 0)
+            name = s.get("sellerName") or s.get("storeName") or "Unknown"
+            years = 0
+            moq = 1
+            title = s.get("title") or s.get("name") or ""
+        elif platform == "amazon":
+            price_str = str(s.get("price") or s.get("priceCurrency") or "0")
+            price_str = price_str.replace("$", "").replace(",", "").strip()
+            try:
+                unit_price = float(price_str)
+            except:
+                unit_price = 0
+            name = s.get("sellerName") or s.get("brand") or "Amazon Seller"
+            years = 0
+            moq = 1
+            title = s.get("title") or s.get("name") or ""
 
         supplier_summaries.append({
-            "index":         i,
-            "name":          supplier_info.get("name") or "Unknown",
-            "product_title": s.get("subject") or "",
-            "price_min":     unit_price,
-            "price_max":     unit_price,
-            "moq":           s.get("moq") or 1,
-            "rating":        0,
-            "years":         supplier_info.get("joinYears") or 0,
-            "transactions":  0,
+            "index": i,
+            "name": name,
+            "product_title": title[:100],
+            "price": unit_price,
+            "moq": moq,
+            "years": years,
+            "platform": platform,
         })
 
     try:
@@ -301,37 +409,32 @@ def rank_suppliers(
             messages=[
                 {
                     "role": "system",
-                    "content": f"""You are an expert Alibaba sourcing agent helping a TikTok Shop seller find the best supplier.
+                    "content": f"""You are an expert sourcing agent helping a TikTok Shop seller.
 
 TikTok Sale Price: ${tiktok_price}
-Product Looking For: {product_title}
+Product: {product_title}
+Platform: {platform}
 
-Rank these suppliers and return the TOP 3 best ones.
+Rank these suppliers and return TOP 3.
 
-Ranking criteria (in order of importance):
-1. PROFITABILITY FIRST: The unit cost MUST be low enough to be profitable after TikTok fees.
-   TikTok takes roughly 30-35% of sale price in fees (referral 6%, transaction 2.9%, affiliate 15%, fulfillment ~$3.15, shipping $1.20, returns 8%).
-   So unit cost must be UNDER {round(tiktok_price * 0.40, 2)} to have any margin.
-   Ideal unit cost is UNDER {round(tiktok_price * 0.25, 2)} for a healthy 35%+ margin.
-2. Supplier trust: higher years in business = better
-3. MOQ feasibility: lower MOQ = better for new sellers (under 50 units ideal)
-4. Product match: does the title actually match what we need?
+Ranking criteria:
+1. PROFITABILITY: unit cost must be under ${round(tiktok_price * 0.40, 2)} for profit after TikTok fees.
+   Ideal cost under ${round(tiktok_price * 0.25, 2)} for 35%+ margin.
+2. Product match: title must match what we need
+3. Trust: more years = better (for Alibaba)
+4. MOQ: lower = better for new sellers
 
-REJECT suppliers where unit cost is above {round(tiktok_price * 0.50, 2)} — they are guaranteed unprofitable.
-If all suppliers are too expensive, still return top 3 cheapest but note they are likely unprofitable.
-
-Return ONLY a JSON array of top 3 suppliers in this exact format:
+Return ONLY a JSON array of top 3:
 [
   {{
     "index": 0,
-    "rank_reason": "Best overall — lowest price with good trust",
+    "rank_reason": "Lowest price with good match",
     "whitelabel_likely": true,
     "recommendation_tag": "Best Value",
     "profitable": true
-  }},
-  ...
+  }}
 ]
-Do not include any text outside the JSON array."""
+No text outside JSON."""
                 },
                 {
                     "role": "user",
@@ -344,7 +447,7 @@ Do not include any text outside the JSON array."""
 
         content = response.choices[0].message.content.strip()
         content = content.replace("```json", "").replace("```", "").strip()
-        ranked  = json.loads(content)
+        ranked = json.loads(content)
         print(f"  GPT ranked top {len(ranked)} suppliers")
         return ranked
 
@@ -354,16 +457,117 @@ Do not include any text outside the JSON array."""
 
 
 # ==============================================================================
-# STEP 4 — Save Suppliers to Supabase (now with profit data)
+# STEP 4 — Extract & Save Suppliers (platform-aware)
 # ==============================================================================
+def extract_supplier_data(raw: dict, platform: str) -> dict:
+    """Extract supplier fields based on platform."""
+
+    if platform == "alibaba":
+        product_title = raw.get("subject") or ""
+        supplier_info = raw.get("supplierInfo") or {}
+        supplier_name = supplier_info.get("name") or "Unknown Supplier"
+        years = supplier_info.get("joinYears") or 0
+        supplier_url = raw.get("url") or supplier_info.get("homeUrl") or ""
+
+        moq_raw = raw.get("moq") or "1"
+        try:
+            moq = int(str(moq_raw).replace(",", "").strip())
+        except:
+            moq = 1
+
+        price_obj = raw.get("price") or {}
+        ladder = price_obj.get("productLadderPrices") or []
+
+        if ladder:
+            prices = [float(tier.get("dollarPrice", 0)) for tier in ladder if tier.get("dollarPrice")]
+            price_min = min(prices) if prices else 0
+            price_max = max(prices) if prices else 0
+        else:
+            range_prices = price_obj.get("productRangePrices") or {}
+            price_min = float(range_prices.get("dollarPriceRangeLow") or 0)
+            price_max = float(range_prices.get("dollarPriceRangeHigh") or price_min)
+
+        media_items = raw.get("mediaItems") or []
+        image_url = ""
+        if media_items:
+            image_url_obj = media_items[0].get("imageUrl") or {}
+            image_url = image_url_obj.get("normal") or image_url_obj.get("big") or ""
+
+        basic_props = raw.get("productBasicProperties") or []
+        whitelabel = False
+        for prop in basic_props:
+            if prop.get("attrName") == "brand name":
+                val = str(prop.get("attrValue") or "").upper()
+                if "OEM" in val or "ODM" in val or "CUSTOM" in val:
+                    whitelabel = True
+
+        shipping_days = 20
+        shipping_cost = 1.50
+
+    elif platform == "aliexpress":
+        product_title = raw.get("title") or raw.get("name") or ""
+        supplier_name = raw.get("sellerName") or raw.get("storeName") or "AliExpress Seller"
+        years = 0
+        supplier_url = raw.get("url") or raw.get("productUrl") or ""
+        moq = 1
+
+        price_val = raw.get("price") or raw.get("salePrice") or 0
+        try:
+            price_min = float(str(price_val).replace("$", "").replace(",", "").strip())
+        except:
+            price_min = 0
+        price_max = price_min
+
+        image_url = raw.get("imageUrl") or raw.get("image") or ""
+        whitelabel = False
+        shipping_days = 10
+        shipping_cost = 0
+
+    elif platform == "amazon":
+        product_title = raw.get("title") or raw.get("name") or ""
+        supplier_name = raw.get("sellerName") or raw.get("brand") or "Amazon Seller"
+        years = 0
+        supplier_url = raw.get("url") or raw.get("productUrl") or ""
+        moq = 1
+
+        price_val = raw.get("price") or 0
+        try:
+            price_min = float(str(price_val).replace("$", "").replace(",", "").strip())
+        except:
+            price_min = 0
+        price_max = price_min
+
+        image_url = raw.get("imageUrl") or raw.get("image") or raw.get("thumbnailImage") or ""
+        whitelabel = False
+        shipping_days = 2
+        shipping_cost = 0
+
+    else:
+        return {}
+
+    return {
+        "product_title": product_title[:500],
+        "supplier_name": supplier_name,
+        "years": years,
+        "supplier_url": supplier_url,
+        "moq": moq,
+        "price_min": round(price_min, 2),
+        "price_max": round(price_max, 2),
+        "image_url": image_url,
+        "whitelabel": whitelabel,
+        "shipping_days": shipping_days,
+        "shipping_cost": shipping_cost,
+    }
+
+
 def save_suppliers(
-    product_id:    str,
+    product_id: str,
     raw_suppliers: list,
-    ranked:        list,
-    tiktok_price:  float,
-    platform:      str = "alibaba"
+    ranked: list,
+    tiktok_price: float,
+    platform: str = "alibaba"
 ) -> list:
-    print(f"  Saving top {len(ranked)} suppliers to Supabase...")
+    print(f"  Saving top {len(ranked)} {platform} suppliers...")
 
     saved = []
     for rank_info in ranked:
@@ -372,167 +576,168 @@ def save_suppliers(
             continue
 
         raw = raw_suppliers[idx]
+        data = extract_supplier_data(raw, platform)
 
-        # ── Extract fields ─────────────────────────────────────────────────
-        product_title = raw.get("subject") or ""
-        supplier_info = raw.get("supplierInfo") or {}
-        supplier_name = supplier_info.get("name") or "Unknown Supplier"
-        years         = supplier_info.get("joinYears") or 0
-        supplier_url  = raw.get("url") or supplier_info.get("homeUrl") or ""
+        if not data:
+            continue
 
-        moq_raw = raw.get("moq") or "1"
-        try:
-            moq = int(str(moq_raw).replace(",", "").strip())
-        except:
-            moq = 1
-
-        price_obj   = raw.get("price") or {}
-        ladder      = price_obj.get("productLadderPrices") or []
-
-        if ladder:
-            price_min = float(ladder[-1].get("dollarPrice") or ladder[0].get("dollarPrice") or 0)
-            price_max = float(ladder[0].get("dollarPrice") or price_min)
-        else:
-            range_prices = price_obj.get("productRangePrices") or {}
-            price_min = float(range_prices.get("dollarPriceRangeLow") or 0)
-            price_max = float(range_prices.get("dollarPriceRangeHigh") or price_min)
-
-        media_items = raw.get("mediaItems") or []
-        image_url   = ""
-        if media_items:
-            image_url_obj = media_items[0].get("imageUrl") or {}
-            image_url = image_url_obj.get("normal") or image_url_obj.get("big") or ""
-
-        basic_props = raw.get("productBasicProperties") or []
-        whitelabel  = False
-        for prop in basic_props:
-            if prop.get("attrName") == "brand name":
-                val = str(prop.get("attrValue") or "").upper()
-                if "OEM" in val or "ODM" in val or "CUSTOM" in val:
-                    whitelabel = True
-
-        # ── Calculate profit using lowest supplier cost ────────────────────
+        # Calculate profit
+        cogs = data["price_min"] if data["price_min"] > 0 else data["price_max"]
         profit_data = calculate_profit(
             sale_price=tiktok_price,
-            cogs=price_min if price_min > 0 else price_max,
+            cogs=cogs,
+            inbound_shipping=data["shipping_cost"],
         )
 
         supplier_record = {
             "tiktok_product_id":       product_id,
             "platform":                platform,
-            "supplier_name":           supplier_name,
-            "product_title":           product_title[:500],
-            "unit_cost_min":           round(price_min, 2),
-            "unit_cost_max":           round(price_max, 2),
-            "moq":                     moq,
-            "shipping_estimate_days":  15,
-            "shipping_cost_estimate":  1.50,
-            "supplier_trust_score":    min(float(years) / 2, 5.0),
-            "years_on_platform":       int(years),
-            "whitelabel_available":    whitelabel,
-            "supplier_url":            supplier_url,
+            "supplier_name":           data["supplier_name"],
+            "product_title":           data["product_title"],
+            "unit_cost_min":           data["price_min"],
+            "unit_cost_max":           data["price_max"],
+            "moq":                     data["moq"],
+            "shipping_estimate_days":  data["shipping_days"],
+            "shipping_cost_estimate":  data["shipping_cost"],
+            "supplier_trust_score":    min(float(data["years"]) / 2, 5.0),
+            "years_on_platform":       data["years"],
+            "whitelabel_available":    data["whitelabel"],
+            "supplier_url":            data["supplier_url"],
         }
 
         try:
             result = supabase.table("suppliers").insert(supplier_record).execute()
             record = result.data[0] if result.data else supplier_record
-
-            # Add profit data and ranking info (not saved to DB, returned to frontend)
             record["_rank_reason"]        = rank_info.get("rank_reason", "")
             record["_recommendation_tag"] = rank_info.get("recommendation_tag", "")
-            record["_image_url"]          = image_url
+            record["_image_url"]          = data["image_url"]
             record["_profit"]             = profit_data
-
             saved.append(record)
-            print(f"    Saved: {supplier_name} — ${price_min}-${price_max} | MOQ: {moq} | Profit: ${profit_data['net_profit']} ({profit_data['margin_pct']}%) | {profit_data['profit_label']}")
+            print(f"    Saved: {data['supplier_name']} — ${data['price_min']} | {profit_data['profit_label']} ({profit_data['margin_pct']}%)")
         except Exception as e:
             print(f"  Error saving supplier: {e}")
 
-    # Sort by profit margin — highest first
     saved.sort(key=lambda x: x.get("_profit", {}).get("margin_pct", -999), reverse=True)
-
-    print(f"  Saved {len(saved)} suppliers successfully")
+    print(f"  Saved {len(saved)} suppliers")
     return saved
 
 
 # ==============================================================================
-# MAIN FUNCTION — Called from FastAPI endpoint
+# MAIN FUNCTIONS — Called from FastAPI endpoints
 # ==============================================================================
-def find_suppliers(product_id: str, product_title: str, tiktok_price: float) -> dict:
+
+def find_suppliers_by_platform(
+    product_id: str,
+    product_title: str,
+    tiktok_price: float,
+    platform: str,
+    user_email: str
+) -> dict:
+    """Search a single platform for suppliers. Deducts 1 credit."""
+
     print(f"\n{'='*50}")
-    print(f"Finding suppliers for: {product_title[:50]}...")
-    print(f"TikTok Price: ${tiktok_price}")
-    print(f"Max COGS for profit: ${round(tiktok_price * 0.40, 2)}")
+    print(f"Finding {platform} suppliers for: {product_title[:50]}...")
+    print(f"TikTok Price: ${tiktok_price} | User: {user_email}")
     print(f"{'='*50}")
 
-    # Check if suppliers already exist for this product
+    # Check for cached results for this product + platform
     existing = (
         supabase.table("suppliers")
         .select("*")
         .eq("tiktok_product_id", product_id)
+        .eq("platform", platform)
         .execute()
     )
 
     if existing.data and len(existing.data) > 0:
-        print(f"  Suppliers already exist — returning cached results with profit calc")
-        # Add profit calculation to cached suppliers too
+        print(f"  Cached {platform} suppliers found — no credit deducted")
         for supplier in existing.data:
             cogs = supplier.get("unit_cost_min") or supplier.get("unit_cost_max") or 0
-            supplier["_profit"] = calculate_profit(
-                sale_price=tiktok_price,
-                cogs=cogs,
-            )
-        # Sort cached by profit
+            supplier["_profit"] = calculate_profit(sale_price=tiktok_price, cogs=cogs)
         existing.data.sort(key=lambda x: x.get("_profit", {}).get("margin_pct", -999), reverse=True)
         return {
-            "success":   True,
-            "cached":    True,
+            "success": True,
+            "cached": True,
+            "platform": platform,
+            "credit_deducted": False,
             "suppliers": existing.data
         }
 
-    # Step 1: Normalize title
+    # Check credits
+    credit_info = check_credits(user_email)
+    if credit_info["credits_remaining"] <= 0:
+        return {
+            "success": False,
+            "message": f"No credits remaining. You've used {credit_info['credits_used']}/{credit_info['credits_total']} credits this month. Upgrade your plan for more credits.",
+            "platform": platform,
+            "credits": credit_info,
+            "suppliers": []
+        }
+
+    # Deduct credit BEFORE search
+    deducted = deduct_credit(user_email, product_id, platform)
+    if not deducted:
+        return {
+            "success": False,
+            "message": "Failed to deduct credit. Please try again.",
+            "platform": platform,
+            "suppliers": []
+        }
+
+    # Normalize title
     normalized_keyword = normalize_product_title(product_title)
 
-    # Step 2: Search Alibaba
-    alibaba_results = search_alibaba(normalized_keyword, max_results=15)
+    # Search the selected platform
+    if platform == "alibaba":
+        results = search_alibaba(normalized_keyword, max_results=15)
+    elif platform == "aliexpress":
+        results = search_aliexpress(normalized_keyword, max_results=10)
+    elif platform == "amazon":
+        results = search_amazon(normalized_keyword, max_results=10)
+    else:
+        return {"success": False, "message": f"Unknown platform: {platform}", "suppliers": []}
 
-    # Step 2b: If Alibaba returns nothing, try AliExpress
-    if not alibaba_results:
-        print("  Alibaba returned no results — trying AliExpress...")
-        aliexpress_results = search_aliexpress(normalized_keyword, max_results=10)
-        if aliexpress_results:
-            ranked  = rank_suppliers(aliexpress_results, tiktok_price, product_title)
-            saved   = save_suppliers(product_id, aliexpress_results, ranked, tiktok_price, platform="aliexpress")
+    if not results:
+        return {
+            "success": False,
+            "message": f"No suppliers found on {platform} for this product. 1 credit was used.",
+            "platform": platform,
+            "keyword": normalized_keyword,
+            "credit_deducted": True,
+            "suppliers": []
+        }
 
-            profitable_count = sum(1 for s in saved if s.get("_profit", {}).get("margin_pct", 0) >= 20)
+    # Rank with GPT
+    ranked = rank_suppliers(results, tiktok_price, product_title, platform)
 
-            return {
-                "success": True,
-                "cached": False,
-                "profitable_count": profitable_count,
-                "suppliers": saved
-            }
-        else:
-            return {
-                "success":  False,
-                "message":  "No suppliers found on Alibaba or AliExpress for this product",
-                "keyword":  normalized_keyword,
-                "suppliers": []
-            }
-
-    # Step 3: Rank with GPT
-    ranked = rank_suppliers(alibaba_results, tiktok_price, product_title)
-
-    # Step 4: Save and return with profit data
-    saved = save_suppliers(product_id, alibaba_results, ranked, tiktok_price, platform="alibaba")
+    # Save and return
+    saved = save_suppliers(product_id, results, ranked, tiktok_price, platform)
 
     profitable_count = sum(1 for s in saved if s.get("_profit", {}).get("margin_pct", 0) >= 20)
 
-    print(f"\n✅ Supplier matching complete — {len(saved)} suppliers found, {profitable_count} profitable")
+    # Get updated credit info
+    updated_credits = check_credits(user_email)
+
+    print(f"\n✅ {platform} search complete — {len(saved)} suppliers, {profitable_count} profitable")
     return {
-        "success":            True,
-        "cached":             False,
+        "success": True,
+        "cached": False,
+        "platform": platform,
         "normalized_keyword": normalized_keyword,
-        "profitable_count":   profitable_count,
-        "suppliers":          saved
+        "credit_deducted": True,
+        "credits_remaining": updated_credits["credits_remaining"],
+        "profitable_count": profitable_count,
+        "suppliers": saved
     }
+
+
+# Legacy function — still works for backward compatibility
+def find_suppliers(product_id: str, product_title: str, tiktok_price: float) -> dict:
+    """Original function — searches Alibaba only, no credit check."""
+    return find_suppliers_by_platform(
+        product_id=product_id,
+        product_title=product_title,
+        tiktok_price=tiktok_price,
+        platform="alibaba",
+        user_email="legacy"
+    )

@@ -11,13 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone, timedelta
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
+from supplier_engine import find_suppliers, find_suppliers_by_platform, check_credits, initialize_credits
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from typing import Optional
 import hmac
 import hashlib
 import json
-
 
 load_dotenv()
 
@@ -30,9 +30,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",  # or replace with your specific Lovable URL
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,62 +39,51 @@ app.add_middleware(
 # --- API Key Auth ---
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
 
+
 async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
     if api_key != os.getenv("API_KEY"):
         raise HTTPException(status_code=403)
     return api_key
+
 
 async def get_user_plan(request: Request):
     """Extract user email from Supabase auth token and return their plan."""
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         return "free"
-    
+
     token = auth_header.replace("Bearer ", "")
     try:
-        # Verify token with Supabase to get user
         user_response = supabase.auth.get_user(token)
         email = user_response.user.email
-        
-        # Look up plan in users table
         result = supabase.table("users").select("plan").eq("email", email).execute()
         if result.data and len(result.data) > 0:
             return result.data[0].get("plan", "free")
         return "free"
     except Exception:
         return "free"
-    
+
 
 # ==============================================================================
 # ENDPOINT 1 — Health Check
-# GET /
-# Just to verify the API is running
 # ==============================================================================
 @app.get("/")
 def root():
     return {
         "status": "running",
         "app": "ProfitScout API",
-        "version": "1.0.0",
-        "docs": "http://127.0.0.1:8000/docs"
+        "version": "2.0.0",
+        "docs": "/docs"
     }
 
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "message": "FastAPI is working!"}
+
+
 # ==============================================================================
-# ENDPOINT 2 — Get All Products (with filters)
-# GET /products
-#
-# Query params (all optional):
-#   min_score   = minimum virality score (default 0)
-#   max_score   = maximum virality score (default 100)
-#   trend_phase = rising | peak | declining
-#   category    = e.g. Skincare
-#   min_price   = minimum product price
-#   max_price   = maximum product price
-#   limit       = number of results (default 20, max 100)
-#   offset      = for pagination (default 0)
-#
-# Example: /products?min_score=65&trend_phase=rising&limit=10
+# ENDPOINT 2 — Get All Products (with filters + plan gating)
 # ==============================================================================
 @app.get("/products")
 async def get_products(
@@ -112,11 +99,10 @@ async def get_products(
     api_key:     str            = Security(verify_api_key),
 ):
     try:
-        # Check user plan
         plan = await get_user_plan(request)
-        
+
         # Free users: max 10 products, no offset
-        if plan != "pro":
+        if plan == "free":
             limit = min(limit, 10)
             offset = 0
 
@@ -142,29 +128,24 @@ async def get_products(
         result = query.execute()
 
         return {
-            "success": True,
-            "count":   len(result.data),
-            "offset":  offset,
-            "limit":   limit,
-            "plan":    plan,
+            "success":  True,
+            "count":    len(result.data),
+            "offset":   offset,
+            "limit":    limit,
+            "plan":     plan,
             "products": result.data
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ==============================================================================
 # ENDPOINT 3 — Get Single Product Detail
-# GET /products/{product_id}
-#
-# Returns full product data including suppliers if already sourced
-# Example: /products/abc123-uuid-here
 # ==============================================================================
 @app.get("/products/{product_id}")
 def get_product(product_id: str, api_key: str = Security(verify_api_key)):
-
     try:
-        # Get product
         product_result = (
             supabase.table("tiktok_products")
             .select("*")
@@ -178,7 +159,6 @@ def get_product(product_id: str, api_key: str = Security(verify_api_key)):
 
         product = product_result.data
 
-        # Get suppliers for this product (if already sourced)
         suppliers_result = (
             supabase.table("suppliers")
             .select("*")
@@ -202,24 +182,19 @@ def get_product(product_id: str, api_key: str = Security(verify_api_key)):
 
 # ==============================================================================
 # ENDPOINT 4 — Get Products by Virality Tier
-# GET /products/tier/{tier}
-#
-# tier options: hot | rising | watch | pass
-# Shortcut endpoint — no need to remember score ranges
-# Example: /products/tier/hot  →  returns all products scored 80-100
 # ==============================================================================
 @app.get("/products/tier/{tier}")
 def get_products_by_tier(
-    tier:   str,
-    limit:  int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0,  ge=0),
+    tier:    str,
+    limit:   int = Query(default=20, ge=1, le=100),
+    offset:  int = Query(default=0,  ge=0),
     api_key: str = Security(verify_api_key),
 ):
     tier_ranges = {
-        "hot":     (80, 100),
-        "rising":  (65, 79),
-        "watch":   (50, 64),
-        "pass":    (0,  49),
+        "hot":    (80, 100),
+        "rising": (65, 79),
+        "watch":  (50, 64),
+        "pass":   (0,  49),
     }
 
     if tier not in tier_ranges:
@@ -243,10 +218,10 @@ def get_products_by_tier(
         )
 
         return {
-            "success": True,
-            "tier":    tier,
-            "range":   f"{min_score}-{max_score}",
-            "count":   len(result.data),
+            "success":  True,
+            "tier":     tier,
+            "range":    f"{min_score}-{max_score}",
+            "count":    len(result.data),
             "products": result.data
         }
 
@@ -255,11 +230,7 @@ def get_products_by_tier(
 
 
 # ==============================================================================
-# ENDPOINT 5 — Get Dashboard Stats
-# GET /stats
-#
-# Returns summary counts for the dashboard header
-# Example: /stats
+# ENDPOINT 5 — Dashboard Stats
 # ==============================================================================
 @app.get("/stats")
 def get_stats(api_key: str = Security(verify_api_key)):
@@ -273,12 +244,11 @@ def get_stats(api_key: str = Security(verify_api_key)):
 
         products = all_products.data or []
 
-        hot     = len([p for p in products if p["virality_score"] >= 80])
-        rising  = len([p for p in products if 65 <= p["virality_score"] < 80])
-        watch   = len([p for p in products if 50 <= p["virality_score"] < 65])
-        total   = len(products)
+        hot    = len([p for p in products if p["virality_score"] >= 80])
+        rising = len([p for p in products if 65 <= p["virality_score"] < 80])
+        watch  = len([p for p in products if 50 <= p["virality_score"] < 65])
+        total  = len(products)
 
-        # Top categories
         categories = {}
         for p in products:
             cat = p.get("category") or "Other"
@@ -302,40 +272,29 @@ def get_stats(api_key: str = Security(verify_api_key)):
 
 # ==============================================================================
 # ENDPOINT 6 — Profit Calculator
-# POST /calculate-profit
-#
-# Send product details + your pricing → get exact net profit breakdown
 # ==============================================================================
 class ProfitRequest(BaseModel):
-    product_id:               str
-    supplier_id:              Optional[str] = None
-    sale_price:               float
-    cogs:                     float          # Cost of goods from supplier
-    affiliate_commission_rate: float = 15.0  # % — default 15%
-    fbt_enabled:              bool  = True   # Using TikTok FBT fulfillment?
-    product_weight_oz:        float = 8.0    # For FBT fee calculation
-    inbound_shipping:         float = 1.20   # Per unit cost to send to FBT
-    return_rate_pct:          float = 8.0    # Expected return rate %
-    ad_spend_per_unit:        float = 0.0    # Optional ad cost per unit
-    is_new_seller:            bool  = False  # New sellers get 3% referral (first 30 days)
+    product_id:                str
+    supplier_id:               Optional[str] = None
+    sale_price:                float
+    cogs:                      float
+    affiliate_commission_rate: float = 15.0
+    fbt_enabled:               bool  = True
+    product_weight_oz:         float = 8.0
+    inbound_shipping:          float = 1.20
+    return_rate_pct:           float = 8.0
+    ad_spend_per_unit:         float = 0.0
+    is_new_seller:             bool  = False
 
 
 @app.post("/calculate-profit")
 def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)):
     try:
-        # ── TikTok Fee Calculations ──────────────────────────────────────────
-
-        # Referral fee: 3% for new sellers (first 30 days), 6% standard
-        referral_rate  = 0.03 if req.is_new_seller else 0.06
-        referral_fee   = round(req.sale_price * referral_rate, 2)
-
-        # Transaction fee: ~2.9%
+        referral_rate   = 0.03 if req.is_new_seller else 0.06
+        referral_fee    = round(req.sale_price * referral_rate, 2)
         transaction_fee = round(req.sale_price * 0.029, 2)
-
-        # Affiliate commission
         affiliate_amt   = round(req.sale_price * (req.affiliate_commission_rate / 100), 2)
 
-        # FBT fulfillment fee (based on weight)
         if req.fbt_enabled:
             if req.product_weight_oz <= 4:    fbt_fee = 2.68
             elif req.product_weight_oz <= 8:  fbt_fee = 3.58
@@ -345,35 +304,24 @@ def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)
         else:
             fbt_fee = 0.0
 
-        # Return buffer: return_rate% of (refund admin fee = 20% of referral fee, capped at $5)
         refund_admin_fee = min(referral_fee * 0.20, 5.0)
         return_buffer    = round((req.return_rate_pct / 100) * refund_admin_fee, 2)
 
-        # ── Total Costs ──────────────────────────────────────────────────────
         total_costs = round(
-            req.cogs
-            + referral_fee
-            + transaction_fee
-            + affiliate_amt
-            + fbt_fee
-            + req.inbound_shipping
-            + return_buffer
-            + req.ad_spend_per_unit,
+            req.cogs + referral_fee + transaction_fee + affiliate_amt
+            + fbt_fee + req.inbound_shipping + return_buffer + req.ad_spend_per_unit,
             2
         )
 
-        # ── Net Profit ───────────────────────────────────────────────────────
         net_profit = round(req.sale_price - total_costs, 2)
         margin_pct = round((net_profit / req.sale_price) * 100, 1) if req.sale_price > 0 else 0
 
-        # ── Profitability Rating ─────────────────────────────────────────────
         if margin_pct >= 35:   rating = "green"
         elif margin_pct >= 20: rating = "amber"
         else:                  rating = "red"
 
-        # ── Warning Flags ────────────────────────────────────────────────────
         warnings = []
-        total_fees_pct = ((referral_fee + transaction_fee + affiliate_amt) / req.sale_price) * 100
+        total_fees_pct = ((referral_fee + transaction_fee + affiliate_amt) / req.sale_price) * 100 if req.sale_price > 0 else 0
         if total_fees_pct > 35:
             warnings.append(f"TikTok fees + affiliate = {total_fees_pct:.1f}% of sale price. Very tight margins.")
         if req.affiliate_commission_rate > 20:
@@ -387,10 +335,10 @@ def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)
             "success": True,
             "rating":  rating,
             "summary": {
-                "sale_price":   req.sale_price,
-                "total_costs":  total_costs,
-                "net_profit":   net_profit,
-                "margin_pct":   margin_pct,
+                "sale_price":  req.sale_price,
+                "total_costs": total_costs,
+                "net_profit":  net_profit,
+                "margin_pct":  margin_pct,
             },
             "breakdown": {
                 "cost_of_goods":        req.cogs,
@@ -411,17 +359,14 @@ def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)
 
 # ==============================================================================
 # ENDPOINT 7 — Search Products
-# GET /search?q=serum
-#
-# Simple keyword search by product title
-# Example: /search?q=vitamin+c&limit=10
 # ==============================================================================
 @app.get("/search")
-async def search_products(q: str, api_key: str = Security(verify_api_key)):
-    q:      str = Query(..., min_length=2, description="Search keyword"),
-    limit:  int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0,  ge=0),
-
+async def search_products(
+    q:       str = Query(..., min_length=2, description="Search keyword"),
+    limit:   int = Query(default=20, ge=1, le=100),
+    offset:  int = Query(default=0,  ge=0),
+    api_key: str = Security(verify_api_key),
+):
     try:
         result = (
             supabase.table("tiktok_products")
@@ -439,63 +384,38 @@ async def search_products(q: str, api_key: str = Security(verify_api_key)):
             "count":    len(result.data),
             "products": result.data
         }
-    
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-@app.get("/ping")
-def ping():
-    return {"status": "ok", "message": "FastAPI is working!"}
-from supplier_engine import find_suppliers
+
 
 # ==============================================================================
-# ENDPOINT 8 — Find Suppliers for a Product
-# GET /products/{product_id}/suppliers
+# ENDPOINT 8 — Find Suppliers (legacy — Alibaba only, backward compatible)
 # ==============================================================================
-from datetime import datetime, timezone, timedelta
-
 @app.get("/products/{product_id}/suppliers")
 async def get_suppliers(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
     try:
-        # Check user plan
         plan = await get_user_plan(request)
 
-        # Free users: 1 supplier lookup per day
-        if plan != "pro":
-            # Get user email from token
-            auth_header = request.headers.get("Authorization")
-            user_email = "anonymous"
-            if auth_header and auth_header.startswith("Bearer "):
-                token = auth_header.replace("Bearer ", "")
-                try:
-                    user_response = supabase.auth.get_user(token)
-                    user_email = user_response.user.email
-                except Exception:
-                    pass
-
-            # Check lookups in last 24 hours
-            since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-            lookups = (
-                supabase.table("supplier_lookups")
-                .select("id")
-                .eq("user_email", user_email)
-                .gte("looked_up_at", since)
-                .execute()
+        # Free users: no supplier access
+        if plan == "free":
+            raise HTTPException(
+                status_code=403,
+                detail="Supplier sourcing requires a Pro or Ultimate plan. Upgrade to unlock Alibaba, AliExpress, and Amazon sourcing."
             )
 
-            if len(lookups.data) >= 1:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Free plan allows 1 supplier search per day. Upgrade to Pro for unlimited searches."
-                )
+        # Get user email
+        auth_header = request.headers.get("Authorization")
+        user_email = "anonymous"
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.replace("Bearer ", "")
+            try:
+                user_response = supabase.auth.get_user(token)
+                user_email = user_response.user.email
+            except Exception:
+                pass
 
-            # Log this lookup
-            supabase.table("supplier_lookups").insert({
-                "user_email": user_email,
-                "product_id": product_id
-            }).execute()
-
-        # Get product from Supabase
+        # Get product
         product_result = (
             supabase.table("tiktok_products")
             .select("id, title, tiktok_price")
@@ -509,11 +429,13 @@ async def get_suppliers(product_id: str, request: Request, api_key: str = Securi
 
         product = product_result.data
 
-        # Run supplier matching engine
-        result = find_suppliers(
-            product_id    = product["id"],
-            product_title = product["title"],
-            tiktok_price  = product["tiktok_price"] or 0
+        # Run supplier matching (Alibaba default)
+        result = find_suppliers_by_platform(
+            product_id=product["id"],
+            product_title=product["title"],
+            tiktok_price=product["tiktok_price"] or 0,
+            platform="alibaba",
+            user_email=user_email
         )
 
         return result
@@ -523,68 +445,232 @@ async def get_suppliers(product_id: str, request: Request, api_key: str = Securi
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ==============================================================================
+# ENDPOINT 9 — Find Suppliers by Platform (NEW — credit-based)
+# GET /products/{product_id}/suppliers/{platform}
+# platform = alibaba | aliexpress | amazon
+# ==============================================================================
+@app.get("/products/{product_id}/suppliers/{platform}")
+async def get_suppliers_by_platform(
+    product_id: str,
+    platform:   str,
+    request:    Request,
+    api_key:    str = Security(verify_api_key),
+):
+    """Search a specific platform. Costs 1 credit."""
+
+    if platform not in ["alibaba", "aliexpress", "amazon"]:
+        raise HTTPException(status_code=400, detail="Platform must be: alibaba, aliexpress, or amazon")
+
+    try:
+        # Get user email from auth token
+        auth_header = request.headers.get("Authorization")
+        user_email = None
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.replace("Bearer ", "")
+            try:
+                user_response = supabase.auth.get_user(token)
+                user_email = user_response.user.email
+            except Exception:
+                pass
+
+        if not user_email:
+            raise HTTPException(status_code=401, detail="Authentication required for supplier search")
+
+        # Check plan
+        plan = await get_user_plan(request)
+        if plan == "free":
+            raise HTTPException(
+                status_code=403,
+                detail="Supplier sourcing requires a Pro or Ultimate plan. Upgrade to unlock Alibaba, AliExpress, and Amazon sourcing."
+            )
+
+        # Get product
+        product_result = (
+            supabase.table("tiktok_products")
+            .select("id, title, tiktok_price")
+            .eq("id", product_id)
+            .single()
+            .execute()
+        )
+
+        if not product_result.data:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        product = product_result.data
+
+        # Run platform-specific supplier search (deducts 1 credit)
+        result = find_suppliers_by_platform(
+            product_id=product["id"],
+            product_title=product["title"],
+            tiktok_price=product["tiktok_price"] or 0,
+            platform=platform,
+            user_email=user_email
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==============================================================================
+# ENDPOINT 10 — Get User Credits
+# ==============================================================================
+@app.get("/credits")
+async def get_credits(request: Request, api_key: str = Security(verify_api_key)):
+    """Get user's current credit balance."""
+    auth_header = request.headers.get("Authorization")
+    user_email = None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.replace("Bearer ", "")
+        try:
+            user_response = supabase.auth.get_user(token)
+            user_email = user_response.user.email
+        except Exception:
+            pass
+
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    credits = check_credits(user_email)
+    return {"success": True, "credits": credits}
+
+
+# ==============================================================================
+# ENDPOINT 11 — LemonSqueezy Webhook
+# ==============================================================================
 LEMONSQUEEZY_WEBHOOK_SECRET = os.getenv("LEMONSQUEEZY_WEBHOOK_SECRET")
+PRO_VARIANT_ID = os.getenv("LEMONSQUEEZY_PRODUCT_ID")
+ULTIMATE_VARIANT_ID = os.getenv("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID")
+
 
 @app.post("/lemonsqueezy-webhook")
 async def lemonsqueezy_webhook(request: Request):
-    # Step 1: Get raw body and verify signature
     body = await request.body()
     signature = request.headers.get("x-signature")
-    
+
     if not signature:
         raise HTTPException(status_code=401, detail="No signature")
-    
-    # Verify HMAC signature
+
     digest = hmac.new(
         LEMONSQUEEZY_WEBHOOK_SECRET.encode(),
         body,
         hashlib.sha256
     ).hexdigest()
-    
+
     if not hmac.compare_digest(digest, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
-    
-    # Step 2: Parse the event
+
     payload = json.loads(body)
     event_name = payload.get("meta", {}).get("event_name")
     custom_data = payload.get("meta", {}).get("custom_data", {})
     user_email = custom_data.get("email")
-    
-    # Also try to get email from attributes
+
     if not user_email:
         user_email = payload.get("data", {}).get("attributes", {}).get("user_email")
-    
+
     if not user_email:
-        print(f"Webhook {event_name}: no email found in payload")
+        print(f"Webhook {event_name}: no email found")
         return {"status": "ok"}
-    
-    # Step 3: Update user plan based on event
+
+    # Determine plan from variant ID
+    variant_id = str(payload.get("data", {}).get("attributes", {}).get("variant_id") or "")
+
+    if variant_id == ULTIMATE_VARIANT_ID:
+        plan = "ultimate"
+    elif variant_id == PRO_VARIANT_ID:
+        plan = "pro"
+    else:
+        plan = "pro"
+
     if event_name == "subscription_created":
-        # Upgrade to pro
-        supabase.table("users").update({"plan": "pro"}).eq("email", user_email).execute()
-        print(f"Upgraded {user_email} to pro")
-    
+        supabase.table("users").update({"plan": plan}).eq("email", user_email).execute()
+        initialize_credits(user_email, plan)
+        print(f"Upgraded {user_email} to {plan}")
+
     elif event_name in ["subscription_cancelled", "subscription_expired"]:
-        # Downgrade to free
         supabase.table("users").update({"plan": "free"}).eq("email", user_email).execute()
+        initialize_credits(user_email, "free")
         print(f"Downgraded {user_email} to free")
-    
+
     elif event_name == "subscription_updated":
-        # Check if subscription is active or not
         status = payload.get("data", {}).get("attributes", {}).get("status")
         if status == "active":
-            supabase.table("users").update({"plan": "pro"}).eq("email", user_email).execute()
+            supabase.table("users").update({"plan": plan}).eq("email", user_email).execute()
+            initialize_credits(user_email, plan)
         elif status in ["cancelled", "expired", "past_due"]:
             supabase.table("users").update({"plan": "free"}).eq("email", user_email).execute()
-        print(f"Updated {user_email} plan based on status: {status}")
-    
+            initialize_credits(user_email, "free")
+        print(f"Updated {user_email}: status={status}, plan={plan}")
+
     return {"status": "ok"}
 
+
+# ==============================================================================
+# ENDPOINT 12 — Create Checkout (supports Pro + Ultimate)
+# ==============================================================================
+class CheckoutRequest(BaseModel):
+    email: str
+    plan:  str = "pro"
+
+
+@app.post("/create-checkout")
+async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Security(verify_api_key)):
+    # Pick variant based on plan
+    if checkout_data.plan == "ultimate":
+        variant_id = os.getenv("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID")
+    else:
+        variant_id = os.getenv("LEMONSQUEEZY_PRODUCT_ID")
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv('LEMONSQUEEZY_API_KEY')}",
+        "Content-Type": "application/vnd.api+json",
+        "Accept": "application/vnd.api+json",
+    }
+
+    payload = {
+        "data": {
+            "type": "checkouts",
+            "attributes": {
+                "checkout_data": {
+                    "email": checkout_data.email,
+                    "custom": {
+                        "email": checkout_data.email
+                    }
+                }
+            },
+            "relationships": {
+                "store": {
+                    "data": {
+                        "type": "stores",
+                        "id": str(os.getenv("LEMONSQUEEZY_STORE_ID"))
+                    }
+                },
+                "variant": {
+                    "data": {
+                        "type": "variants",
+                        "id": str(variant_id)
+                    }
+                }
+            }
+        }
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.lemonsqueezy.com/v1/checkouts",
+            json=payload,
+            headers=headers
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Checkout creation failed")
+
     data = response.json()
-    print("Lemon Squeezy response:", data)  # shows in Railway logs
-    
-    if "data" not in data:
-        raise HTTPException(status_code=400, detail=str(data))
-    
-    checkout_url = data["data"]["attributes"]["url"]
-    return {"url": checkout_url}
+    checkout_url = data.get("data", {}).get("attributes", {}).get("url")
+
+    return {"success": True, "checkout_url": checkout_url}
