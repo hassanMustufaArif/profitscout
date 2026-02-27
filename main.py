@@ -4,6 +4,7 @@ ProfitScout — FastAPI Backend
 Run with:  uvicorn main:app --reload
 API Docs:  http://127.0.0.1:8000/docs
 """
+
 import os
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Security, Request
@@ -37,13 +38,13 @@ app.add_middleware(
 )
 
 # --- API Key Auth ---
-API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def verify_api_key(request: Request, api_key: str = Security(API_KEY_HEADER, auto_error=False)):
+async def verify_api_key(request: Request, api_key: str = Security(API_KEY_HEADER)):
     if request.method == "OPTIONS":
         return None
-    if api_key != os.getenv("API_KEY"):
+    if not api_key or api_key != os.getenv("API_KEY"):
         raise HTTPException(status_code=403, detail="Forbidden")
     return api_key
 
