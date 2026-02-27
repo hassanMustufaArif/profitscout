@@ -50,17 +50,21 @@ async def get_user_plan(request: Request):
     """Extract user email from Supabase auth token and return their plan."""
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
+        print("get_user_plan: No auth header found")
         return "free"
 
     token = auth_header.replace("Bearer ", "")
     try:
         user_response = supabase.auth.get_user(token)
         email = user_response.user.email
+        print(f"get_user_plan: email={email}")  # ADD THIS
         result = supabase.table("users").select("plan").eq("email", email).execute()
+        print(f"get_user_plan: result={result.data}")  # ADD THIS
         if result.data and len(result.data) > 0:
             return result.data[0].get("plan", "free")
         return "free"
-    except Exception:
+    except Exception as e:
+        print(f"get_user_plan ERROR: {e}")  # ADD THIS
         return "free"
 
 
