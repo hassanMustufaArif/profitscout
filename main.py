@@ -40,9 +40,11 @@ app.add_middleware(
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
 
 
-async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
+async def verify_api_key(request: Request, api_key: str = Security(API_KEY_HEADER, auto_error=False)):
+    if request.method == "OPTIONS":
+        return None
     if api_key != os.getenv("API_KEY"):
-        raise HTTPException(status_code=403)
+        raise HTTPException(status_code=403, detail="Forbidden")
     return api_key
 
 
