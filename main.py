@@ -496,7 +496,7 @@ async def get_suppliers_by_platform(
         # Get product
         product_result = (
             supabase.table("tiktok_products")
-            .select("id, title, tiktok_price")
+            .select("id, product_name, tiktok_price")
             .eq("id", product_id)
             .single()
             .execute()
@@ -510,7 +510,7 @@ async def get_suppliers_by_platform(
         # Run platform-specific supplier search (deducts 1 credit)
         result = find_suppliers_by_platform(
             product_id=product["id"],
-            product_title=product["title"],
+            product_title=product["product_name"],
             tiktok_price=product["tiktok_price"] or 0,
             platform=platform,
             user_email=user_email
