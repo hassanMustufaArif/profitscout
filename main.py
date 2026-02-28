@@ -627,11 +627,16 @@ class CheckoutRequest(BaseModel):
 
 @app.post("/create-checkout")
 async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Security(verify_api_key)):
-    # Pick variant based on plan
     if checkout_data.plan == "ultimate":
         variant_id = os.getenv("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID")
     else:
         variant_id = os.getenv("LEMONSQUEEZY_PRODUCT_ID")
+
+    # Debug — print what we're sending
+    print(f"Checkout: plan={checkout_data.plan}, email={checkout_data.email}")
+    print(f"Variant ID: {variant_id}")
+    print(f"Store ID: {os.getenv('LEMONSQUEEZY_STORE_ID')}")
+    print(f"API Key exists: {bool(os.getenv('LEMONSQUEEZY_API_KEY'))}")
 
     headers = {
         "Authorization": f"Bearer {os.getenv('LEMONSQUEEZY_API_KEY')}",
@@ -674,10 +679,13 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
             headers=headers
         )
 
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail="Checkout creation failed")
+    # Print full LemonSqueezy response for debugging
+    print(f"LemonSqueezy status: {response.status_code}")
+    print(f"LemonSqueezy response: {response.text}")
+
+    if response.status_code != 200 and response.status_code != 201:
+        raise HTTPException(status_code=400, detail="Checkout creation failed")
 
     data = response.json()
     checkout_url = data.get("data", {}).get("attributes", {}).get("url")
-
     return {"success": True, "checkout_url": checkout_url}
