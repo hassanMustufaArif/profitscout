@@ -1,21 +1,11 @@
 """
-ProfitScout — Supplier Matching Engine v4
-==========================================
-Changes from v3:
-- Replaced Apify with ScraperAPI (~10x cheaper)
-- Replaced GPT-4o ranking with GPT-4o-mini (~60x cheaper)
-- Total cost per 3-platform search: ~$0.036 vs $0.37–0.73 originally
-
-Cost breakdown per search:
-- ScraperAPI: $0.001 per request × ~35 requests = $0.035
-- GPT-4o-mini normalize: $0.0001
-- GPT-4o-mini rank: $0.0003
-- Total: ~$0.036 per full 3-platform search
-
-Setup:
-- Add SCRAPERAPI_KEY=your_key to .env
-- Get free key at https://www.scraperapi.com (1,000 free calls)
-- Hobby plan $29/month = 250,000 calls (covers 50 Pro users easily)
+ProfitScout — Supplier Matching Engine v4.1
+============================================
+- Alibaba: Apify (reliable)
+- AliExpress: ScraperAPI structured → HTML fallback
+- Amazon: ScraperAPI structured → HTML fallback
+- Ranking: GPT-4o-mini (cheap + accurate enough)
+- Normalize: GPT-4o-mini
 """
 
 import os
@@ -26,6 +16,7 @@ import requests
 from datetime import datetime, timezone
 from urllib.parse import urlencode, quote_plus
 
+from apify_client import ApifyClient
 from openai import OpenAI
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -33,32 +24,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── CLIENTS ──────────────────────────────────────────────────────────────────
+apify         = ApifyClient(os.getenv("APIFY_API_TOKEN"))
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
 
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
+SCRAPERAPI_KEY  = os.getenv("SCRAPERAPI_KEY")
 SCRAPERAPI_BASE = "https://api.scraperapi.com"
-
-# Request settings
-REQUEST_TIMEOUT = 60      # seconds per request
-MAX_RETRIES     = 2       # retries on failure
-RETRY_DELAY     = 3       # seconds between retries
+REQUEST_TIMEOUT = 60
+MAX_RETRIES     = 2
+RETRY_DELAY     = 3
 
 
 # ==============================================================================
 # SCRAPERAPI — Core Request Function
 # ==============================================================================
-def scraper_get(url: str, render_js: bool = False, country: str = "us") -> requests.Response | None:
-    """
-    Make a GET request via ScraperAPI.
-    render_js=True for JavaScript-heavy pages (costs 5 credits instead of 1).
-    """
+def scraper_get(url: str, render_js: bool = False, country: str = "us"):
     params = {
-        "api_key":    SCRAPERAPI_KEY,
-        "url":        url,
+        "api_key":      SCRAPERAPI_KEY,
+        "url":          url,
         "country_code": country,
     }
     if render_js:
@@ -75,7 +61,7 @@ def scraper_get(url: str, render_js: bool = False, country: str = "us") -> reque
                 print(f"    Rate limited — waiting {RETRY_DELAY * attempt}s...")
                 time.sleep(RETRY_DELAY * attempt)
             elif response.status_code == 403:
-                print(f"    Blocked (403) — page may require login")
+                print(f"    Blocked (403)")
                 return None
             else:
                 print(f"    HTTP {response.status_code} on attempt {attempt}")
@@ -91,27 +77,10 @@ def scraper_get(url: str, render_js: bool = False, country: str = "us") -> reque
     return None
 
 
-def scraper_post(url: str, payload: dict) -> requests.Response | None:
-    """Make a POST request via ScraperAPI structured data endpoint."""
-    api_url = f"{SCRAPERAPI_BASE}/structured/alibaba/search"
-    params  = {"api_key": SCRAPERAPI_KEY}
-
-    try:
-        response = requests.post(api_url, params=params, json=payload, timeout=REQUEST_TIMEOUT)
-        if response.status_code == 200:
-            return response
-        print(f"    POST {response.status_code}: {response.text[:200]}")
-        return None
-    except Exception as e:
-        print(f"    POST error: {e}")
-        return None
-
-
 # ==============================================================================
 # CREDIT SYSTEM
 # ==============================================================================
 def check_credits(user_email: str) -> dict:
-    """Check user's remaining credits."""
     try:
         result = supabase.table("user_credits").select("*").eq("user_email", user_email).execute()
         if not result.data:
@@ -146,7 +115,6 @@ def check_credits(user_email: str) -> dict:
 
 
 def deduct_credit(user_email: str, product_id: str, platform: str) -> bool:
-    """Deduct 1 credit. Returns True if successful."""
     try:
         result = supabase.table("user_credits").select("credits_used").eq("user_email", user_email).execute()
         if not result.data:
@@ -157,13 +125,12 @@ def deduct_credit(user_email: str, product_id: str, platform: str) -> bool:
             "credits_used": current_used + 1
         }).eq("user_email", user_email).execute()
 
-        # Log — non-fatal if table missing
         try:
             supabase.table("credit_logs").insert({
-                "user_email":        user_email,
-                "product_id":        product_id,
-                "platform":          platform,
-                "credits_deducted":  1
+                "user_email":       user_email,
+                "product_id":       product_id,
+                "platform":         platform,
+                "credits_deducted": 1
             }).execute()
         except Exception as log_err:
             print(f"Credit log warning (non-fatal): {log_err}")
@@ -175,7 +142,6 @@ def deduct_credit(user_email: str, product_id: str, platform: str) -> bool:
 
 
 def initialize_credits(user_email: str, plan: str):
-    """Create or update credits when user subscribes."""
     import datetime as dt
     credits    = 50 if plan == "pro" else 120 if plan == "ultimate" else 0
     now        = datetime.now(timezone.utc)
@@ -219,7 +185,7 @@ def calculate_profit(
     affiliate_commission = sale_price * (affiliate_commission_rate / 100)
 
     if fbt_enabled:
-        if product_weight_oz <= 8:   fbt_fee = 3.15
+        if product_weight_oz <= 8:    fbt_fee = 3.15
         elif product_weight_oz <= 16: fbt_fee = 3.75
         elif product_weight_oz <= 32: fbt_fee = 5.25
         elif product_weight_oz <= 48: fbt_fee = 6.50
@@ -230,15 +196,14 @@ def calculate_profit(
     return_buffer = sale_price * (return_rate_pct / 100)
     total_fees    = (referral_fee + transaction_fee + affiliate_commission +
                      fbt_fee + inbound_shipping + return_buffer + ad_spend_per_unit)
-    total_cost    = cogs + total_fees
-    net_profit    = sale_price - total_cost
+    net_profit    = sale_price - cogs - total_fees
     margin_pct    = (net_profit / sale_price * 100) if sale_price > 0 else 0
 
-    if margin_pct >= 35:   rating, label = "green",  "Highly Profitable"
-    elif margin_pct >= 20: rating, label = "green",  "Profitable"
-    elif margin_pct >= 10: rating, label = "amber",  "Low Margin"
-    elif margin_pct >= 0:  rating, label = "amber",  "Breakeven"
-    else:                  rating, label = "red",    "Unprofitable"
+    if margin_pct >= 35:   rating, label = "green", "Highly Profitable"
+    elif margin_pct >= 20: rating, label = "green", "Profitable"
+    elif margin_pct >= 10: rating, label = "amber", "Low Margin"
+    elif margin_pct >= 0:  rating, label = "amber", "Breakeven"
+    else:                  rating, label = "red",   "Unprofitable"
 
     return {
         "sale_price":           round(sale_price, 2),
@@ -258,7 +223,7 @@ def calculate_profit(
 
 
 # ==============================================================================
-# STEP 1 — Normalize Product Title (GPT-4o-mini)
+# STEP 1 — Normalize Product Title
 # ==============================================================================
 def normalize_product_title(raw_title: str) -> str:
     print(f"  Normalizing: {raw_title[:80]}...")
@@ -288,7 +253,8 @@ Portable Mini Face Massager Roller Skincare Tool → face massager roller tool
 LED Sunset Projection Lamp Moon Room Decor → LED sunset projection night lamp
 Magnetic Eyelashes Kit Professional Waterproof Women → magnetic false eyelashes kit
 Knee Pain Relief Red Light Therapy Wrap Device → red light therapy knee wrap device
-Scalp Massager Shampoo Brush Hair Growth Stimulator → scalp massager hair growth brush"""
+Scalp Massager Shampoo Brush Hair Growth Stimulator → scalp massager hair growth brush
+To-Go Buddy Universal Cup Insulator for to-go cups → universal cup insulator sleeve"""
                 },
                 {"role": "user", "content": raw_title}
             ],
@@ -309,98 +275,68 @@ Scalp Massager Shampoo Brush Hair Growth Stimulator → scalp massager hair grow
 
 
 # ==============================================================================
-# STEP 2 — Platform Search Functions (ScraperAPI)
+# STEP 2 — Platform Search Functions
 # ==============================================================================
 
 def parse_price(value) -> float:
-    """Safely parse a price value to float."""
     if value is None:
         return 0.0
     try:
         cleaned = str(value).replace("$", "").replace(",", "").replace("USD", "").strip()
-        # Take first number if range like "1.50-3.00"
-        match = re.search(r'\d+\.?\d*', cleaned)
+        match   = re.search(r'\d+\.?\d*', cleaned)
         return float(match.group()) if match else 0.0
     except Exception:
         return 0.0
 
 
+# ── Alibaba — Apify ───────────────────────────────────────────────────────────
 def search_alibaba(keyword: str, max_results: int = 15) -> list:
-    """Search Alibaba via ScraperAPI structured endpoint."""
     print(f"  Searching Alibaba for: '{keyword}'...")
 
-    # Try ScraperAPI structured Alibaba endpoint first
-    results = _search_alibaba_structured(keyword, max_results)
+    keyword_encoded = keyword.replace(' ', '+')
+    search_url = (
+        f"https://www.alibaba.com/trade/search?"
+        f"tab=all&SearchText={keyword_encoded}&has4Tab=true"
+    )
 
-    if not results:
-        print("  Structured endpoint returned 0 — trying search page scrape...")
-        results = _search_alibaba_html(keyword, max_results)
-
-    print(f"  Found {len(results)} Alibaba results")
-    return results
-
-
-def _search_alibaba_structured(keyword: str, max_results: int) -> list:
-    """Use ScraperAPI's structured Alibaba search."""
     try:
-        params = {
-            "api_key": SCRAPERAPI_KEY,
-            "query":   keyword,
-            "country": "us",
-        }
-        url      = f"https://api.scraperapi.com/structured/alibaba/search?{urlencode(params)}"
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        run     = apify.actor("shareze001/scrape-alibaba-products-by-keywords").call(
+            run_input={
+                "search_url":          search_url,
+                "size":                max_results,
+                "skip_page_parameter": True,
+            },
+            timeout_secs=120
+        )
+        results = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
+        print(f"  Found {len(results)} Alibaba results")
 
-        if response.status_code != 200:
-            return []
+        if not results:
+            print("  Primary actor returned 0 — trying backup...")
+            try:
+                run2    = apify.actor("piotrv1001/alibaba-listings-scraper").call(
+                    run_input={"searchQuery": keyword, "maxItems": max_results}
+                )
+                results = list(apify.dataset(run2["defaultDatasetId"]).iterate_items())
+                print(f"  Backup found {len(results)} results")
+            except Exception as e2:
+                print(f"  Backup error: {e2}")
 
-        data    = response.json()
-        results = data.get("results") or data.get("products") or data.get("items") or []
-
-        # Normalize to internal format
-        normalized = []
-        for item in results[:max_results]:
-            normalized.append({
-                "subject":      item.get("name") or item.get("title") or "",
-                "moq":          item.get("min_order") or item.get("moq") or 1,
-                "supplier_name": item.get("company") or item.get("supplier") or "",
-                "url":          item.get("url") or item.get("product_url") or "",
-                "image_url":    item.get("image") or item.get("thumbnail") or "",
-                "price_min":    parse_price(item.get("price") or item.get("min_price")),
-                "price_max":    parse_price(item.get("max_price") or item.get("price")),
-                "years":        item.get("years_on_platform") or 0,
-                "_source":      "structured",
-            })
-        return normalized
+        return results
 
     except Exception as e:
-        print(f"  Structured endpoint error: {e}")
+        print(f"  Alibaba Apify error: {e}")
         return []
 
 
-def _search_alibaba_html(keyword: str, max_results: int) -> list:
-    """Fallback: scrape Alibaba search results page HTML and parse with GPT."""
-    keyword_encoded = quote_plus(keyword)
-    search_url      = f"https://www.alibaba.com/trade/search?SearchText={keyword_encoded}&tab=all"
-
-    response = scraper_get(search_url, render_js=True, country="us")
-    if not response:
-        return []
-
-    # Use GPT to extract product listings from HTML
-    html_snippet = response.text[:8000]  # limit tokens
-    return _gpt_extract_from_html(html_snippet, "alibaba", max_results)
-
-
+# ── AliExpress — ScraperAPI ───────────────────────────────────────────────────
 def search_aliexpress(keyword: str, max_results: int = 10) -> list:
-    """Search AliExpress via ScraperAPI."""
     print(f"  Searching AliExpress for: '{keyword}'...")
 
-    # Try structured endpoint first
     results = _search_aliexpress_structured(keyword, max_results)
 
     if not results:
-        print("  Trying AliExpress HTML scrape...")
+        print("  Structured returned 0 — trying HTML scrape...")
         results = _search_aliexpress_html(keyword, max_results)
 
     print(f"  Found {len(results)} AliExpress results")
@@ -408,77 +344,9 @@ def search_aliexpress(keyword: str, max_results: int = 10) -> list:
 
 
 def _search_aliexpress_structured(keyword: str, max_results: int) -> list:
-    """Use ScraperAPI's structured AliExpress search."""
     try:
-        params = {
-            "api_key": SCRAPERAPI_KEY,
-            "query":   keyword,
-        }
+        params   = {"api_key": SCRAPERAPI_KEY, "query": keyword}
         url      = f"https://api.scraperapi.com/structured/aliexpress/search?{urlencode(params)}"
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
-
-        if response.status_code != 200:
-            return []
-
-        data    = response.json()
-        results = data.get("results") or data.get("products") or data.get("items") or []
-
-        normalized = []
-        for item in results[:max_results]:
-            price = parse_price(item.get("price") or item.get("sale_price"))
-            normalized.append({
-                "title":        item.get("name") or item.get("title") or "",
-                "price":        price,
-                "seller_name":  item.get("store_name") or item.get("seller") or "AliExpress Seller",
-                "url":          item.get("url") or item.get("product_url") or "",
-                "image_url":    item.get("image") or item.get("thumbnail") or "",
-                "moq":          1,
-                "years":        0,
-                "_source":      "structured",
-            })
-        return normalized
-
-    except Exception as e:
-        print(f"  AliExpress structured error: {e}")
-        return []
-
-
-def _search_aliexpress_html(keyword: str, max_results: int) -> list:
-    """Fallback: scrape AliExpress search HTML."""
-    keyword_encoded = quote_plus(keyword)
-    search_url      = f"https://www.aliexpress.com/wholesale?SearchText={keyword_encoded}"
-
-    response = scraper_get(search_url, render_js=True, country="us")
-    if not response:
-        return []
-
-    html_snippet = response.text[:8000]
-    return _gpt_extract_from_html(html_snippet, "aliexpress", max_results)
-
-
-def search_amazon(keyword: str, max_results: int = 10) -> list:
-    """Search Amazon via ScraperAPI structured endpoint."""
-    print(f"  Searching Amazon for: '{keyword}'...")
-
-    results = _search_amazon_structured(keyword, max_results)
-
-    if not results:
-        print("  Trying Amazon HTML scrape...")
-        results = _search_amazon_html(keyword, max_results)
-
-    print(f"  Found {len(results)} Amazon results")
-    return results
-
-
-def _search_amazon_structured(keyword: str, max_results: int) -> list:
-    """Use ScraperAPI's structured Amazon search."""
-    try:
-        params = {
-            "api_key": SCRAPERAPI_KEY,
-            "query":   keyword,
-            "country": "us",
-        }
-        url      = f"https://api.scraperapi.com/structured/amazon/search?{urlencode(params)}"
         response = requests.get(url, timeout=REQUEST_TIMEOUT)
 
         if response.status_code != 200:
@@ -493,14 +361,67 @@ def _search_amazon_structured(keyword: str, max_results: int) -> list:
             normalized.append({
                 "title":       item.get("name") or item.get("title") or "",
                 "price":       price,
-                "brand":       item.get("brand") or item.get("seller") or "Amazon Seller",
+                "seller_name": item.get("store_name") or item.get("seller") or "AliExpress Seller",
                 "url":         item.get("url") or item.get("product_url") or "",
                 "image_url":   item.get("image") or item.get("thumbnail") or "",
-                "rating":      item.get("rating") or 0,
-                "reviews":     item.get("reviews_count") or 0,
                 "moq":         1,
                 "years":       0,
-                "_source":     "structured",
+            })
+        return normalized
+
+    except Exception as e:
+        print(f"  AliExpress structured error: {e}")
+        return []
+
+
+def _search_aliexpress_html(keyword: str, max_results: int) -> list:
+    keyword_encoded = quote_plus(keyword)
+    search_url      = f"https://www.aliexpress.com/wholesale?SearchText={keyword_encoded}"
+    response        = scraper_get(search_url, render_js=True, country="us")
+    if not response:
+        return []
+    return _gpt_extract_from_html(response.text[:8000], "aliexpress", max_results)
+
+
+# ── Amazon — ScraperAPI ───────────────────────────────────────────────────────
+def search_amazon(keyword: str, max_results: int = 10) -> list:
+    print(f"  Searching Amazon for: '{keyword}'...")
+
+    results = _search_amazon_structured(keyword, max_results)
+
+    if not results:
+        print("  Structured returned 0 — trying HTML scrape...")
+        results = _search_amazon_html(keyword, max_results)
+
+    print(f"  Found {len(results)} Amazon results")
+    return results
+
+
+def _search_amazon_structured(keyword: str, max_results: int) -> list:
+    try:
+        params   = {"api_key": SCRAPERAPI_KEY, "query": keyword, "country": "us"}
+        url      = f"https://api.scraperapi.com/structured/amazon/search?{urlencode(params)}"
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+
+        if response.status_code != 200:
+            return []
+
+        data    = response.json()
+        results = data.get("results") or data.get("products") or data.get("items") or []
+
+        normalized = []
+        for item in results[:max_results]:
+            price = parse_price(item.get("price") or item.get("sale_price"))
+            normalized.append({
+                "title":     item.get("name") or item.get("title") or "",
+                "price":     price,
+                "brand":     item.get("brand") or item.get("seller") or "Amazon Seller",
+                "url":       item.get("url") or item.get("product_url") or "",
+                "image_url": item.get("image") or item.get("thumbnail") or "",
+                "rating":    item.get("rating") or 0,
+                "reviews":   item.get("reviews_count") or 0,
+                "moq":       1,
+                "years":     0,
             })
         return normalized
 
@@ -510,23 +431,16 @@ def _search_amazon_structured(keyword: str, max_results: int) -> list:
 
 
 def _search_amazon_html(keyword: str, max_results: int) -> list:
-    """Fallback: scrape Amazon search HTML."""
     keyword_encoded = quote_plus(keyword)
     search_url      = f"https://www.amazon.com/s?k={keyword_encoded}"
-
-    response = scraper_get(search_url, render_js=False, country="us")
+    response        = scraper_get(search_url, render_js=False, country="us")
     if not response:
         return []
-
-    html_snippet = response.text[:8000]
-    return _gpt_extract_from_html(html_snippet, "amazon", max_results)
+    return _gpt_extract_from_html(response.text[:8000], "amazon", max_results)
 
 
+# ── GPT HTML fallback extractor ───────────────────────────────────────────────
 def _gpt_extract_from_html(html: str, platform: str, max_results: int) -> list:
-    """
-    Use GPT-4o-mini to extract product listings from raw HTML.
-    Fallback when structured endpoints fail.
-    """
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -534,13 +448,13 @@ def _gpt_extract_from_html(html: str, platform: str, max_results: int) -> list:
                 {
                     "role": "system",
                     "content": f"""Extract product listings from this {platform} HTML page.
-Return a JSON array of up to {max_results} products with these fields:
+Return a JSON array of up to {max_results} products:
 [{{
   "title": "product title",
   "price": 0.00,
-  "supplier_name": "company or seller name",
-  "url": "product URL if found",
-  "image_url": "image URL if found",
+  "supplier_name": "seller name",
+  "url": "product URL",
+  "image_url": "image URL",
   "moq": 1,
   "years": 0
 }}]
@@ -560,7 +474,7 @@ Return ONLY valid JSON array. If no products found return []."""
 
 
 # ==============================================================================
-# STEP 3 — Rank Suppliers with GPT-4o-mini (replaces GPT-4o)
+# STEP 3 — Rank Suppliers with GPT-4o-mini
 # ==============================================================================
 def rank_suppliers(
     raw_suppliers: list,
@@ -573,27 +487,26 @@ def rank_suppliers(
     if not raw_suppliers:
         return []
 
-    # Build summary for GPT
     summaries = []
     for i, s in enumerate(raw_suppliers[:15]):
         if platform == "alibaba":
-            price      = s.get("price_min") or parse_price(s.get("price") or s.get("subject_price") or 0)
-            name       = s.get("supplier_name") or (s.get("supplierInfo") or {}).get("name") or "Unknown"
-            years      = s.get("years") or (s.get("supplierInfo") or {}).get("joinYears") or 0
-            moq        = s.get("moq") or 1
-            title      = s.get("subject") or s.get("title") or ""
+            price = s.get("price_min") or parse_price(s.get("price") or 0)
+            name  = s.get("supplier_name") or (s.get("supplierInfo") or {}).get("name") or "Unknown"
+            years = s.get("years") or (s.get("supplierInfo") or {}).get("joinYears") or 0
+            moq   = s.get("moq") or 1
+            title = s.get("subject") or s.get("title") or ""
         elif platform == "aliexpress":
-            price      = parse_price(s.get("price") or s.get("sale_price") or 0)
-            name       = s.get("seller_name") or s.get("sellerName") or s.get("storeName") or "AliExpress Seller"
-            years      = 0
-            moq        = 1
-            title      = s.get("title") or s.get("name") or ""
+            price = parse_price(s.get("price") or 0)
+            name  = s.get("seller_name") or s.get("sellerName") or "AliExpress Seller"
+            years = 0
+            moq   = 1
+            title = s.get("title") or s.get("name") or ""
         elif platform == "amazon":
-            price      = parse_price(s.get("price") or 0)
-            name       = s.get("brand") or s.get("sellerName") or "Amazon Seller"
-            years      = 0
-            moq        = 1
-            title      = s.get("title") or s.get("name") or ""
+            price = parse_price(s.get("price") or 0)
+            name  = s.get("brand") or s.get("sellerName") or "Amazon Seller"
+            years = 0
+            moq   = 1
+            title = s.get("title") or s.get("name") or ""
         else:
             price, name, years, moq, title = 0, "Unknown", 0, 1, ""
 
@@ -617,16 +530,10 @@ def rank_suppliers(
 Target product: {product_title}
 TikTok sale price: ${tiktok_price}
 Platform: {platform}
-Ideal COGS target: under ${round(tiktok_price * 0.30, 2)} (for 30%+ margin)
+Ideal COGS: under ${round(tiktok_price * 0.30, 2)} for 30%+ margin
 
-STEP 1 — FILTER: Remove any supplier whose title does NOT match the target product.
-Be strict — wrong product type = exclude regardless of price.
-
-STEP 2 — RANK remaining by:
-1. Product match (most important)
-2. Price (lower = better profit)
-3. Trust (more years = better, for Alibaba)
-4. MOQ (lower = better for new sellers)
+STEP 1 — FILTER: Remove suppliers whose title does NOT match the target product type.
+STEP 2 — RANK remaining by: product match → price → trust (years) → MOQ
 
 Return TOP 3 as JSON array:
 [{{
@@ -637,7 +544,6 @@ Return TOP 3 as JSON array:
   "profitable": true,
   "product_match": true
 }}]
-
 If fewer than 3 match, return only matching ones.
 If none match return [].
 Return ONLY valid JSON."""
@@ -651,19 +557,19 @@ Return ONLY valid JSON."""
         content = response.choices[0].message.content.strip()
         content = content.replace("```json", "").replace("```", "").strip()
         ranked  = json.loads(content)
-        print(f"  GPT-4o-mini selected {len(ranked)} matching suppliers")
+        print(f"  GPT-4o-mini selected {len(ranked)} suppliers")
         return ranked
 
     except Exception as e:
         print(f"  Ranking error: {e}")
         return [
             {
-                "index":            i,
-                "rank_reason":      "Auto-selected",
+                "index":              i,
+                "rank_reason":        "Auto-selected",
                 "recommendation_tag": f"Option {i+1}",
-                "whitelabel_likely": False,
-                "profitable":       False,
-                "product_match":    False
+                "whitelabel_likely":  False,
+                "profitable":         False,
+                "product_match":      False
             }
             for i in range(min(3, len(raw_suppliers)))
         ]
@@ -673,36 +579,27 @@ Return ONLY valid JSON."""
 # STEP 4 — Extract Supplier Data
 # ==============================================================================
 def extract_supplier_data(raw: dict, platform: str) -> dict:
-    """Extract and normalize supplier fields from raw search result."""
 
     if platform == "alibaba":
-        # Handle both structured API format and legacy Apify format
         product_title = raw.get("subject") or raw.get("title") or ""
         supplier_name = (
             raw.get("supplier_name")
             or (raw.get("supplierInfo") or {}).get("name")
             or "Unknown Supplier"
         )
-        years = (
-            raw.get("years")
-            or (raw.get("supplierInfo") or {}).get("joinYears")
-            or 0
-        )
+        years        = raw.get("years") or (raw.get("supplierInfo") or {}).get("joinYears") or 0
         supplier_url = raw.get("url") or raw.get("supplier_url") or ""
 
-        # MOQ
         moq_raw = raw.get("moq") or 1
         try:
             moq = int(str(moq_raw).replace(",", "").strip())
         except Exception:
             moq = 1
 
-        # Price — use pre-parsed fields if available
         price_min = raw.get("price_min") or 0
         price_max = raw.get("price_max") or 0
 
         if not price_min and not price_max:
-            # Legacy Apify format
             price_obj = raw.get("price") or {}
             ladder    = price_obj.get("productLadderPrices") or []
             if ladder:
@@ -714,20 +611,13 @@ def extract_supplier_data(raw: dict, platform: str) -> dict:
                 price_min = parse_price(range_p.get("dollarPriceRangeLow"))
                 price_max = parse_price(range_p.get("dollarPriceRangeHigh") or range_p.get("dollarPriceRangeLow"))
 
-        # Image — try multiple fields
-        image_url = (
-            raw.get("image_url")
-            or raw.get("imageUrl")
-            or raw.get("mainImage")
-            or ""
-        )
+        image_url = raw.get("image_url") or raw.get("imageUrl") or raw.get("mainImage") or ""
         if not image_url:
             media_items = raw.get("mediaItems") or []
             if media_items:
                 img_obj   = media_items[0].get("imageUrl") or {}
                 image_url = img_obj.get("normal") or img_obj.get("big") or ""
 
-        # Whitelabel
         basic_props = raw.get("productBasicProperties") or []
         whitelabel  = False
         for prop in basic_props:
@@ -745,8 +635,7 @@ def extract_supplier_data(raw: dict, platform: str) -> dict:
         years         = 0
         supplier_url  = raw.get("url") or raw.get("productUrl") or ""
         moq           = 1
-        price_val     = raw.get("price") or raw.get("salePrice") or 0
-        price_min     = parse_price(price_val)
+        price_min     = parse_price(raw.get("price") or raw.get("salePrice") or 0)
         price_max     = price_min
         image_url     = raw.get("image_url") or raw.get("imageUrl") or raw.get("image") or ""
         whitelabel    = False
@@ -785,7 +674,7 @@ def extract_supplier_data(raw: dict, platform: str) -> dict:
 
 
 # ==============================================================================
-# STEP 5 — Save Suppliers to Supabase
+# STEP 5 — Save Suppliers
 # ==============================================================================
 def save_suppliers(
     product_id: str,
@@ -802,8 +691,8 @@ def save_suppliers(
         if idx >= len(raw_suppliers):
             continue
 
-        raw    = raw_suppliers[idx]
-        data   = extract_supplier_data(raw, platform)
+        raw  = raw_suppliers[idx]
+        data = extract_supplier_data(raw, platform)
         if not data:
             continue
 
@@ -832,7 +721,7 @@ def save_suppliers(
         }
 
         try:
-            result = supabase.table("suppliers").insert(record).execute()
+            result       = supabase.table("suppliers").insert(record).execute()
             saved_record = result.data[0] if result.data else record
             saved_record["_rank_reason"]        = rank_info.get("rank_reason", "")
             saved_record["_recommendation_tag"] = rank_info.get("recommendation_tag", "")
@@ -859,14 +748,13 @@ def find_suppliers_by_platform(
     platform: str,
     user_email: str
 ) -> dict:
-    """Search a single platform for suppliers. Deducts 1 credit."""
 
     print(f"\n{'='*55}")
     print(f"[{platform.upper()}] {product_title[:55]}")
     print(f"Price: ${tiktok_price} | User: {user_email}")
     print(f"{'='*55}")
 
-    # Check cache first
+    # Check cache
     existing = (
         supabase.table("suppliers")
         .select("*")
@@ -878,7 +766,7 @@ def find_suppliers_by_platform(
     if existing.data:
         print(f"  Cached results found — no credit deducted")
         for s in existing.data:
-            cogs = s.get("unit_cost_min") or s.get("unit_cost_max") or 0
+            cogs            = s.get("unit_cost_min") or s.get("unit_cost_max") or 0
             s["_profit"]    = calculate_profit(sale_price=tiktok_price, cogs=cogs)
             s["_image_url"] = s.get("image_url", "")
         existing.data.sort(key=lambda x: x.get("_profit", {}).get("margin_pct", -999), reverse=True)
@@ -895,13 +783,13 @@ def find_suppliers_by_platform(
     if credit_info["credits_remaining"] <= 0:
         return {
             "success":  False,
-            "message":  f"No credits remaining. Used {credit_info['credits_used']}/{credit_info['credits_total']} this month. Upgrade for more.",
+            "message":  f"No credits remaining. Used {credit_info['credits_used']}/{credit_info['credits_total']} this month.",
             "platform": platform,
             "credits":  credit_info,
             "suppliers": []
         }
 
-    # Deduct credit before search
+    # Deduct credit
     if not deduct_credit(user_email, product_id, platform):
         return {
             "success":  False,
@@ -913,7 +801,7 @@ def find_suppliers_by_platform(
     # Normalize title
     keyword = normalize_product_title(product_title)
 
-    # Search platform
+    # Search
     if platform == "alibaba":
         results = search_alibaba(keyword, max_results=15)
     elif platform == "aliexpress":
@@ -933,7 +821,7 @@ def find_suppliers_by_platform(
             "suppliers":       []
         }
 
-    # Rank with GPT-4o-mini
+    # Rank
     ranked = rank_suppliers(results, tiktok_price, product_title, platform)
 
     if not ranked:
@@ -966,7 +854,7 @@ def find_suppliers_by_platform(
 
 
 # ==============================================================================
-# LEGACY — backward compatibility
+# LEGACY
 # ==============================================================================
 def find_suppliers(product_id: str, product_title: str, tiktok_price: float) -> dict:
     return find_suppliers_by_platform(
