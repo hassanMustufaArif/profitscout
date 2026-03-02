@@ -1,0 +1,530 @@
+"""
+ProfitScout — Google Sheet → Scraper → Supabase Pipeline
+=========================================================
+Reads supplier URLs from Google Sheet, scrapes each one via Apify,
+enriches with GPT-4o-mini, saves to Supabase suppliers table.
+
+Cost: ~$0.02–0.05 per supplier URL (vs $0.30–0.70 for live search)
+
+Setup:
+1. pip install gspread google-auth apify-client openai supabase python-dotenv
+2. Create Google Cloud service account → download credentials.json
+3. Share your Google Sheet with the service account email
+4. Fill in your Google Sheet ID in .env
+5. Run: python scrape_from_sheet.py
+
+Google Sheet columns (Row 1 = headers):
+  A: product_name         — TikTok product name (for reference)
+  B: tiktok_product_id    — UUID from tiktok_products table
+  C: tiktok_price         — TikTok sale price (e.g. 44.99)
+  D: platform             — alibaba / aliexpress / amazon
+  E: supplier_url         — Full URL to supplier product page
+  F: notes                — Optional notes (OEM available, best price, etc.)
+  G: status               — Leave blank — script fills: done / error / skipped
+  H: scraped_at           — Leave blank — script fills timestamp
+"""
+
+import os
+import json
+import time
+from datetime import datetime, timezone
+
+import gspread
+from google.oauth2.service_account import Credentials
+from apify_client import ApifyClient
+from openai import OpenAI
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─── CLIENTS ──────────────────────────────────────────────────────────────────
+apify_client = ApifyClient(os.getenv("APIFY_API_TOKEN"))
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+)
+
+# Google Sheets setup
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly"
+]
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "credentials.json")
+
+# Column indices (0-based)
+COL_PRODUCT_NAME      = 0   # A
+COL_PRODUCT_ID        = 1   # B
+COL_TIKTOK_PRICE      = 2   # C
+COL_PLATFORM          = 3   # D
+COL_SUPPLIER_URL      = 4   # E
+COL_NOTES             = 5   # F
+COL_STATUS            = 6   # G
+COL_SCRAPED_AT        = 7   # H
+
+
+# ==============================================================================
+# GOOGLE SHEETS
+# ==============================================================================
+def connect_sheet():
+    """Connect to Google Sheets and return the worksheet."""
+    creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    worksheet = sh.sheet1
+    print(f"Connected to sheet: {sh.title}")
+    return worksheet
+
+
+def get_pending_rows(worksheet):
+    """Get all rows where status is blank (not yet processed)."""
+    all_rows = worksheet.get_all_values()
+    if not all_rows or len(all_rows) < 2:
+        print("No data rows found in sheet.")
+        return []
+
+    headers = all_rows[0]
+    print(f"Headers: {headers}")
+
+    pending = []
+    for i, row in enumerate(all_rows[1:], start=2):  # start=2 because row 1 is headers
+        # Pad row to at least 8 columns
+        while len(row) < 8:
+            row.append("")
+
+        status       = row[COL_STATUS].strip().lower()
+        supplier_url = row[COL_SUPPLIER_URL].strip()
+        product_id   = row[COL_PRODUCT_ID].strip()
+
+        # Skip if already done, errored, or missing required fields
+        if status in ["done", "skipped"]:
+            continue
+        if not supplier_url or not product_id:
+            print(f"  Row {i}: Skipping — missing URL or product_id")
+            continue
+
+        pending.append({
+            "row_num":      i,
+            "product_name": row[COL_PRODUCT_NAME].strip(),
+            "product_id":   product_id,
+            "tiktok_price": float(row[COL_TIKTOK_PRICE].strip() or "0"),
+            "platform":     row[COL_PLATFORM].strip().lower() or "alibaba",
+            "supplier_url": supplier_url,
+            "notes":        row[COL_NOTES].strip(),
+        })
+
+    print(f"Found {len(pending)} pending rows to process")
+    return pending
+
+
+def update_row_status(worksheet, row_num: int, status: str):
+    """Update the status and timestamp columns for a row."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    worksheet.update_cell(row_num, COL_STATUS + 1, status)       # +1 because gspread is 1-indexed
+    worksheet.update_cell(row_num, COL_SCRAPED_AT + 1, now)
+    print(f"  Row {row_num}: status = {status}")
+
+
+# ==============================================================================
+# SCRAPING — Platform-Specific URL Scrapers
+# ==============================================================================
+def scrape_alibaba_url(url: str) -> dict:
+    """Scrape a single Alibaba product URL."""
+    print(f"  Scraping Alibaba URL: {url[:80]}...")
+
+    try:
+        run = apify_client.actor("shareze001/scrape-alibaba-products-by-keywords").call(
+            run_input={
+                "search_url":          url,
+                "size":                1,
+                "skip_page_parameter": True,
+            },
+            timeout_secs=120
+        )
+
+        results = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
+        if results:
+            print(f"  Got {len(results)} result(s)")
+            return results[0]
+
+        # Fallback: try fetching the product page directly
+        print("  Primary actor returned 0 — trying direct page scrape...")
+        return scrape_url_direct(url, "alibaba")
+
+    except Exception as e:
+        print(f"  Alibaba scrape error: {e}")
+        return {}
+
+
+def scrape_aliexpress_url(url: str) -> dict:
+    """Scrape a single AliExpress product URL."""
+    print(f"  Scraping AliExpress URL: {url[:80]}...")
+
+    try:
+        run = apify_client.actor("bebity/aliexpress-scraper").call(
+            run_input={
+                "productUrls": [{"url": url}],
+                "maxItems": 1,
+            },
+            timeout_secs=120
+        )
+
+        results = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
+        if results:
+            return results[0]
+        return scrape_url_direct(url, "aliexpress")
+
+    except Exception as e:
+        print(f"  AliExpress scrape error: {e}")
+        return {}
+
+
+def scrape_amazon_url(url: str) -> dict:
+    """Scrape a single Amazon product URL."""
+    print(f"  Scraping Amazon URL: {url[:80]}...")
+
+    try:
+        run = apify_client.actor("junglee/amazon-crawler").call(
+            run_input={
+                "startUrls": [{"url": url}],
+                "maxItems": 1,
+                "country": "US",
+            },
+            timeout_secs=120
+        )
+
+        results = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
+        if results:
+            return results[0]
+        return scrape_url_direct(url, "amazon")
+
+    except Exception as e:
+        print(f"  Amazon scrape error: {e}")
+        return {}
+
+
+def scrape_url_direct(url: str, platform: str) -> dict:
+    """
+    Fallback: Use Apify's generic web scraper to extract
+    basic product info from any URL.
+    """
+    print(f"  Trying generic scraper for {platform} URL...")
+
+    try:
+        run = apify_client.actor("apify/web-scraper").call(
+            run_input={
+                "startUrls":     [{"url": url}],
+                "pageFunction":  """
+                    async function pageFunction(context) {
+                        const { page, request } = context;
+                        const title = await page.title();
+                        return {
+                            url: request.url,
+                            title: title,
+                            platform: '""" + platform + """'
+                        };
+                    }
+                """,
+                "maxPagesPerCrawl": 1,
+            },
+            timeout_secs=60
+        )
+
+        results = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
+        return results[0] if results else {}
+
+    except Exception as e:
+        print(f"  Generic scraper error: {e}")
+        return {}
+
+
+# ==============================================================================
+# ENRICHMENT — GPT extracts structured data from raw scraped content
+# ==============================================================================
+def enrich_with_gpt(raw: dict, platform: str, product_name: str, tiktok_price: float, notes: str) -> dict:
+    """
+    Use GPT-4o-mini to extract structured supplier data from raw scraped content.
+    Much cheaper than GPT-4o — good enough for extraction.
+    """
+    print(f"  Enriching with GPT-4o-mini...")
+
+    raw_text = json.dumps(raw, default=str)[:3000]  # limit tokens
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """Extract supplier information from this scraped product data.
+Return ONLY a JSON object with these exact fields:
+{
+  "supplier_name": "company name",
+  "product_title": "product title from supplier",
+  "unit_cost_min": 0.00,
+  "unit_cost_max": 0.00,
+  "moq": 1,
+  "years_on_platform": 0,
+  "whitelabel_available": false,
+  "image_url": "https://...",
+  "supplier_url": "https://...",
+  "shipping_days": 15,
+  "shipping_cost": 1.50
+}
+
+Rules:
+- unit_cost_min = lowest price (bulk/high MOQ), unit_cost_max = highest price (single unit)
+- If only one price found, use it for both min and max
+- moq = minimum order quantity (integer)
+- whitelabel_available = true if OEM/ODM/custom branding mentioned
+- shipping_days = estimated days (Alibaba=20, AliExpress=10, Amazon=3)
+- If a field cannot be found, use null for strings and 0 for numbers
+- Return ONLY valid JSON, no other text"""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Platform: {platform}
+TikTok product: {product_name}
+TikTok price: ${tiktok_price}
+Notes: {notes}
+
+Raw scraped data:
+{raw_text}"""
+                }
+            ],
+            max_tokens=400,
+            temperature=0
+        )
+
+        content = response.choices[0].message.content.strip()
+        content = content.replace("```json", "").replace("```", "").strip()
+        enriched = json.loads(content)
+        print(f"  GPT extracted: {enriched.get('supplier_name', 'unknown')} — ${enriched.get('unit_cost_min', 0)}")
+        return enriched
+
+    except Exception as e:
+        print(f"  GPT enrichment error: {e}")
+        return {}
+
+
+# ==============================================================================
+# PROFIT CALCULATOR
+# ==============================================================================
+def calculate_profit(sale_price: float, cogs: float, shipping_cost: float = 1.50) -> dict:
+    if sale_price <= 0 or cogs <= 0:
+        return {"net_profit": 0, "margin_pct": 0, "rating": "red", "profit_label": "Unknown"}
+
+    referral_fee         = sale_price * 0.06
+    transaction_fee      = sale_price * 0.029
+    affiliate_commission = sale_price * 0.15
+    fbt_fee              = 3.15
+    return_buffer        = sale_price * 0.08
+
+    total_fees  = referral_fee + transaction_fee + affiliate_commission + fbt_fee + shipping_cost + return_buffer
+    net_profit  = sale_price - cogs - total_fees
+    margin_pct  = (net_profit / sale_price * 100) if sale_price > 0 else 0
+
+    if margin_pct >= 35:
+        rating, label = "green", "Highly Profitable"
+    elif margin_pct >= 20:
+        rating, label = "green", "Profitable"
+    elif margin_pct >= 10:
+        rating, label = "amber", "Low Margin"
+    elif margin_pct >= 0:
+        rating, label = "amber", "Breakeven"
+    else:
+        rating, label = "red", "Unprofitable"
+
+    return {
+        "net_profit":   round(net_profit, 2),
+        "margin_pct":   round(margin_pct, 1),
+        "rating":       rating,
+        "profit_label": label
+    }
+
+
+# ==============================================================================
+# SAVE TO SUPABASE
+# ==============================================================================
+def save_to_supabase(
+    product_id: str,
+    platform: str,
+    enriched: dict,
+    tiktok_price: float,
+    notes: str
+) -> bool:
+    """Save enriched supplier data to Supabase suppliers table."""
+
+    unit_cost = enriched.get("unit_cost_min") or enriched.get("unit_cost_max") or 0
+    shipping  = enriched.get("shipping_cost") or 1.50
+    profit    = calculate_profit(tiktok_price, unit_cost, shipping)
+
+    record = {
+        "tiktok_product_id":      product_id,
+        "platform":               platform,
+        "supplier_name":          enriched.get("supplier_name") or "Unknown Supplier",
+        "product_title":          enriched.get("product_title") or "",
+        "unit_cost_min":          enriched.get("unit_cost_min") or 0,
+        "unit_cost_max":          enriched.get("unit_cost_max") or 0,
+        "moq":                    enriched.get("moq") or 1,
+        "shipping_estimate_days": enriched.get("shipping_days") or 15,
+        "shipping_cost_estimate": shipping,
+        "supplier_trust_score":   min(float(enriched.get("years_on_platform") or 0) / 2, 5.0),
+        "years_on_platform":      enriched.get("years_on_platform") or 0,
+        "whitelabel_available":   enriched.get("whitelabel_available") or False,
+        "supplier_url":           enriched.get("supplier_url") or "",
+        "image_url":              enriched.get("image_url") or "",
+    }
+
+    try:
+        # Check if supplier already exists for this product + platform + supplier_name
+        existing = (
+            supabase.table("suppliers")
+            .select("id")
+            .eq("tiktok_product_id", product_id)
+            .eq("platform", platform)
+            .eq("supplier_name", record["supplier_name"])
+            .execute()
+        )
+
+        if existing.data:
+            # Update existing record
+            supabase.table("suppliers").update(record).eq("id", existing.data[0]["id"]).execute()
+            print(f"  Updated existing supplier: {record['supplier_name']}")
+        else:
+            # Insert new record
+            supabase.table("suppliers").insert(record).execute()
+            print(f"  Saved new supplier: {record['supplier_name']} — ${record['unit_cost_min']} | {profit['profit_label']} ({profit['margin_pct']}%)")
+
+        return True
+
+    except Exception as e:
+        print(f"  Supabase save error: {e}")
+        return False
+
+
+# ==============================================================================
+# MAIN PIPELINE
+# ==============================================================================
+def process_row(row: dict) -> str:
+    """Process a single sheet row. Returns 'done' or 'error'."""
+
+    product_id   = row["product_id"]
+    product_name = row["product_name"]
+    tiktok_price = row["tiktok_price"]
+    platform     = row["platform"]
+    supplier_url = row["supplier_url"]
+    notes        = row["notes"]
+
+    print(f"\n{'─'*55}")
+    print(f"Product: {product_name[:50]}")
+    print(f"Platform: {platform} | Price: ${tiktok_price}")
+    print(f"URL: {supplier_url[:70]}")
+
+    # Step 1 — Scrape the URL
+    raw = {}
+    if platform == "alibaba":
+        raw = scrape_alibaba_url(supplier_url)
+    elif platform == "aliexpress":
+        raw = scrape_aliexpress_url(supplier_url)
+    elif platform == "amazon":
+        raw = scrape_amazon_url(supplier_url)
+    else:
+        print(f"  Unknown platform: {platform}")
+        return "error"
+
+    if not raw:
+        print(f"  No data scraped from URL")
+        return "error"
+
+    # Step 2 — Enrich with GPT
+    # Always inject the URL into raw so GPT can reference it
+    raw["_source_url"] = supplier_url
+    enriched = enrich_with_gpt(raw, platform, product_name, tiktok_price, notes)
+
+    if not enriched:
+        print(f"  GPT enrichment failed")
+        return "error"
+
+    # Ensure supplier_url is set (use source URL if GPT didn't find one)
+    if not enriched.get("supplier_url"):
+        enriched["supplier_url"] = supplier_url
+
+    # Step 3 — Save to Supabase
+    saved = save_to_supabase(product_id, platform, enriched, tiktok_price, notes)
+
+    if saved:
+        print(f"  ✅ Done")
+        return "done"
+    else:
+        print(f"  ❌ Save failed")
+        return "error"
+
+
+def run_pipeline(dry_run: bool = False):
+    """
+    Main entry point.
+    dry_run=True: shows what would be processed without scraping or saving.
+    """
+    print("\n" + "="*55)
+    print("ProfitScout — Sheet Scraper Pipeline")
+    print("="*55)
+
+    if dry_run:
+        print("DRY RUN MODE — no scraping or saving will happen\n")
+
+    # Connect to sheet
+    worksheet = connect_sheet()
+
+    # Get pending rows
+    pending = get_pending_rows(worksheet)
+
+    if not pending:
+        print("Nothing to process. Add supplier URLs to the sheet.")
+        return
+
+    print(f"\nProcessing {len(pending)} rows...\n")
+
+    success_count = 0
+    error_count   = 0
+
+    for row in pending:
+        row_num = row["row_num"]
+
+        if dry_run:
+            print(f"[DRY RUN] Would process row {row_num}: {row['product_name']} | {row['platform']} | {row['supplier_url'][:60]}")
+            continue
+
+        try:
+            status = process_row(row)
+
+            if status == "done":
+                success_count += 1
+            else:
+                error_count += 1
+
+            # Update sheet with status
+            update_row_status(worksheet, row_num, status)
+
+            # Small delay to avoid rate limiting
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"  Unexpected error on row {row_num}: {e}")
+            error_count += 1
+            update_row_status(worksheet, row_num, f"error: {str(e)[:50]}")
+
+    print(f"\n{'='*55}")
+    print(f"Pipeline complete")
+    print(f"  ✅ Success: {success_count}")
+    print(f"  ❌ Errors:  {error_count}")
+    print(f"  Total:     {len(pending)}")
+    print("="*55)
+
+
+if __name__ == "__main__":
+    import sys
+    dry_run = "--dry-run" in sys.argv
+    run_pipeline(dry_run=dry_run)
