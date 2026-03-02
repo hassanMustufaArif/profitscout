@@ -61,7 +61,7 @@ async def get_user_plan(request: Request):
         user_response = supabase.auth.get_user(token)
         email = user_response.user.email
         print(f"get_user_plan: email={email}")  # ADD THIS
-        result = supabase.table("users").select("plan").eq("email", email).execute()
+        result = supabase.table("users").select("plan").eq("user_email", email).execute()
         print(f"get_user_plan: result={result.data}")  # ADD THIS
         if result.data and len(result.data) > 0:
             return result.data[0].get("plan", "free")
@@ -575,7 +575,7 @@ async def lemonsqueezy_webhook(request: Request):
     payload = json.loads(body)
     event_name = payload.get("meta", {}).get("event_name")
     custom_data = payload.get("meta", {}).get("custom_data", {})
-    user_email = custom_data.get("email")
+    user_email = custom_data.get("email") or custom_data.get("user_email")
 
     if not user_email:
         user_email = payload.get("data", {}).get("attributes", {}).get("user_email")
@@ -595,22 +595,22 @@ async def lemonsqueezy_webhook(request: Request):
         plan = "pro"
 
     if event_name == "subscription_created":
-        supabase.table("users").update({"plan": plan}).eq("email", user_email).execute()
+        supabase.table("users").update({"plan": plan}).eq("user_email", user_email).execute()
         initialize_credits(user_email, plan)
         print(f"Upgraded {user_email} to {plan}")
 
     elif event_name in ["subscription_cancelled", "subscription_expired"]:
-        supabase.table("users").update({"plan": "free"}).eq("email", user_email).execute()
+        supabase.table("users").update({"plan": "free"}).eq("user_email", user_email).execute()
         initialize_credits(user_email, "free")
         print(f"Downgraded {user_email} to free")
 
     elif event_name == "subscription_updated":
         status = payload.get("data", {}).get("attributes", {}).get("status")
         if status == "active":
-            supabase.table("users").update({"plan": plan}).eq("email", user_email).execute()
+            supabase.table("users").update({"plan": plan}).eq("user_email", user_email).execute()
             initialize_credits(user_email, plan)
         elif status in ["cancelled", "expired", "past_due"]:
-            supabase.table("users").update({"plan": "free"}).eq("email", user_email).execute()
+            supabase.table("users").update({"plan": "free"}).eq("user_email", user_email).execute()
             initialize_credits(user_email, "free")
         print(f"Updated {user_email}: status={status}, plan={plan}")
 
