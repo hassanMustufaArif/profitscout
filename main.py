@@ -281,14 +281,18 @@ def get_stats(api_key: str = Security(verify_api_key)):
 # ENDPOINT 6 — Profit Calculator
 # ==============================================================================
 class ProfitRequest(BaseModel):
-    product_id:                str
+    product_id:                str = "manual"
     supplier_id:               Optional[str] = None
-    sale_price:                float
-    cogs:                      float
+    sale_price:                Optional[float] = None
+    selling_price:             Optional[float] = None
+    cogs:                      Optional[float] = None
+    product_cost:              Optional[float] = None
+    shipping_cost:             Optional[float] = 0.0
+    quantity:                  int = 1
     affiliate_commission_rate: float = 15.0
-    fbt_enabled:               bool  = True
+    fbt_enabled:               bool  = False
     product_weight_oz:         float = 8.0
-    inbound_shipping:          float = 1.20
+    inbound_shipping:          float = 0.0
     return_rate_pct:           float = 8.0
     ad_spend_per_unit:         float = 0.0
     is_new_seller:             bool  = False
@@ -297,10 +301,14 @@ class ProfitRequest(BaseModel):
 @app.post("/calculate-profit")
 def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)):
     try:
+        # Normalize field names from frontend
+        sale_price = req.sale_price or req.selling_price or 0
+        cogs = req.cogs or ((req.product_cost or 0) + (req.shipping_cost or 0))
+
         referral_rate   = 0.03 if req.is_new_seller else 0.06
-        referral_fee    = round(req.sale_price * referral_rate, 2)
-        transaction_fee = round(req.sale_price * 0.029, 2)
-        affiliate_amt   = round(req.sale_price * (req.affiliate_commission_rate / 100), 2)
+        referral_fee    = round(sale_price * referral_rate, 2)
+        transaction_fee = round(sale_price * 0.029, 2)
+        affiliate_amt   = round(sale_price * (req.affiliate_commission_rate / 100), 2)
 
         if req.fbt_enabled:
             if req.product_weight_oz <= 4:    fbt_fee = 2.68
@@ -315,24 +323,24 @@ def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)
         return_buffer    = round((req.return_rate_pct / 100) * refund_admin_fee, 2)
 
         total_costs = round(
-            req.cogs + referral_fee + transaction_fee + affiliate_amt
+            cogs + referral_fee + transaction_fee + affiliate_amt
             + fbt_fee + req.inbound_shipping + return_buffer + req.ad_spend_per_unit,
             2
         )
 
-        net_profit = round(req.sale_price - total_costs, 2)
-        margin_pct = round((net_profit / req.sale_price) * 100, 1) if req.sale_price > 0 else 0
+        net_profit = round(sale_price - total_costs, 2)
+        margin_pct = round((net_profit / sale_price) * 100, 1) if sale_price > 0 else 0
 
         if margin_pct >= 35:   rating = "green"
         elif margin_pct >= 20: rating = "amber"
         else:                  rating = "red"
 
         warnings = []
-        total_fees_pct = ((referral_fee + transaction_fee + affiliate_amt) / req.sale_price) * 100 if req.sale_price > 0 else 0
+        total_fees_pct = ((referral_fee + transaction_fee + affiliate_amt) / sale_price) * 100 if sale_price > 0 else 0
         if total_fees_pct > 35:
             warnings.append(f"TikTok fees + affiliate = {total_fees_pct:.1f}% of sale price. Very tight margins.")
-        if req.affiliate_commission_rate > 20:
-            warnings.append(f"Affiliate rate of {req.affiliate_commission_rate}% is very high. Consider reducing.")
+        if req.affiliate_commission_rate > 15:
+            warnings.append(f"Affiliate rate of {req.affiliate_commission_rate}% is high. Consider reducing.")
         if req.return_rate_pct > 20:
             warnings.append(f"Return rate of {req.return_rate_pct}% will significantly erode profit.")
         if margin_pct < 0:
@@ -342,13 +350,13 @@ def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)
             "success": True,
             "rating":  rating,
             "summary": {
-                "sale_price":  req.sale_price,
+                "sale_price":  sale_price,
                 "total_costs": total_costs,
                 "net_profit":  net_profit,
                 "margin_pct":  margin_pct,
             },
             "breakdown": {
-                "cost_of_goods":        req.cogs,
+                "cost_of_goods":        cogs,
                 "referral_fee":         referral_fee,
                 "transaction_fee":      transaction_fee,
                 "affiliate_commission": affiliate_amt,
