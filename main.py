@@ -416,13 +416,6 @@ async def get_suppliers(product_id: str, request: Request, api_key: str = Securi
     try:
         plan = await get_user_plan(request)
 
-        # Free users: no supplier access
-        if plan == "free":
-            raise HTTPException(
-                status_code=403,
-                detail="Supplier sourcing requires a Pro or Ultimate plan. Upgrade to unlock Alibaba, AliExpress, and Amazon sourcing."
-            )
-
         # Get user email
         auth_header = request.headers.get("Authorization")
         user_email = "anonymous"
@@ -454,8 +447,26 @@ async def get_suppliers(product_id: str, request: Request, api_key: str = Securi
             product_title=product["title"],
             tiktok_price=product["tiktok_price"] or 0,
             platform="alibaba",
-            user_email=user_email
+            user_email=user_email if plan in ["pro", "ultimate"] else "free_user"
         )
+
+        # Only deduct credits for Pro/Ultimate users
+        if plan in ["pro", "ultimate"] and user_email != "anonymous":
+            try:
+                credit_result = (
+                    supabase.table("user_credits")
+                    .select("credits_used")
+                    .eq("user_email", user_email)
+                    .single()
+                    .execute()
+                )
+                if credit_result.data:
+                    current = credit_result.data["credits_used"]
+                    supabase.table("user_credits").update(
+                        {"credits_used": current + 1}
+                    ).eq("user_email", user_email).execute()
+            except Exception:
+                pass
 
         return result
 
