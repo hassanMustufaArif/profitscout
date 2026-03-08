@@ -510,12 +510,7 @@ async def get_suppliers_by_platform(
 
         # Check plan
         plan = await get_user_plan(request)
-        if plan == "free":
-            raise HTTPException(
-                status_code=403,
-                detail="Supplier sourcing requires a Pro or Ultimate plan. Upgrade to unlock Alibaba, AliExpress, and Amazon sourcing."
-            )
-
+       
         # Get product
         product_result = (
             supabase.table("tiktok_products")
