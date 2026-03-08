@@ -31,12 +31,16 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://tiktokscout.lovable.app"],
+    allow_origins=[
+        "https://tikprofitpro.shop",
+        "https://www.tikprofitpro.shop",
+        "https://tikprofitpro.pages.dev",
+        "https://tiktokscout.lovable.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # --- API Key Auth ---
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
