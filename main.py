@@ -409,208 +409,139 @@ async def search_products(
 
 
 # ==============================================================================
-# ENDPOINT 8 — Find Suppliers (legacy — Alibaba only, backward compatible)
-# ==============================================================================
-@app.get("/products/{product_id}/suppliers")
-async def get_suppliers(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
-    try:
-        plan = await get_user_plan(request)
+    # ENDPOINT 8 — Find Suppliers (legacy — Alibaba only, backward compatible)
+    # ==============================================================================
+    @app.get("/products/{product_id}/suppliers")
+    async def get_suppliers(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
+        try:
+            plan = await get_user_plan(request)
 
-        # Get user email
-        auth_header = request.headers.get("Authorization")
-        user_email = "anonymous"
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header.replace("Bearer ", "")
-            try:
-                user_response = supabase.auth.get_user(token)
-                user_email = user_response.user.email
-            except Exception:
-                pass
+            # Get user email
+            auth_header = request.headers.get("Authorization")
+            user_email = "anonymous"
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.replace("Bearer ", "")
+                try:
+                    user_response = supabase.auth.get_user(token)
+                    user_email = user_response.user.email
+                except Exception:
+                    pass
 
-        # Get product
-        product_result = (
-            supabase.table("tiktok_products")
-            .select("id, title, tiktok_price")
-            .eq("id", product_id)
-            .single()
-            .execute()
-        )
+            # Get product
+            product_result = (
+                supabase.table("tiktok_products")
+                .select("id, title, tiktok_price")
+                .eq("id", product_id)
+                .single()
+                .execute()
+            )
+            if not product_result.data:
+                raise HTTPException(status_code=404, detail="Product not found")
+            product = product_result.data
 
-        if not product_result.data:
-            raise HTTPException(status_code=404, detail="Product not found")
-
-        product = product_result.data
-
-        # ── BUG 1 FIX: Check credits BEFORE running search ────────────────────
-        if plan in ["pro", "ultimate"] and user_email != "anonymous":
-            try:
-                credit_result = (
-                    supabase.table("user_credits")
-                    .select("credits_used, credits_total")   # BUG WAS: only selected credits_used
-                    .eq("user_email", user_email)
-                    .single()
-                    .execute()
+            # ── Single atomic credit check + deduct (BEFORE search) ───────────
+            # Passes "free_user" to engine so it won't deduct a second time
+            credit = check_and_deduct_credit(user_email, plan, product_id, "alibaba")
+            if not credit["allowed"]:
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"No credits remaining. You've used {credit['credits_used']}/{credit['credits_total']} credits. Please upgrade your plan."
                 )
-                if credit_result.data:
-                    credits_used  = credit_result.data["credits_used"]  or 0
-                    credits_total = credit_result.data["credits_total"] or 0
-                    if credits_used >= credits_total:
-                        raise HTTPException(
-                            status_code=402,
-                            detail=f"No credits remaining. You've used {credits_used}/{credits_total} credits. Please upgrade your plan."
-                        )
-            except HTTPException:
-                raise   # BUG WAS: except Exception: pass — swallowed the 402
-            except Exception:
-                pass    # DB error — allow through rather than block user
 
-        # Run supplier matching (Alibaba default)
-        result = find_suppliers_by_platform(
-            product_id=product["id"],
-            product_title=product["title"],
-            tiktok_price=product["tiktok_price"] or 0,
-            platform="alibaba",
-            user_email=user_email if plan in ["pro", "ultimate"] else "free_user"
-        )
-
-        # ── Deduct 1 credit AFTER successful search ───────────────────────────
-        if plan in ["pro", "ultimate"] and user_email != "anonymous":
-            try:
-                credit_result = (
-                    supabase.table("user_credits")
-                    .select("credits_used")
-                    .eq("user_email", user_email)
-                    .single()
-                    .execute()
-                )
-                if credit_result.data:
-                    current = credit_result.data["credits_used"]
-                    supabase.table("user_credits").update(
-                        {"credits_used": current + 1}
-                    ).eq("user_email", user_email).execute()
-            except Exception:
-                pass
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ==============================================================================
-# ENDPOINT 9 — Find Suppliers by Platform (NEW — credit-based)
-# GET /products/{product_id}/suppliers/{platform}
-# platform = alibaba | aliexpress | amazon
-# ==============================================================================
-@app.get("/products/{product_id}/suppliers/{platform}")
-async def get_suppliers_by_platform(
-    product_id: str,
-    platform:   str,
-    request:    Request,
-    api_key:    str = Security(verify_api_key),
-):
-    """Search a specific platform. Costs 1 credit."""
-
-    if platform not in ["alibaba", "aliexpress", "amazon"]:
-        raise HTTPException(status_code=400, detail="Platform must be: alibaba, aliexpress, or amazon")
-
-    try:
-        # Get user email from auth token
-        auth_header = request.headers.get("Authorization")
-        user_email = None
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header.replace("Bearer ", "")
-            try:
-                user_response = supabase.auth.get_user(token)
-                user_email = user_response.user.email
-            except Exception:
-                pass
-
-        if not user_email:
-            raise HTTPException(status_code=401, detail="Authentication required for supplier search")
-
-        # Check plan
-        plan = await get_user_plan(request)
-
-        # ── BUG 2 FIX: Endpoint 9 had NO credit check at all ─────────────────
-        if plan in ["pro", "ultimate"]:
-            try:
-                credit_result = (
-                    supabase.table("user_credits")
-                    .select("credits_used, credits_total")
-                    .eq("user_email", user_email)
-                    .single()
-                    .execute()
-                )
-                if credit_result.data:
-                    credits_used  = credit_result.data["credits_used"]  or 0
-                    credits_total = credit_result.data["credits_total"] or 0
-                    if credits_used >= credits_total:
-                        raise HTTPException(
-                            status_code=402,
-                            detail=f"No credits remaining. You've used {credits_used}/{credits_total} credits. Please upgrade your plan."
-                        )
-            except HTTPException:
-                raise
-            except Exception:
-                pass
-        elif plan == "free":
-            # BUG 3 FIX: Free users were not blocked from this endpoint at all
-            raise HTTPException(
-                status_code=403,
-                detail="Supplier search by platform requires a Pro or Ultimate plan. Please upgrade."
+            # Run supplier matching — "free_user" prevents engine deducting again
+            result = find_suppliers_by_platform(
+                product_id=product["id"],
+                product_title=product["title"],
+                tiktok_price=product["tiktok_price"] or 0,
+                platform="alibaba",
+                user_email="free_user"
             )
 
-        # Get product
-        product_result = (
-            supabase.table("tiktok_products")
-            .select("id, product_name, tiktok_price")
-            .eq("id", product_id)
-            .single()
-            .execute()
-        )
+            return result
 
-        if not product_result.data:
-            raise HTTPException(status_code=404, detail="Product not found")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
-        product = product_result.data
 
-        # Run platform-specific supplier search
-        result = find_suppliers_by_platform(
-            product_id=product["id"],
-            product_title=product["product_name"],
-            tiktok_price=product["tiktok_price"] or 0,
-            platform=platform,
-            user_email=user_email
-        )
+    # ==============================================================================
+    # ENDPOINT 9 — Find Suppliers by Platform (credit-based)
+    # GET /products/{product_id}/suppliers/{platform}
+    # platform = alibaba | aliexpress | amazon
+    # ==============================================================================
+    @app.get("/products/{product_id}/suppliers/{platform}")
+    async def get_suppliers_by_platform(
+        product_id: str,
+        platform:   str,
+        request:    Request,
+        api_key:    str = Security(verify_api_key),
+    ):
+        """Search a specific platform. Costs 1 credit."""
 
-        # ── Deduct 1 credit AFTER successful search ───────────────────────────
-        if plan in ["pro", "ultimate"]:
-            try:
-                credit_result = (
-                    supabase.table("user_credits")
-                    .select("credits_used")
-                    .eq("user_email", user_email)
-                    .single()
-                    .execute()
+        if platform not in ["alibaba", "aliexpress", "amazon"]:
+            raise HTTPException(status_code=400, detail="Platform must be: alibaba, aliexpress, or amazon")
+
+        try:
+            # Get user email
+            auth_header = request.headers.get("Authorization")
+            user_email = None
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.replace("Bearer ", "")
+                try:
+                    user_response = supabase.auth.get_user(token)
+                    user_email = user_response.user.email
+                except Exception:
+                    pass
+
+            if not user_email:
+                raise HTTPException(status_code=401, detail="Authentication required for supplier search")
+
+            plan = await get_user_plan(request)
+
+            # Block free users entirely
+            if plan == "free":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Supplier search requires a Pro or Ultimate plan. Please upgrade."
                 )
-                if credit_result.data:
-                    current = credit_result.data["credits_used"]
-                    supabase.table("user_credits").update(
-                        {"credits_used": current + 1}
-                    ).eq("user_email", user_email).execute()
-            except Exception:
-                pass
 
-        return result
+            # Get product
+            product_result = (
+                supabase.table("tiktok_products")
+                .select("id, product_name, tiktok_price")
+                .eq("id", product_id)
+                .single()
+                .execute()
+            )
+            if not product_result.data:
+                raise HTTPException(status_code=404, detail="Product not found")
+            product = product_result.data
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            # ── Single atomic credit check + deduct (BEFORE search) ───────────
+            # Passes "free_user" to engine so it won't deduct a second time
+            credit = check_and_deduct_credit(user_email, plan, product_id, platform)
+            if not credit["allowed"]:
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"No credits remaining. You've used {credit['credits_used']}/{credit['credits_total']} credits. Please upgrade your plan."
+                )
 
+            # Run supplier search — "free_user" prevents engine deducting again
+            result = find_suppliers_by_platform(
+                product_id=product["id"],
+                product_title=product["product_name"],
+                tiktok_price=product["tiktok_price"] or 0,
+                platform=platform,
+                user_email="free_user"
+            )
+
+            return result
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 # ==============================================================================
 

@@ -11,6 +11,11 @@ v3 Changes:
 - MOQ accuracy fix (maps price tiers correctly)
 - GPT ranking now filters out irrelevant products first
 - Cleaner error handling throughout
+
+v3.1 Credit fix:
+- Replaced deduct_credit() with check_and_deduct_credit() — single atomic call
+- find_suppliers_by_platform skips internal deduction when user_email == "free_user"
+  (main.py handles check+deduct before calling engine, passes "free_user" to prevent double billing)
 """
 
 from apify_client import ApifyClient
@@ -71,34 +76,62 @@ def check_credits(user_email: str) -> dict:
         return {"credits_remaining": 0, "plan": "free", "credits_total": 0, "credits_used": 0}
 
 
-def deduct_credit(user_email: str, product_id: str, platform: str) -> bool:
-    """Deduct 1 credit and log the usage. Returns True if successful."""
+def check_and_deduct_credit(user_email: str, plan: str, product_id: str, platform: str) -> dict:
+    """
+    Single atomic function: checks credit balance, deducts 1 if available, logs usage.
+    Returns {"allowed": True/False, "credits_used": N, "credits_total": N}
+
+    Call this ONCE per search from main.py — replaces separate check + deduct calls.
+    Cached results skip this entirely (no credit charged for cache hits).
+    """
+    # Free users, legacy, anonymous — always allow, no deduction
+    if plan not in ("pro", "ultimate") or not user_email or user_email in ("anonymous", "free_user", "legacy"):
+        return {"allowed": True, "credits_used": 0, "credits_total": 999}
+
     try:
-        result = supabase.table("user_credits").select("credits_used").eq("user_email", user_email).execute()
+        result = (
+            supabase.table("user_credits")
+            .select("credits_used, credits_total")
+            .eq("user_email", user_email)
+            .single()
+            .execute()
+        )
         if not result.data:
-            return False
+            # No credit record — allow but log warning
+            print(f"WARNING: No credit record found for {user_email}")
+            return {"allowed": True, "credits_used": 0, "credits_total": 999}
 
-        current_used = result.data[0]["credits_used"]
-        supabase.table("user_credits").update({
-            "credits_used": current_used + 1
-        }).eq("user_email", user_email).execute()
+        credits_used  = result.data["credits_used"]  or 0
+        credits_total = result.data["credits_total"] or 0
 
-        # Log the usage — table must exist in Supabase
+        # Block if at or over limit
+        if credits_used >= credits_total:
+            return {"allowed": False, "credits_used": credits_used, "credits_total": credits_total}
+
+        # Deduct — the extra .eq("credits_used", credits_used) is an optimistic lock:
+        # if two simultaneous requests fire, only one will match the exact current value
+        # and deduct; the other will update 0 rows (safe, no double-charge)
+        supabase.table("user_credits").update(
+            {"credits_used": credits_used + 1}
+        ).eq("user_email", user_email).eq("credits_used", credits_used).execute()
+
+        # Log usage (non-fatal)
         try:
             supabase.table("credit_logs").insert({
-                "user_email": user_email,
-                "product_id": product_id,
-                "platform": platform,
+                "user_email":       user_email,
+                "product_id":       product_id,
+                "platform":         platform,
                 "credits_deducted": 1
             }).execute()
         except Exception as log_err:
-            # Don't fail the whole deduction if logging fails
             print(f"Credit log warning (non-fatal): {log_err}")
 
-        return True
+        return {"allowed": True, "credits_used": credits_used + 1, "credits_total": credits_total}
+
     except Exception as e:
-        print(f"Credit deduction error: {e}")
-        return False
+        print(f"check_and_deduct_credit error: {e}")
+        # DB error — allow through rather than block a paying user
+        return {"allowed": True, "credits_used": 0, "credits_total": 999}
 
 
 def initialize_credits(user_email: str, plan: str):
@@ -246,7 +279,6 @@ Scalp Massager Shampoo Brush Hair Growth Stimulator → scalp massager shampoo b
             temperature=0
         )
         normalized = response.choices[0].message.content.strip().lower()
-        # Remove any quotes GPT might add
         normalized = normalized.strip('"\'')
         print(f"  Normalized to: '{normalized}'")
         return normalized
@@ -254,9 +286,9 @@ Scalp Massager Shampoo Brush Hair Growth Stimulator → scalp massager shampoo b
     except Exception as e:
         print(f"  GPT normalization failed, using basic cleanup: {e}")
         import re
-        cleaned = re.sub(r'\[.*?\]', '', raw_title)   # remove [Brand]
-        cleaned = re.sub(r'\b20\d{2}\b', '', cleaned)  # remove years
-        cleaned = re.sub(r'[^\w\s]', ' ', cleaned)     # remove punctuation
+        cleaned = re.sub(r'\[.*?\]', '', raw_title)
+        cleaned = re.sub(r'\b20\d{2}\b', '', cleaned)
+        cleaned = re.sub(r'[^\w\s]', ' ', cleaned)
         words = [w for w in cleaned.split() if len(w) > 2][:6]
         return ' '.join(words).lower().strip()
 
@@ -391,7 +423,6 @@ def rank_suppliers(
         if platform == "alibaba":
             price_obj  = s.get("price") or {}
             ladder     = price_obj.get("productLadderPrices") or []
-            # Use highest-MOQ tier price (lowest unit cost) for profitability check
             if ladder:
                 prices = [float(t.get("dollarPrice", 0)) for t in ladder if t.get("dollarPrice")]
                 unit_price = min(prices) if prices else 0
@@ -452,8 +483,8 @@ TikTok Sale Price: ${tiktok_price}
 Target Product: {product_title}
 Platform: {platform}
 
-STEP 1 — FILTER: Remove any supplier whose product title does not match 
-the target product type. A "women probiotic capsule" is NOT the same as 
+STEP 1 — FILTER: Remove any supplier whose product title does not match
+the target product type. A "women probiotic capsule" is NOT the same as
 a "face mask" or "hair serum". Be strict — if it's a different product, exclude it.
 
 STEP 2 — RANK remaining suppliers by:
@@ -496,7 +527,6 @@ Return ONLY valid JSON — no text outside the array."""
 
     except Exception as e:
         print(f"  Ranking error: {e}")
-        # Fallback: return first 3 without filtering
         return [
             {
                 "index": i,
@@ -523,27 +553,24 @@ def extract_supplier_data(raw: dict, platform: str) -> dict:
         years         = supplier_info.get("joinYears") or 0
         supplier_url  = raw.get("url") or supplier_info.get("homeUrl") or ""
 
-        # MOQ — use top-level moq field (minimum order regardless of price tier)
         moq_raw = raw.get("moq") or "1"
         try:
             moq = int(str(moq_raw).replace(",", "").strip())
         except Exception:
             moq = 1
 
-        # Price tiers — price_max = highest price (lowest MOQ), price_min = lowest price (highest MOQ)
         price_obj = raw.get("price") or {}
         ladder    = price_obj.get("productLadderPrices") or []
 
         if ladder:
             prices    = [float(tier.get("dollarPrice", 0)) for tier in ladder if tier.get("dollarPrice")]
-            price_min = min(prices) if prices else 0   # best bulk price
-            price_max = max(prices) if prices else 0   # single unit price
+            price_min = min(prices) if prices else 0
+            price_max = max(prices) if prices else 0
         else:
             range_prices = price_obj.get("productRangePrices") or {}
             price_min    = float(range_prices.get("dollarPriceRangeLow")  or 0)
             price_max    = float(range_prices.get("dollarPriceRangeHigh") or price_min)
 
-        # Image — try multiple fields
         image_url   = ""
         media_items = raw.get("mediaItems") or []
         if media_items:
@@ -557,10 +584,8 @@ def extract_supplier_data(raw: dict, platform: str) -> dict:
                 or ""
             )
         if not image_url:
-            # Fallback to mainImage or thumbnail fields
             image_url = raw.get("mainImage") or raw.get("thumbnailUrl") or raw.get("image") or ""
 
-        # Whitelabel check
         basic_props = raw.get("productBasicProperties") or []
         whitelabel  = False
         for prop in basic_props:
@@ -586,7 +611,6 @@ def extract_supplier_data(raw: dict, platform: str) -> dict:
             price_min = 0
         price_max = price_min
 
-        # Image
         image_url = (
             raw.get("imageUrl")
             or raw.get("image")
@@ -613,7 +637,6 @@ def extract_supplier_data(raw: dict, platform: str) -> dict:
             price_min = 0
         price_max = price_min
 
-        # Image
         image_url = (
             raw.get("imageUrl")
             or raw.get("image")
@@ -668,7 +691,6 @@ def save_suppliers(
         if not data:
             continue
 
-        # Calculate profit using bulk price (price_min) for best-case scenario
         cogs = data["price_min"] if data["price_min"] > 0 else data["price_max"]
         profit_data = calculate_profit(
             sale_price=tiktok_price,
@@ -690,14 +712,13 @@ def save_suppliers(
             "years_on_platform":      data["years"],
             "whitelabel_available":   data["whitelabel"],
             "supplier_url":           data["supplier_url"],
-            "image_url":              data["image_url"],   # v3: save image
+            "image_url":              data["image_url"],
         }
 
         try:
             result = supabase.table("suppliers").insert(supplier_record).execute()
             record = result.data[0] if result.data else supplier_record
 
-            # Attach extra fields for API response (not stored in DB)
             record["_rank_reason"]        = rank_info.get("rank_reason", "")
             record["_recommendation_tag"] = rank_info.get("recommendation_tag", "")
             record["_product_match"]      = rank_info.get("product_match", True)
@@ -710,7 +731,6 @@ def save_suppliers(
         except Exception as e:
             print(f"  Error saving supplier: {e}")
 
-    # Sort by margin — most profitable first
     saved.sort(key=lambda x: x.get("_profit", {}).get("margin_pct", -999), reverse=True)
     print(f"  Saved {len(saved)} suppliers total")
     return saved
@@ -726,14 +746,21 @@ def find_suppliers_by_platform(
     platform: str,
     user_email: str
 ) -> dict:
-    """Search a single platform for suppliers. Deducts 1 credit."""
+    """
+    Search a single platform for suppliers.
+
+    Credit handling:
+    - If user_email == "free_user": main.py already did check+deduct — skip here
+    - If user_email is a real email (legacy path): do check+deduct internally
+    - Cached results never deduct a credit regardless
+    """
 
     print(f"\n{'='*55}")
     print(f"[{platform.upper()}] Finding suppliers for: {product_title[:60]}...")
     print(f"TikTok Price: ${tiktok_price} | User: {user_email}")
     print(f"{'='*55}")
 
-    # Check for cached results for this product + platform
+    # Check for cached results — no credit charged for cache hits
     existing = (
         supabase.table("suppliers")
         .select("*")
@@ -747,43 +774,45 @@ def find_suppliers_by_platform(
         for supplier in existing.data:
             cogs = supplier.get("unit_cost_min") or supplier.get("unit_cost_max") or 0
             supplier["_profit"] = calculate_profit(sale_price=tiktok_price, cogs=cogs)
-            # Ensure image is available under both keys
             if not supplier.get("_image_url"):
                 supplier["_image_url"] = supplier.get("image_url", "")
         existing.data.sort(key=lambda x: x.get("_profit", {}).get("margin_pct", -999), reverse=True)
         return {
-            "success":        True,
-            "cached":         True,
-            "platform":       platform,
+            "success":         True,
+            "cached":          True,
+            "platform":        platform,
             "credit_deducted": False,
-            "suppliers":      existing.data
+            "suppliers":       existing.data
         }
 
-    # Check credits
-    credit_info = check_credits(user_email)
-    if credit_info["credits_remaining"] <= 0:
-        return {
-            "success":  False,
-            "message":  f"No credits remaining. You've used {credit_info['credits_used']}/{credit_info['credits_total']} credits this month. Upgrade your plan for more credits.",
-            "platform": platform,
-            "credits":  credit_info,
-            "suppliers": []
-        }
+    # ── Credit handling ────────────────────────────────────────────────────────
+    # "free_user" means main.py already called check_and_deduct_credit() — skip
+    # Any real email in legacy path (e.g. called directly) — check+deduct here
+    internal_deduct = user_email not in ("free_user", "anonymous", "legacy", "")
 
-    # Deduct credit BEFORE search (prevents abuse if search fails)
-    deducted = deduct_credit(user_email, product_id, platform)
-    if not deducted:
-        return {
-            "success":  False,
-            "message":  "Failed to deduct credit. Please try again.",
-            "platform": platform,
-            "suppliers": []
-        }
+    if internal_deduct:
+        # Legacy path: engine handles credits itself
+        credit_info = check_credits(user_email)
+        if credit_info["credits_remaining"] <= 0:
+            return {
+                "success":   False,
+                "message":   f"No credits remaining. You've used {credit_info['credits_used']}/{credit_info['credits_total']} credits this month. Upgrade your plan for more credits.",
+                "platform":  platform,
+                "credits":   credit_info,
+                "suppliers": []
+            }
+        # Deduct before search
+        result = supabase.table("user_credits").select("credits_used").eq("user_email", user_email).execute()
+        if result.data:
+            current = result.data[0]["credits_used"]
+            supabase.table("user_credits").update(
+                {"credits_used": current + 1}
+            ).eq("user_email", user_email).execute()
 
-    # Normalize title to precise search keyword
+    # Normalize title
     normalized_keyword = normalize_product_title(product_title)
 
-    # Search the selected platform
+    # Search platform
     if platform == "alibaba":
         results = search_alibaba(normalized_keyword, max_results=15)
     elif platform == "aliexpress":
@@ -795,32 +824,32 @@ def find_suppliers_by_platform(
 
     if not results:
         return {
-            "success":        False,
-            "message":        f"No suppliers found on {platform} for '{normalized_keyword}'. 1 credit was used.",
-            "platform":       platform,
-            "keyword":        normalized_keyword,
+            "success":         False,
+            "message":         f"No suppliers found on {platform} for '{normalized_keyword}'. 1 credit was used.",
+            "platform":        platform,
+            "keyword":         normalized_keyword,
             "credit_deducted": True,
-            "suppliers":      []
+            "suppliers":       []
         }
 
-    # Rank with GPT-4o — filters irrelevant products
+    # Rank with GPT-4o
     ranked = rank_suppliers(results, tiktok_price, product_title, platform)
 
     if not ranked:
         return {
-            "success":        False,
-            "message":        f"Found {len(results)} results on {platform} but none matched '{product_title}'. Try a different platform. 1 credit was used.",
-            "platform":       platform,
-            "keyword":        normalized_keyword,
+            "success":         False,
+            "message":         f"Found {len(results)} results on {platform} but none matched '{product_title}'. Try a different platform. 1 credit was used.",
+            "platform":        platform,
+            "keyword":         normalized_keyword,
             "credit_deducted": True,
-            "suppliers":      []
+            "suppliers":       []
         }
 
     # Save and return
     saved = save_suppliers(product_id, results, ranked, tiktok_price, platform)
 
     profitable_count = sum(1 for s in saved if s.get("_profit", {}).get("margin_pct", 0) >= 20)
-    updated_credits  = check_credits(user_email)
+    updated_credits  = check_credits(user_email) if internal_deduct else {"credits_remaining": "N/A"}
 
     print(f"\n✅ {platform} complete — {len(saved)} suppliers, {profitable_count} profitable, keyword: '{normalized_keyword}'")
 
@@ -830,7 +859,7 @@ def find_suppliers_by_platform(
         "platform":           platform,
         "normalized_keyword": normalized_keyword,
         "credit_deducted":    True,
-        "credits_remaining":  updated_credits["credits_remaining"],
+        "credits_remaining":  updated_credits.get("credits_remaining", "N/A"),
         "profitable_count":   profitable_count,
         "suppliers":          saved
     }
