@@ -441,6 +441,29 @@ async def get_suppliers(product_id: str, request: Request, api_key: str = Securi
 
         product = product_result.data
 
+        # ── BUG 1 FIX: Check credits BEFORE running search ────────────────────
+        if plan in ["pro", "ultimate"] and user_email != "anonymous":
+            try:
+                credit_result = (
+                    supabase.table("user_credits")
+                    .select("credits_used, credits_total")   # BUG WAS: only selected credits_used
+                    .eq("user_email", user_email)
+                    .single()
+                    .execute()
+                )
+                if credit_result.data:
+                    credits_used  = credit_result.data["credits_used"]  or 0
+                    credits_total = credit_result.data["credits_total"] or 0
+                    if credits_used >= credits_total:
+                        raise HTTPException(
+                            status_code=402,
+                            detail=f"No credits remaining. You've used {credits_used}/{credits_total} credits. Please upgrade your plan."
+                        )
+            except HTTPException:
+                raise   # BUG WAS: except Exception: pass — swallowed the 402
+            except Exception:
+                pass    # DB error — allow through rather than block user
+
         # Run supplier matching (Alibaba default)
         result = find_suppliers_by_platform(
             product_id=product["id"],
@@ -450,7 +473,7 @@ async def get_suppliers(product_id: str, request: Request, api_key: str = Securi
             user_email=user_email if plan in ["pro", "ultimate"] else "free_user"
         )
 
-        # Only deduct credits for Pro/Ultimate users
+        # ── Deduct 1 credit AFTER successful search ───────────────────────────
         if plan in ["pro", "ultimate"] and user_email != "anonymous":
             try:
                 credit_result = (
@@ -510,7 +533,36 @@ async def get_suppliers_by_platform(
 
         # Check plan
         plan = await get_user_plan(request)
-       
+
+        # ── BUG 2 FIX: Endpoint 9 had NO credit check at all ─────────────────
+        if plan in ["pro", "ultimate"]:
+            try:
+                credit_result = (
+                    supabase.table("user_credits")
+                    .select("credits_used, credits_total")
+                    .eq("user_email", user_email)
+                    .single()
+                    .execute()
+                )
+                if credit_result.data:
+                    credits_used  = credit_result.data["credits_used"]  or 0
+                    credits_total = credit_result.data["credits_total"] or 0
+                    if credits_used >= credits_total:
+                        raise HTTPException(
+                            status_code=402,
+                            detail=f"No credits remaining. You've used {credits_used}/{credits_total} credits. Please upgrade your plan."
+                        )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+        elif plan == "free":
+            # BUG 3 FIX: Free users were not blocked from this endpoint at all
+            raise HTTPException(
+                status_code=403,
+                detail="Supplier search by platform requires a Pro or Ultimate plan. Please upgrade."
+            )
+
         # Get product
         product_result = (
             supabase.table("tiktok_products")
@@ -525,7 +577,7 @@ async def get_suppliers_by_platform(
 
         product = product_result.data
 
-        # Run platform-specific supplier search (deducts 1 credit)
+        # Run platform-specific supplier search
         result = find_suppliers_by_platform(
             product_id=product["id"],
             product_title=product["product_name"],
@@ -533,6 +585,24 @@ async def get_suppliers_by_platform(
             platform=platform,
             user_email=user_email
         )
+
+        # ── Deduct 1 credit AFTER successful search ───────────────────────────
+        if plan in ["pro", "ultimate"]:
+            try:
+                credit_result = (
+                    supabase.table("user_credits")
+                    .select("credits_used")
+                    .eq("user_email", user_email)
+                    .single()
+                    .execute()
+                )
+                if credit_result.data:
+                    current = credit_result.data["credits_used"]
+                    supabase.table("user_credits").update(
+                        {"credits_used": current + 1}
+                    ).eq("user_email", user_email).execute()
+            except Exception:
+                pass
 
         return result
 
@@ -543,26 +613,6 @@ async def get_suppliers_by_platform(
 
 
 # ==============================================================================
-# ENDPOINT 10 — Get User Credits
-# ==============================================================================
-@app.get("/credits")
-async def get_credits(request: Request, api_key: str = Security(verify_api_key)):
-    """Get user's current credit balance."""
-    auth_header = request.headers.get("Authorization")
-    user_email = None
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.replace("Bearer ", "")
-        try:
-            user_response = supabase.auth.get_user(token)
-            user_email = user_response.user.email
-        except Exception:
-            pass
-
-    if not user_email:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    credits = check_credits(user_email)
-    return {"success": True, "credits": credits}
 
 
 # ==============================================================================
