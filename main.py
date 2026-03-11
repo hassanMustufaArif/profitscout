@@ -7,6 +7,9 @@ API Docs:  http://127.0.0.1:8000/docs
 
 import os
 import httpx
+import jwt
+import time
+from fastapi import APIRouter
 from fastapi import FastAPI, HTTPException, Query, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone, timedelta
@@ -700,3 +703,45 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
     checkout_url = data.get("data", {}).get("attributes", {}).get("url")
     return {"success": True, "checkout_url": checkout_url}
 
+# ==============================================================================
+# ENDPOINT 13 — Create Checkout (supports Pro + Ultimate)
+# ==============================================================================
+@app.post("/publish-blog-post")
+async def publish_blog_post(post: dict):
+    # Generate Ghost JWT
+    admin_key = "69b1e6f30e2043000140543a:63d0fef22ca26095fd310f19b07a7df28adbe09954d6bd80cf9fa8fc16ab7936"
+    key_id, secret = admin_key.split(":")
+    now = int(time.time())
+    token = jwt.encode(
+        {"iat": now, "exp": now + 300, "aud": "/admin/"},
+        bytes.fromhex(secret),
+        algorithm="HS256",
+        headers={"kid": key_id}
+    )
+
+    mobiledoc = json.dumps({
+        "version": "0.3.1",
+        "markups": [], "atoms": [],
+        "cards": [["markdown", {"markdown": post["content"]}]],
+        "sections": [[10, 0]]
+    })
+
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://blog.tikprofitpro.shop/ghost/api/admin/posts/",
+            headers={
+                "Authorization": f"Ghost {token}",
+                "Content-Type": "application/json",
+                "Accept-Version": "v5.0"
+            },
+            json={"posts": [{
+                "title": post["title"],
+                "slug": post["slug"],
+                "mobiledoc": mobiledoc,
+                "status": "published",
+                "meta_title": post["title"],
+                "meta_description": post["meta"],
+                "tags": [{"name": "TikTok Shop"}, {"name": "SEO"}]
+            }]}
+        )
+    return res.json()
