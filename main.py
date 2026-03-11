@@ -40,6 +40,7 @@ app.add_middleware(
         "https://www.tikprofitpro.shop",
         "https://tikprofitpro.pages.dev",
         "https://tiktokscout.lovable.app",
+        "https://claude.ai",
     ],
     allow_credentials=True,
     allow_methods=["*"],
