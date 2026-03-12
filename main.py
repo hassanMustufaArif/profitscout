@@ -749,25 +749,29 @@ async def publish_blog_post(post: dict):
     return res.json()
 
 
-# ─── Claude AI Proxy ─────────────────────────────────────────────
+# ─── Blog Post Generator via OpenAI ──────────────────────────────
 @app.post("/generate-blog-post")
 async def generate_blog_post(request: dict):
     import httpx
-    
-    prompt = request.get("prompt", "")
-    
+    import os
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    prompt  = request.get("prompt", "")
+
     async with httpx.AsyncClient() as client:
         res = await client.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.openai.com/v1/chat/completions",
             headers={
-                "x-api-key": "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",
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model":      "gpt-4o",
                 "max_tokens": 8000,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "system", "content": "You are an expert SEO content writer."},
+                    {"role": "user",   "content": prompt},
+                ],
             },
             timeout=120.0,
         )
