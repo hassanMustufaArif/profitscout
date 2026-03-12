@@ -40,7 +40,8 @@ app.add_middleware(
         "https://www.tikprofitpro.shop",
         "https://tikprofitpro.pages.dev",
         "https://tiktokscout.lovable.app",
-        "https://claude.ai",         # ← ADD THIS LINE
+        "https://claude.ai",
+        "null",              # ← local HTML files
     ],
     allow_credentials=True,
     allow_methods=["*"],
