@@ -711,7 +711,7 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
 @app.post("/publish-blog-post")
 async def publish_blog_post(post: dict):
     # Generate Ghost JWT
-    admin_key = "69b1e6f30e2043000140543a:63d0fef22ca26095fd310f19b07a7df28adbe09954d6bd80cf9fa8fc16ab7936"
+    admin_key = "69b37cfd0128440001b36256:6740ab2703fbfac727ab773f2374eaa5f0c61f608abf5d6121ff138e9ebed26c"
     key_id, secret = admin_key.split(":")
     now = int(time.time())
     token = jwt.encode(
