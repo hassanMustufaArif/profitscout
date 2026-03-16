@@ -35,15 +35,8 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://tikprofitpro.shop",
-        "https://www.tikprofitpro.shop",
-        "https://tikprofitpro.pages.dev",
-        "https://tiktokscout.lovable.app",
-        "https://claude.ai",
-        "null",              # ← local HTML files
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
