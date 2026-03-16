@@ -793,42 +793,32 @@ async def generate_blog_post(request: dict):
     return res.json()
 
 
-# ─── Unsplash Image Fetcher ───────────────────────────────────────
 @app.get("/get-image")
 async def get_image(query: str = "ecommerce"):
-    import httpx
-    import os
+    import httpx, os
 
-    access_key = os.environ.get("Cg6iwiDOXBkds64HNB1jK9x293jhnBoFIUV-y7oQvZg", "")
-    
+    access_key = os.environ.get("UNSPLASH_ACCESS_KEY", "")
+
     if not access_key:
-        return {"url": None, "error": "Cg6iwiDOXBkds64HNB1jK9x293jhnBoFIUV-y7oQvZg"}
+        return {"url": None, "error": "UNSPLASH_ACCESS_KEY not set in Railway"}
 
-    async with httpx.AsyncClient() as client:
-        res = await client.get(
-            "https://api.unsplash.com/search/photos",
-            params={
-                "query":       query,
-                "per_page":    5,
-                "orientation": "landscape",
-                "content_filter": "high",
-            },
-            headers={"Authorization": f"Client-ID {access_key}"},
-            timeout=15.0,
-        )
-    
-    data = res.json()
-    
-    if data.get("results"):
-        # Pick best image (highest resolution landscape)
-        best = data["results"][0]
-        return {
-            "url":          best["urls"]["regular"],
-            "full_url":     best["urls"]["full"],
-            "thumb":        best["urls"]["thumb"],
-            "author":       best["user"]["name"],
-            "author_link":  best["user"]["links"]["html"],
-            "description":  best.get("alt_description", ""),
-        }
-    
-    return {"url": None, "error": "No images found for this query"}
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                "https://api.unsplash.com/search/photos",
+                params={"query": query, "per_page": 1, "orientation": "landscape"},
+                headers={"Authorization": f"Client-ID {access_key}"},
+                timeout=15.0,
+            )
+        data = res.json()
+        results = data.get("results", [])
+        if results:
+            return {
+                "url":         results[0]["urls"]["regular"],
+                "thumb":       results[0]["urls"]["thumb"],
+                "author":      results[0]["user"]["name"],
+                "description": results[0].get("alt_description", ""),
+            }
+        return {"url": None, "error": f"No results from Unsplash. Total: {data.get('total', 0)}"}
+    except Exception as e:
+        return {"url": None, "error": str(e)}
