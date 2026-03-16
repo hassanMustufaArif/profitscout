@@ -702,6 +702,7 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
 # ENDPOINT 13 — Create Checkout (supports Pro + Ultimate)
 # ==============================================================================
 @app.post("/publish-blog-post")
+
 async def publish_blog_post(request: dict):
     import httpx, jwt, time, os
 
@@ -715,6 +716,9 @@ async def publish_blog_post(request: dict):
     feature_image = request.get("feature_image", None)  # ← NEW
 
     # Build Ghost JWT
+    admin_api_key = os.environ.get("GHOST_ADMIN_API_KEY", "")
+    if not admin_api_key or ":" not in admin_api_key:
+        return {"errors": [{"message": f"GHOST_ADMIN_API_KEY missing or invalid. Got: '{admin_api_key[:10]}...'"}]}
     key_id, key_secret = admin_api_key.split(":")
     iat = int(time.time())
     payload = {"iat": iat, "exp": iat + 300, "aud": "/admin/"}
