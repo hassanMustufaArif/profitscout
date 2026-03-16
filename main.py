@@ -709,45 +709,60 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
 # ENDPOINT 13 — Create Checkout (supports Pro + Ultimate)
 # ==============================================================================
 @app.post("/publish-blog-post")
-async def publish_blog_post(post: dict):
-    # Generate Ghost JWT
-    admin_key = "69b37cfd0128440001b36256:6740ab2703fbfac727ab773f2374eaa5f0c61f608abf5d6121ff138e9ebed26c"
-    key_id, secret = admin_key.split(":")
-    now = int(time.time())
-    token = jwt.encode(
-        {"iat": now, "exp": now + 300, "aud": "/admin/"},
-        bytes.fromhex(secret),
-        algorithm="HS256",
-        headers={"kid": key_id}
-    )
+async def publish_blog_post(request: dict):
+    import httpx, jwt, time, os
 
+    ghost_url     = os.environ.get("GHOST_URL", "https://blog.tikprofitpro.shop")
+    admin_api_key = os.environ.get("GHOST_ADMIN_API_KEY", "")
+    
+    title         = request.get("title", "Untitled")
+    slug          = request.get("slug", "")
+    meta          = request.get("meta", "")
+    content       = request.get("content", "")
+    feature_image = request.get("feature_image", None)  # ← NEW
+
+    # Build Ghost JWT
+    key_id, key_secret = admin_api_key.split(":")
+    iat = int(time.time())
+    payload = {"iat": iat, "exp": iat + 300, "aud": "/admin/"}
+    token = jwt.encode(payload, bytes.fromhex(key_secret), algorithm="HS256", headers={"kid": key_id})
+
+    # Build mobiledoc
     mobiledoc = json.dumps({
         "version": "0.3.1",
-        "markups": [], "atoms": [],
-        "cards": [["markdown", {"markdown": post["content"]}]],
+        "atoms": [],
+        "cards": [["markdown", {"markdown": content}]],
+        "markups": [],
         "sections": [[10, 0]]
     })
 
+    post_data = {
+        "posts": [{
+            "title":        title,
+            "slug":         slug,
+            "custom_excerpt": meta,
+            "mobiledoc":    mobiledoc,
+            "status":       "published",
+        }]
+    }
+
+    # Add feature image if provided
+    if feature_image:
+        post_data["posts"][0]["feature_image"] = feature_image  # ← NEW
+
     async with httpx.AsyncClient() as client:
         res = await client.post(
-            "https://blog.tikprofitpro.shop/ghost/api/admin/posts/",
+            f"{ghost_url}/ghost/api/admin/posts/",
             headers={
                 "Authorization": f"Ghost {token}",
-                "Content-Type": "application/json",
-                "Accept-Version": "v5.0"
+                "Content-Type":  "application/json",
+                "Accept-Version": "v5.0",
             },
-            json={"posts": [{
-                "title": post["title"],
-                "slug": post["slug"],
-                "mobiledoc": mobiledoc,
-                "status": "published",
-                "meta_title": post["title"],
-                "meta_description": post["meta"],
-                "tags": [{"name": "TikTok Shop"}, {"name": "SEO"}]
-            }]}
+            json=post_data,
+            timeout=30.0,
         )
-    return res.json()
 
+    return res.json()
 
 # ─── Blog Post Generator via OpenAI ──────────────────────────────
 @app.post("/generate-blog-post")
@@ -776,3 +791,44 @@ async def generate_blog_post(request: dict):
             timeout=120.0,
         )
     return res.json()
+
+
+# ─── Unsplash Image Fetcher ───────────────────────────────────────
+@app.get("/get-image")
+async def get_image(query: str = "ecommerce"):
+    import httpx
+    import os
+
+    access_key = os.environ.get("Cg6iwiDOXBkds64HNB1jK9x293jhnBoFIUV-y7oQvZg", "")
+    
+    if not access_key:
+        return {"url": None, "error": "Cg6iwiDOXBkds64HNB1jK9x293jhnBoFIUV-y7oQvZg"}
+
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            "https://api.unsplash.com/search/photos",
+            params={
+                "query":       query,
+                "per_page":    5,
+                "orientation": "landscape",
+                "content_filter": "high",
+            },
+            headers={"Authorization": f"Client-ID {access_key}"},
+            timeout=15.0,
+        )
+    
+    data = res.json()
+    
+    if data.get("results"):
+        # Pick best image (highest resolution landscape)
+        best = data["results"][0]
+        return {
+            "url":          best["urls"]["regular"],
+            "full_url":     best["urls"]["full"],
+            "thumb":        best["urls"]["thumb"],
+            "author":       best["user"]["name"],
+            "author_link":  best["user"]["links"]["html"],
+            "description":  best.get("alt_description", ""),
+        }
+    
+    return {"url": None, "error": "No images found for this query"}
