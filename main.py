@@ -871,7 +871,7 @@ async def catch_txt(full_path: str):
         return PlainTextResponse(indexnow_key)
     return PlainTextResponse("not found", status_code=404)
 
-    @app.post("/ghost-admin")
+@app.post("/ghost-admin")
 async def ghost_admin(request: dict):
     import httpx, jwt, time, os
     
