@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>TikProfitPro SEO Autopilot v2</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;scrollbar-width:thin;scrollbar-color:rgba(0,255,136,0.2) transparent}
+*::-webkit-scrollbar{width:4px}*::-webkit-scrollbar-thumb{background:rgba(0,255,136,0.2);border-radius:2px}
+body{background:#060a10;font-family:'Courier New',monospace;color:#e0e8f0;min-height:100vh}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes scan{0%{transform:translateY(-100%)}100%{transform:translateY(100vh)}}
+.pulse{animation:pulse 2s infinite}.blink{animation:blink 1s infinite}
+.grid-bg{position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:linear-gradient(rgba(0,255,136,0.025) 1px,transparent 1px),
+  linear-gradient(90deg,rgba(0,255,136,0.025) 1px,transparent 1px);
+  background-size:44px 44px}
+.scan-line{position:fixed;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(0,255,136,0.2),transparent);
+  animation:scan 8s linear infinite;z-index:0;pointer-events:none}
+input,textarea,select{font-family:'Courier New',monospace}
+</style>
+</head>
+<body>
+<div class="grid-bg"></div>
+<div class="scan-line"></div>
+<div id="root"></div>
+<script type="text/babel">
+const {useState} = React;
+
+// ── CONFIG ──────────────────────────────────────────────────────
+const API_BASE     = "https://api.tikprofitpro.shop";
+const GENERATE_URL = `${API_BASE}/generate-blog-post`;
+const PUBLISH_URL  = `${API_BASE}/publish-blog-post`;
+const BLOG_URL     = "https://blog.tikprofitpro.shop";
+const BRAND        = "TikProfitPro";
+const DOMAIN       = "tikprofitpro.shop";
+
+// ── COMPETITOR KEYWORDS ─────────────────────────────────────────
+const COMPETITOR_KEYWORDS = [
+  // Fastmoss keywords
+  {kw:"fastmoss alternative",         comp:"Fastmoss",  vol:"1,400", difficulty:"Low",    intent:"Money"},
+  {kw:"fastmoss vs kalodata",         comp:"Fastmoss",  vol:"880",   difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop analytics tool",   comp:"Fastmoss",  vol:"3,200", difficulty:"Medium", intent:"Money"},
+  {kw:"tiktok shop spy tool",         comp:"Fastmoss",  vol:"2,100", difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop sales data",       comp:"Fastmoss",  vol:"4,500", difficulty:"Medium", intent:"Info"},
+  // Kalodata keywords
+  {kw:"kalodata alternative",         comp:"Kalodata",  vol:"1,200", difficulty:"Low",    intent:"Money"},
+  {kw:"kalodata free alternative",    comp:"Kalodata",  vol:"760",   difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop product tracker",  comp:"Kalodata",  vol:"2,800", difficulty:"Medium", intent:"Money"},
+  {kw:"tiktok shop revenue tracker",  comp:"Kalodata",  vol:"1,900", difficulty:"Low",    intent:"Info"},
+  // Shoplus keywords
+  {kw:"shoplus alternative",          comp:"Shoplus",   vol:"680",   difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop winning products", comp:"Shoplus",   vol:"5,400", difficulty:"Medium", intent:"Money"},
+  {kw:"tiktok shop best sellers",     comp:"Shoplus",   vol:"8,200", difficulty:"Medium", intent:"Info"},
+  // Exlasso keywords
+  {kw:"exlasso alternative",          comp:"Exlasso",   vol:"420",   difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop product finder",   comp:"Exlasso",   vol:"3,100", difficulty:"Low",    intent:"Money"},
+  // TikTok Creative Center
+  {kw:"tiktok creative center alternative", comp:"TikTok CC", vol:"2,300", difficulty:"Low", intent:"Money"},
+  {kw:"better than tiktok creative center", comp:"TikTok CC", vol:"1,100", difficulty:"Low", intent:"Money"},
+];
+
+// ── USER SEARCH QUERIES ─────────────────────────────────────────
+const USER_QUERIES = [
+  {kw:"how to find viral products on tiktok shop",    vol:"18,000", difficulty:"Medium", intent:"Info"},
+  {kw:"how to find winning products for tiktok shop", vol:"12,000", difficulty:"Medium", intent:"Info"},
+  {kw:"best tiktok shop product research tool",       vol:"4,200",  difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop product research tool free",       vol:"2,800",  difficulty:"Low",    intent:"Money"},
+  {kw:"how to find trending products tiktok 2026",    vol:"22,000", difficulty:"Medium", intent:"Info"},
+  {kw:"tiktok shop trending products finder",         vol:"6,500",  difficulty:"Low",    intent:"Money"},
+  {kw:"how to research tiktok shop products",         vol:"9,800",  difficulty:"Medium", intent:"Info"},
+  {kw:"find viral tiktok products before they trend", vol:"7,200",  difficulty:"Low",    intent:"Info"},
+  {kw:"tiktok shop product sourcing tool",            vol:"3,400",  difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop dropshipping product research",    vol:"5,100",  difficulty:"Low",    intent:"Money"},
+];
+
+// ── ORIGINAL TARGET KEYWORDS ────────────────────────────────────
+const TARGET_KEYWORDS = [
+  {kw:"TikTok Shop product research tool",     vol:"1,200", difficulty:"Low",    intent:"Money"},
+  {kw:"best products to sell on TikTok Shop",  vol:"8,000", difficulty:"Medium", intent:"Money"},
+  {kw:"TikTok Shop winning products",          vol:"3,500", difficulty:"Low",    intent:"Money"},
+  {kw:"how to sell on TikTok Shop 2026",       vol:"22,000",difficulty:"Medium", intent:"Info"},
+  {kw:"TikTok Shop for beginners",             vol:"18,000",difficulty:"Medium", intent:"Info"},
+  {kw:"TikTok Shop dropshipping products",     vol:"2,800", difficulty:"Low",    intent:"Money"},
+  {kw:"TikTok Shop profit margin calculator",  vol:"2,100", difficulty:"Very Low",intent:"Tool"},
+  {kw:"trending TikTok Shop products 2026",    vol:"5,400", difficulty:"Low",    intent:"Info"},
+];
+
+// ── VIRAL PRODUCTS (from tikprofitpro.shop) ─────────────────────
+const VIRAL_PRODUCTS = [
+  {name:"LED Strip Lights",          score:94, category:"Home Decor",    url:`https://${DOMAIN}/?product=led-strip-lights`},
+  {name:"Portable Blender",          score:91, category:"Kitchen",       url:`https://${DOMAIN}/?product=portable-blender`},
+  {name:"Posture Corrector",         score:89, category:"Health",        url:`https://${DOMAIN}/?product=posture-corrector`},
+  {name:"Car Phone Holder",          score:87, category:"Automotive",    url:`https://${DOMAIN}/?product=car-phone-holder`},
+  {name:"Resistance Bands Set",      score:85, category:"Fitness",       url:`https://${DOMAIN}/?product=resistance-bands`},
+  {name:"Magnetic Phone Case",       score:83, category:"Accessories",   url:`https://${DOMAIN}/?product=magnetic-phone-case`},
+  {name:"Air Purifier Mini",         score:88, category:"Home",          url:`https://${DOMAIN}/?product=air-purifier-mini`},
+  {name:"Teeth Whitening Kit",       score:86, category:"Beauty",        url:`https://${DOMAIN}/?product=teeth-whitening`},
+];
+
+// ── PUBLISHED POSTS (for internal links - editable) ─────────────
+const DEFAULT_POSTS = [
+  {title:"Complete Guide to TikTok Shop Product Research 2026", url:`${BLOG_URL}/tiktok-shop-product-research-guide-2026/`},
+  {title:"10 Best Products to Sell on TikTok Shop Right Now",   url:`${BLOG_URL}/best-products-tiktok-shop/`},
+  {title:"TikTok Shop vs Amazon: Which Is More Profitable?",    url:`${BLOG_URL}/tiktok-shop-vs-amazon/`},
+  {title:"How to Find Winning Products for TikTok Shop",        url:`${BLOG_URL}/find-winning-products-tiktok-shop/`},
+  {title:"Top Trending TikTok Shop Products March 2026",        url:`${BLOG_URL}/trending-tiktok-shop-products-march-2026/`},
+];
+
+const TEMPLATES = [
+  {type:"Pillar Guide",    icon:"📘"},
+  {type:"Trending Report", icon:"🔥"},
+  {type:"Comparison Post", icon:"⚖️"},
+  {type:"Tutorial",        icon:"🎓"},
+  {type:"Case Study",      icon:"📊"},
+  {type:"Tool Page",       icon:"🛠️"},
+];
+
+const TABS = ["🤖 AI Writer","🎯 Competitor KWs","🔍 User Queries","📅 Scheduler","📤 Publisher","⚙️ Settings"];
+
+const ic = i => i==="Money"?"#00ff88":i==="Info"?"#00cfff":i==="Tool"?"#ffb800":"#ff88cc";
+const sc = s => s>=80?"#00ff88":s>=60?"#ffb800":"#ff4444";
+
+function Panel({title,children,style={}}) {
+  return (
+    <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:10,padding:16,...style}}>
+      <div style={{fontSize:11,fontWeight:700,marginBottom:14,color:"#fff",letterSpacing:"1px",textTransform:"uppercase"}}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function Pill({status}) {
+  const c = status==="published"?{bg:"rgba(0,255,136,0.15)",col:"#00ff88"}
+           :status==="scheduled"?{bg:"rgba(0,207,255,0.15)",col:"#00cfff"}
+           :                     {bg:"rgba(255,184,0,0.15)", col:"#ffb800"};
+  return <span style={{fontSize:10,padding:"3px 10px",borderRadius:20,fontWeight:700,background:c.bg,color:c.col}}>{status}</span>;
+}
+
+function Badge({label,color="#00ff88"}) {
+  return <span style={{fontSize:9,padding:"2px 7px",borderRadius:20,fontWeight:700,background:`${color}18`,color,border:`1px solid ${color}30`,marginLeft:6}}>{label}</span>;
+}
+
+function App() {
+  const [tab,        setTab]        = useState(0);
+  const [kwSource,   setKwSource]   = useState("target"); // target | competitor | userquery | gsc
+  const [selKw,      setSelKw]      = useState(TARGET_KEYWORDS[0]);
+  const [selTpl,     setSelTpl]     = useState(TEMPLATES[0]);
+  const [customKw,   setCustomKw]   = useState("");
+  const [gscKw,      setGscKw]      = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [streamText, setStreamText] = useState("");
+  const [post,       setPost]       = useState(null);
+  const [wordCount,  setWordCount]  = useState(0);
+  const [score,      setScore]      = useState(null);
+  const [pubStatus,  setPubStatus]  = useState(null);
+  const [pubUrl,     setPubUrl]     = useState(null);
+  const [pubErr,     setPubErr]     = useState(null);
+  const [agentMsg,   setAgentMsg]   = useState(null);
+  const [error,      setError]      = useState(null);
+  const [publishedPosts, setPublishedPosts] = useState(DEFAULT_POSTS);
+  const [newPostTitle,   setNewPostTitle]   = useState("");
+  const [newPostUrl,     setNewPostUrl]     = useState("");
+  const [selProducts,    setSelProducts]    = useState([VIRAL_PRODUCTS[0], VIRAL_PRODUCTS[1]]);
+  const [usaCount,       setUsaCount]       = useState(3);
+  const [scheduled,      setScheduled]      = useState([
+    {title:"Complete Guide to TikTok Shop Product Research 2026", date:"Mar 13", status:"published", keyword:"TikTok Shop product research"},
+    {title:"10 Best Products to Sell on TikTok Shop Right Now",   date:"Mar 15", status:"scheduled", keyword:"best products TikTok Shop"},
+    {title:"TikTok Shop vs Amazon: Which Is More Profitable?",    date:"Mar 18", status:"draft",     keyword:"TikTok Shop vs Amazon"},
+  ]);
+
+  const activeKw = customKw.trim() || gscKw.trim() || selKw?.kw || "";
+
+  // ── Build the mega prompt ──────────────────────────────────────
+  const buildPrompt = (kw) => {
+    const internalLinksSection = publishedPosts.slice(0,4).map(p =>
+      `- [${p.title}](${p.url})`
+    ).join("\n");
+
+    const product1 = selProducts[0];
+    const product2 = selProducts[1];
+
+    return `You are an expert SEO content writer for ${BRAND} — a TikTok Shop product research SaaS at ${DOMAIN} targeting USA TikTok Shop sellers.
+
+Write a complete SEO-optimized blog post for the keyword: "${kw}"
+Post type: ${selTpl.type}
+
+CRITICAL REQUIREMENTS — MUST FOLLOW ALL:
+
+1. WORD COUNT: The post MUST be between 1000-1200 words. Count carefully. Not less than 1000, not more than 1200.
+
+2. USA LOCAL SIGNALS: Naturally mention "USA" exactly 3 times throughout the post:
+   - Once in the introduction paragraph
+   - Once in a subheading or body section  
+   - Once in the conclusion
+   This gives Google local signals that this content targets USA TikTok Shop sellers.
+
+3. VIRAL PRODUCT LINKS: Naturally and contextually embed these 2 products into the post body where relevant:
+   - Product 1: "${product1.name}" (Virality: ${product1.score}) → link: ${product1.url}
+   - Product 2: "${product2.name}" (Virality: ${product2.score}) → link: ${product2.url}
+   Insert them as natural markdown links in a contextual sentence. Example: "Products like [${product1.name}](${product1.url}) are currently trending with a virality score of ${product1.score}."
+   DO NOT make it sound promotional. Make it data-driven and natural.
+
+4. INTERNAL LINKS: At the very end of the post, add a "Read More Guides" section with these internal links:
+${internalLinksSection}
+Format it exactly like this:
+---
+## 📚 Read More Guides
+Explore more resources to grow your TikTok Shop business:
+[list the links as markdown bullet points]
+---
+
+5. CTA TO TIKPROFITPRO: Naturally mention ${BRAND} at ${DOMAIN} at least twice — once mid-post and once in conclusion. Frame it as the tool USA sellers use to find trending products.
+
+Return EXACTLY this format:
+
+---TITLE---
+[SEO title under 60 chars with keyword]
+
+---META---
+[Meta description 150-160 chars with keyword, USA mention, and CTA]
+
+---SLUG---
+[URL slug: lowercase hyphens only]
+
+---CONTENT---
+[Full markdown post following ALL 5 requirements above]
+
+---WORD_COUNT---
+[exact word count as a number]
+
+---SEO_SCORE---
+[XX/100 — one line reason]`;
+  };
+
+  // ── Generate ───────────────────────────────────────────────────
+  const generate = async () => {
+    const kw = activeKw;
+    if (!kw) { setError("Please select or enter a keyword first."); return; }
+
+    setGenerating(true);
+    setStreamText("");
+    setPost(null);
+    setScore(null);
+    setWordCount(0);
+    setPubStatus(null);
+    setPubUrl(null);
+    setPubErr(null);
+    setError(null);
+    setAgentMsg("⚙️ Building optimized prompt with all 6 SEO rules...");
+
+    await new Promise(r => setTimeout(r, 600));
+    setAgentMsg("🤖 Sending to GPT-4o via api.tikprofitpro.shop...");
+
+    try {
+      const res = await fetch(GENERATE_URL, {
+        method:  "POST",
+        headers: {"Content-Type":"application/json"},
+        body:    JSON.stringify({prompt: buildPrompt(kw)}),
+      });
+
+      if (!res.ok) throw new Error(`Server error ${res.status}: ${await res.text()}`);
+
+      const data = await res.json();
+
+      let full = "";
+      if (data?.choices?.[0]?.message?.content) {
+        full = data.choices[0].message.content;
+      } else if (data?.content?.[0]?.text) {
+        full = data.content.map(c => c.text||"").join("");
+      } else if (data?.error) {
+        throw new Error(data.error.message || JSON.stringify(data.error));
+      } else {
+        throw new Error("Unexpected response: " + JSON.stringify(data).slice(0,200));
+      }
+
+      if (!full.trim()) throw new Error("Empty response from AI.");
+
+      setAgentMsg("✍️ Streaming post with all SEO enhancements...");
+
+      let i = 0;
+      const iv = setInterval(() => {
+        i += 30;
+        setStreamText(full.slice(0, i));
+        if (i >= full.length) {
+          clearInterval(iv);
+          parsePost(full, kw);
+          setGenerating(false);
+          setAgentMsg(null);
+        }
+      }, 6);
+
+    } catch(e) {
+      setError(e.message);
+      setGenerating(false);
+      setAgentMsg(null);
+    }
+  };
+
+  const parsePost = (text, kw) => {
+    const ext = tag => {
+      const m = text.match(new RegExp(`---${tag}---\\n([\\s\\S]*?)(?=\\n---[A-Z_]+---|$)`));
+      return m ? m[1].trim() : "";
+    };
+    const content    = ext("CONTENT");
+    const scoreRaw   = ext("SEO_SCORE");
+    const wcRaw      = ext("WORD_COUNT");
+    const scoreNum   = parseInt((scoreRaw.match(/(\d+)/)||["","78"])[1]);
+    const wc         = parseInt(wcRaw) || content.split(/\s+/).filter(Boolean).length;
+
+    // Verify USA mentions
+    const usaMentions = (content.match(/\bUSA\b/g)||[]).length;
+    // Verify internal links
+    const hasReadMore = content.includes("Read More Guides");
+    // Verify viral products
+    const hasProduct1 = content.includes(selProducts[0].name);
+    const hasProduct2 = content.includes(selProducts[1].name);
+
+    const parsed = {
+      title:   ext("TITLE") || kw,
+      meta:    ext("META"),
+      slug:    ext("SLUG")  || kw.toLowerCase().replace(/[^a-z0-9]+/g,"-"),
+      content,
+      seoRaw:  scoreRaw,
+      checks: {
+        wordCount:    wc,
+        usaMentions,
+        hasReadMore,
+        hasProduct1,
+        hasProduct2,
+        wordCountOk:  wc >= 1000 && wc <= 1200,
+      },
+    };
+    setPost(parsed);
+    setScore(scoreNum);
+    setWordCount(wc);
+    setScheduled(prev => [{title:parsed.title, date:"Pending", status:"draft", keyword:kw}, ...prev]);
+  };
+
+  // ── Publish ────────────────────────────────────────────────────
+  const publish = async () => {
+    if (!post) return;
+    setPubStatus("publishing");
+    setPubErr(null);
+    setAgentMsg("📡 Publishing to blog.tikprofitpro.shop...");
+    try {
+      const res  = await fetch(PUBLISH_URL, {
+        method:  "POST",
+        headers: {"Content-Type":"application/json"},
+        body:    JSON.stringify({
+          title:   post.title,
+          slug:    post.slug,
+          meta:    post.meta,
+          content: post.content,
+        }),
+      });
+      const data = await res.json();
+      if (data?.errors?.length) throw new Error(data.errors[0].message);
+      const slug = data?.posts?.[0]?.slug || post.slug;
+      const url  = `${BLOG_URL}/${slug}/`;
+      setPubStatus("published");
+      setPubUrl(url);
+      setAgentMsg("✅ Live on Ghost!");
+      // Add to published posts list for future internal links
+      setPublishedPosts(prev => [{title:post.title, url}, ...prev].slice(0,8));
+      setScheduled(prev => prev.map(p => p.title===post.title ? {...p,status:"published",date:"Today"} : p));
+      setTimeout(() => setAgentMsg(null), 3000);
+    } catch(e) {
+      setPubStatus("error");
+      setPubErr(e.message);
+      setAgentMsg(null);
+    }
+  };
+
+  const pubCount   = scheduled.filter(p=>p.status==="published").length;
+  const schedCount = scheduled.filter(p=>p.status==="scheduled").length;
+
+  const allKwLists = {
+    target:     TARGET_KEYWORDS,
+    competitor: COMPETITOR_KEYWORDS,
+    userquery:  USER_QUERIES,
+  };
+
+  return (
+    <div style={{position:"relative",zIndex:1,maxWidth:1160,margin:"0 auto",padding:"20px 14px"}}>
+
+      {/* ── HEADER ── */}
+      <div style={{marginBottom:20,borderBottom:"1px solid rgba(0,255,136,0.12)",paddingBottom:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{width:38,height:38,borderRadius:9,background:"linear-gradient(135deg,#00ff88,#00cfff)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:19,fontWeight:900,color:"#060a10",flexShrink:0}}>⚡</div>
+          <div style={{flex:1}}>
+            <div style={{fontSize:18,fontWeight:800,color:"#fff",letterSpacing:"-0.5px"}}>
+              TikProfitPro <span style={{color:"#00ff88"}}>SEO Autopilot</span>
+              <span style={{fontSize:10,marginLeft:8,padding:"2px 8px",borderRadius:20,background:"rgba(0,255,136,0.15)",color:"#00ff88",fontWeight:700,verticalAlign:"middle"}}>v2.0</span>
+            </div>
+            <div style={{fontSize:10,color:"#3a5268",letterSpacing:"2px",textTransform:"uppercase",marginTop:2}}>
+              Competitor Research → GSC Keywords → GPT-4o → Ghost Publisher
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{width:7,height:7,borderRadius:"50%",background:"#00ff88",display:"inline-block"}} className="pulse"/>
+            <span style={{fontSize:11,color:"#00ff88",fontWeight:700}}>ALL SYSTEMS LIVE</span>
+          </div>
+        </div>
+        {agentMsg && (
+          <div style={{marginTop:10,padding:"8px 14px",background:"rgba(0,255,136,0.06)",border:"1px solid rgba(0,255,136,0.2)",borderRadius:6,fontSize:11,color:"#00ff88",display:"flex",alignItems:"center",gap:8}}>
+            <span className="pulse">●</span> {agentMsg}
+          </div>
+        )}
+      </div>
+
+      {/* ── STATS BAR ── */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:18}}>
+        {[
+          {label:"Published",    value:pubCount+1,         color:"#00ff88"},
+          {label:"Scheduled",    value:schedCount,         color:"#00cfff"},
+          {label:"Competitor KWs",value:COMPETITOR_KEYWORDS.length, color:"#ffb800"},
+          {label:"User Queries", value:USER_QUERIES.length,color:"#ff88cc"},
+          {label:"Word Target",  value:"1000-1200",        color:"#00ff88"},
+        ].map((s,i) => (
+          <div key={i} style={{background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:9,padding:"12px 14px"}}>
+            <div style={{fontSize:18,fontWeight:800,color:s.color,letterSpacing:"-0.5px"}}>{s.value}</div>
+            <div style={{fontSize:10,color:"#3a5268",marginTop:1,textTransform:"uppercase",letterSpacing:"0.5px"}}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── TABS ── */}
+      <div style={{display:"flex",gap:3,marginBottom:16,flexWrap:"wrap"}}>
+        {TABS.map((t,i) => (
+          <button key={i} onClick={()=>setTab(i)} style={{
+            padding:"7px 14px",borderRadius:6,border:"none",cursor:"pointer",
+            fontSize:11,fontFamily:"inherit",fontWeight:700,letterSpacing:"0.3px",
+            background:tab===i?"linear-gradient(135deg,#00ff88,#00cfff)":"rgba(255,255,255,0.04)",
+            color:tab===i?"#060a10":"#5a7a8a",transition:"all 0.15s",
+          }}>{t}</button>
+        ))}
+      </div>
+
+      {/* ══════════════════════════════════════════
+          TAB 0: AI WRITER
+      ══════════════════════════════════════════ */}
+      {tab===0 && (
+        <div style={{display:"grid",gridTemplateColumns:"300px 1fr",gap:14}}>
+
+          {/* LEFT PANEL */}
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+
+            {/* Keyword Source Selector */}
+            <Panel title="📡 Keyword Source">
+              {[
+                {id:"target",    label:"🎯 Target Keywords",    count:TARGET_KEYWORDS.length},
+                {id:"competitor",label:"🕵️ Competitor Research", count:COMPETITOR_KEYWORDS.length},
+                {id:"userquery", label:"🔍 User Search Queries", count:USER_QUERIES.length},
+                {id:"gsc",       label:"📊 GSC / Custom",        count:"manual"},
+              ].map(s => (
+                <div key={s.id} onClick={()=>{setKwSource(s.id);setCustomKw("");setGscKw("");}}
+                  style={{padding:"8px 10px",borderRadius:6,cursor:"pointer",marginBottom:3,
+                    background:kwSource===s.id?"rgba(0,255,136,0.08)":"transparent",
+                    border:kwSource===s.id?"1px solid rgba(0,255,136,0.25)":"1px solid transparent",
+                    display:"flex",justifyContent:"space-between",alignItems:"center",fontSize:12}}>
+                  <span style={{color:kwSource===s.id?"#e0e8f0":"#5a7a8a"}}>{s.label}</span>
+                  <span style={{fontSize:10,color:"#3a5268",background:"rgba(255,255,255,0.05)",padding:"1px 7px",borderRadius:10}}>{s.count}</span>
+                </div>
+              ))}
+            </Panel>
+
+            {/* GSC / Custom keyword input */}
+            {kwSource==="gsc" && (
+              <Panel title="📊 GSC / Custom Keyword">
+                <div style={{fontSize:10,color:"#3a5268",marginBottom:8,lineHeight:1.6}}>
+                  Paste a keyword from Google Search Console or type any custom keyword:
+                </div>
+                <input value={gscKw} onChange={e=>setGscKw(e.target.value)}
+                  placeholder="e.g. tiktok shop for beginners usa..."
+                  style={{width:"100%",padding:"9px 11px",borderRadius:6,background:"rgba(0,0,0,0.4)",
+                    border:"1px solid rgba(0,255,136,0.25)",color:"#e0e8f0",fontSize:12,marginBottom:6}}/>
+                {gscKw && <div style={{fontSize:10,color:"#00ff88"}}>✓ Using: "{gscKw}"</div>}
+              </Panel>
+            )}
+
+            {/* Keyword list */}
+            {kwSource!=="gsc" && (
+              <Panel title={`🔑 ${kwSource==="target"?"Target":kwSource==="competitor"?"Competitor":"User Query"} Keywords`}
+                style={{maxHeight:220,overflow:"hidden"}}>
+                <div style={{maxHeight:180,overflowY:"auto"}}>
+                  {(allKwLists[kwSource]||[]).map((k,i) => (
+                    <div key={i} onClick={()=>setSelKw(k)}
+                      style={{padding:"6px 9px",borderRadius:5,cursor:"pointer",marginBottom:2,
+                        background:selKw?.kw===k.kw?"rgba(0,255,136,0.08)":"transparent",
+                        border:selKw?.kw===k.kw?"1px solid rgba(0,255,136,0.25)":"1px solid transparent",
+                        fontSize:11}}>
+                      <div style={{color:"#c0d0e0",marginBottom:2}}>{k.kw}</div>
+                      <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                        <span style={{color:ic(k.intent),fontSize:9}}>{k.intent}</span>
+                        <span style={{color:"#3a5268",fontSize:9}}>· {k.vol}/mo</span>
+                        {k.comp && <span style={{color:"#ffb800",fontSize:9}}>· vs {k.comp}</span>}
+                        <span style={{color:k.difficulty.includes("Low")?"#00ff88":"#ffb800",fontSize:9}}>· {k.difficulty}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </Panel>
+            )}
+
+            {/* Post Type */}
+            <Panel title="📝 Post Type">
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+                {TEMPLATES.map((t,i) => (
+                  <div key={i} onClick={()=>setSelTpl(t)}
+                    style={{padding:"7px 9px",borderRadius:5,cursor:"pointer",
+                      background:selTpl.type===t.type?"rgba(0,207,255,0.1)":"rgba(255,255,255,0.02)",
+                      border:selTpl.type===t.type?"1px solid rgba(0,207,255,0.3)":"1px solid rgba(255,255,255,0.05)",
+                      fontSize:11,textAlign:"center"}}>
+                    <div>{t.icon}</div>
+                    <div style={{color:selTpl.type===t.type?"#00cfff":"#5a7a8a",marginTop:2,fontSize:10}}>{t.type}</div>
+                  </div>
+                ))}
+              </div>
+            </Panel>
+
+            {/* Viral Products */}
+            <Panel title="🔥 Viral Product Links (auto-embedded)">
+              {VIRAL_PRODUCTS.map((p,i) => {
+                const isSelected = selProducts.some(s=>s.name===p.name);
+                return (
+                  <div key={i} onClick={()=>{
+                    if(isSelected) setSelProducts(prev=>prev.filter(s=>s.name!==p.name));
+                    else if(selProducts.length<2) setSelProducts(prev=>[...prev,p]);
+                    else setSelProducts(prev=>[prev[1],p]);
+                  }} style={{padding:"6px 9px",borderRadius:5,cursor:"pointer",marginBottom:2,
+                    background:isSelected?"rgba(255,136,0,0.08)":"transparent",
+                    border:isSelected?"1px solid rgba(255,136,0,0.25)":"1px solid transparent",
+                    display:"flex",justifyContent:"space-between",fontSize:11,alignItems:"center"}}>
+                    <div>
+                      <span style={{color:isSelected?"#ffb800":"#5a7a8a"}}>{p.name}</span>
+                      <span style={{fontSize:9,color:"#3a5268",marginLeft:6}}>{p.category}</span>
+                    </div>
+                    <span style={{color:"#00ff88",fontSize:10,fontWeight:700}}>🔥{p.score}</span>
+                  </div>
+                );
+              })}
+              <div style={{fontSize:10,color:"#3a5268",marginTop:6}}>Select 2 products to embed in post</div>
+            </Panel>
+
+            {/* SEO Rules Summary */}
+            <Panel title="✅ SEO Rules Active">
+              {[
+                {rule:'Word count: 1000-1200',      on:true},
+                {rule:'"USA" × 3 signals',           on:true},
+                {rule:'2 viral product links',       on:selProducts.length===2},
+                {rule:'Internal "Read More" links',  on:publishedPosts.length>0},
+                {rule:'TikProfitPro CTA × 2',        on:true},
+                {rule:'Competitor keyword targeting',on:kwSource==="competitor"},
+              ].map((r,i) => (
+                <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",
+                  borderBottom:"1px solid rgba(255,255,255,0.04)",fontSize:11}}>
+                  <span style={{color:"#5a7a8a"}}>{r.rule}</span>
+                  <span style={{color:r.on?"#00ff88":"#3a5268",fontSize:12}}>{r.on?"✓":"○"}</span>
+                </div>
+              ))}
+            </Panel>
+
+            {/* Generate Button */}
+            <button onClick={generate} disabled={generating||!activeKw} style={{
+              padding:"14px",borderRadius:8,border:"none",
+              cursor:generating||!activeKw?"not-allowed":"pointer",
+              background:generating?"rgba(0,255,136,0.12)":!activeKw?"rgba(255,255,255,0.05)":"linear-gradient(135deg,#00ff88,#00cfff)",
+              color:generating||!activeKw?"#3a5268":"#060a10",
+              fontWeight:800,fontSize:13,fontFamily:"inherit",letterSpacing:"0.5px",
+            }}>
+              {generating?"⏳ Generating 1000-1200 words...":"⚡ Generate SEO Post"}
+            </button>
+
+            {activeKw && <div style={{fontSize:10,color:"#3a5268",textAlign:"center"}}>Keyword: "{activeKw}"</div>}
+          </div>
+
+          {/* RIGHT PANEL */}
+          <div>
+            {/* Error */}
+            {error && !generating && (
+              <div style={{padding:14,borderRadius:10,background:"rgba(255,68,68,0.06)",border:"1px solid rgba(255,68,68,0.25)",marginBottom:12}}>
+                <div style={{color:"#ff6b6b",fontWeight:700,marginBottom:6}}>⚠️ Error</div>
+                <div style={{fontSize:11,color:"#ff9999",wordBreak:"break-all"}}>{error}</div>
+              </div>
+            )}
+
+            {/* Empty state */}
+            {!post && !generating && !error && (
+              <div style={{height:500,display:"flex",alignItems:"center",justifyContent:"center",
+                background:"rgba(255,255,255,0.015)",borderRadius:10,
+                border:"1px dashed rgba(255,255,255,0.06)",flexDirection:"column",gap:12}}>
+                <div style={{fontSize:52}}>🚀</div>
+                <div style={{color:"#3a5268",fontSize:13}}>Select keyword source → Pick keyword → Generate</div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
+                  {["1000-1200 words","USA × 3","Viral products","Internal links","CTA × 2"].map((f,i) => (
+                    <span key={i} style={{fontSize:10,padding:"3px 10px",borderRadius:20,
+                      background:"rgba(0,255,136,0.06)",color:"#00ff88",border:"1px solid rgba(0,255,136,0.15)"}}>✓ {f}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Streaming */}
+            {generating && (
+              <div style={{background:"rgba(0,0,0,0.35)",borderRadius:10,padding:18,
+                border:"1px solid rgba(0,255,136,0.12)",height:500,overflowY:"auto"}}>
+                <div style={{fontSize:10,color:"#00ff88",marginBottom:10,letterSpacing:"2px"}}>● GPT-4o WRITING (1000-1200 WORDS + ALL SEO RULES)...</div>
+                <pre style={{fontSize:11,color:"#5a7a8a",whiteSpace:"pre-wrap",lineHeight:1.8,margin:0}}>
+                  {streamText}<span className="blink" style={{color:"#00ff88"}}>█</span>
+                </pre>
+              </div>
+            )}
+
+            {/* Generated Post */}
+            {post && !generating && (
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+
+                {/* Quality Checks */}
+                <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8}}>
+                  {[
+                    {label:"Word Count", value:post.checks.wordCount,
+                     ok:post.checks.wordCountOk,
+                     display:post.checks.wordCount,
+                     note:post.checks.wordCountOk?"✓ Target met":"⚠ Re-generate"},
+                    {label:"USA Signals", value:post.checks.usaMentions,
+                     ok:post.checks.usaMentions>=3,
+                     display:`${post.checks.usaMentions}×`,
+                     note:post.checks.usaMentions>=3?"✓ Found":"⚠ Check"},
+                    {label:"Read More", value:post.checks.hasReadMore,
+                     ok:post.checks.hasReadMore,
+                     display:post.checks.hasReadMore?"✓":"✗",
+                     note:post.checks.hasReadMore?"Links added":"Missing"},
+                    {label:selProducts[0]?.name?.split(" ")[0]||"Product 1",
+                     ok:post.checks.hasProduct1,
+                     display:post.checks.hasProduct1?"✓":"✗",
+                     note:post.checks.hasProduct1?"Embedded":"Missing"},
+                    {label:selProducts[1]?.name?.split(" ")[0]||"Product 2",
+                     ok:post.checks.hasProduct2,
+                     display:post.checks.hasProduct2?"✓":"✗",
+                     note:post.checks.hasProduct2?"Embedded":"Missing"},
+                  ].map((c,i) => (
+                    <div key={i} style={{background:"rgba(0,0,0,0.3)",borderRadius:8,padding:"10px 12px",
+                      border:`1px solid ${c.ok?"rgba(0,255,136,0.2)":"rgba(255,184,0,0.2)"}`}}>
+                      <div style={{fontSize:16,fontWeight:800,color:c.ok?"#00ff88":"#ffb800"}}>{c.display}</div>
+                      <div style={{fontSize:9,color:"#3a5268",textTransform:"uppercase",letterSpacing:"0.5px",marginTop:2}}>{c.label}</div>
+                      <div style={{fontSize:9,color:c.ok?"#00ff88":"#ffb800",marginTop:2}}>{c.note}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* SEO Score */}
+                {score && (
+                  <div style={{background:"rgba(0,0,0,0.25)",borderRadius:9,padding:12,
+                    border:`1px solid ${sc(score)}25`,display:"flex",alignItems:"center",gap:12}}>
+                    <div style={{width:50,height:50,borderRadius:"50%",flexShrink:0,
+                      border:`3px solid ${sc(score)}`,display:"flex",alignItems:"center",
+                      justifyContent:"center",fontSize:16,fontWeight:800,color:sc(score)}}>{score}</div>
+                    <div>
+                      <div style={{fontWeight:700,color:"#fff",fontSize:13}}>SEO Score</div>
+                      <div style={{fontSize:10,color:"#3a5268",marginTop:2}}>{post.seoRaw}</div>
+                    </div>
+                    <div style={{marginLeft:"auto",textAlign:"right"}}>
+                      <div style={{fontSize:11,color:"#3a5268"}}>Keyword</div>
+                      <div style={{fontSize:11,color:"#00cfff",fontWeight:600}}>{activeKw.slice(0,35)}...</div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Title + Slug */}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                  {[{label:"Title Tag",val:post.title},{label:"URL Slug",val:`/${post.slug}`}].map((f,i)=>(
+                    <div key={i} style={{background:"rgba(0,0,0,0.25)",borderRadius:7,padding:10,
+                      border:"1px solid rgba(255,255,255,0.06)"}}>
+                      <div style={{fontSize:9,color:"#3a5268",marginBottom:3,textTransform:"uppercase",letterSpacing:"1px"}}>{f.label}</div>
+                      <div style={{fontSize:11,color:"#e0e8f0"}}>{f.val}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Meta */}
+                {post.meta && (
+                  <div style={{background:"rgba(0,0,0,0.25)",borderRadius:7,padding:10,border:"1px solid rgba(255,255,255,0.06)"}}>
+                    <div style={{fontSize:9,color:"#3a5268",marginBottom:3,textTransform:"uppercase",letterSpacing:"1px"}}>Meta Description</div>
+                    <div style={{fontSize:11,color:"#e0e8f0",lineHeight:1.6}}>{post.meta}</div>
+                  </div>
+                )}
+
+                {/* Content Preview */}
+                <div style={{background:"rgba(0,0,0,0.25)",borderRadius:9,padding:12,
+                  border:"1px solid rgba(255,255,255,0.06)",maxHeight:200,overflowY:"auto"}}>
+                  <div style={{fontSize:9,color:"#3a5268",marginBottom:8,textTransform:"uppercase",letterSpacing:"1px"}}>Content Preview</div>
+                  <pre style={{fontSize:10,color:"#5a7a8a",whiteSpace:"pre-wrap",lineHeight:1.9,margin:0}}>{post.content?.slice(0,1000)}...</pre>
+                </div>
+
+                {/* Published URL */}
+                {pubStatus==="published" && pubUrl && (
+                  <div style={{padding:12,borderRadius:8,background:"rgba(0,255,136,0.06)",border:"1px solid rgba(0,255,136,0.25)"}}>
+                    <div style={{color:"#00ff88",fontWeight:700,marginBottom:6}}>🎉 Live on Ghost!</div>
+                    <a href={pubUrl} target="_blank" style={{color:"#00cfff",fontSize:12,wordBreak:"break-all",textDecoration:"underline"}}>{pubUrl}</a>
+                  </div>
+                )}
+
+                {/* Publish Error */}
+                {pubStatus==="error" && (
+                  <div style={{padding:10,borderRadius:8,background:"rgba(255,68,68,0.06)",border:"1px solid rgba(255,68,68,0.25)",fontSize:11,color:"#ff6b6b"}}>
+                    ⚠️ {pubErr}
+                  </div>
+                )}
+
+                {/* Warn if word count off */}
+                {!post.checks.wordCountOk && (
+                  <div style={{padding:10,borderRadius:8,background:"rgba(255,184,0,0.06)",border:"1px solid rgba(255,184,0,0.25)",fontSize:11,color:"#ffb800"}}>
+                    ⚠️ Word count is {post.checks.wordCount} — outside 1000-1200 target. Consider re-generating.
+                  </div>
+                )}
+
+                {/* Buttons */}
+                <div style={{display:"flex",gap:8}}>
+                  <button onClick={publish} disabled={pubStatus==="publishing"||pubStatus==="published"} style={{
+                    flex:1,padding:"13px",borderRadius:8,border:"none",cursor:"pointer",
+                    background:pubStatus==="published"?"rgba(0,255,136,0.12)"
+                             :pubStatus==="publishing"?"rgba(0,255,136,0.08)"
+                             :"linear-gradient(135deg,#00ff88,#00cfff)",
+                    color:pubStatus==="published"?"#00ff88":"#060a10",
+                    fontWeight:800,fontSize:12,fontFamily:"inherit",
+                  }}>
+                    {pubStatus==="publishing"?"🚀 Publishing..."
+                    :pubStatus==="published" ?"✅ Published on Ghost!"
+                    :"🚀 Publish to blog.tikprofitpro.shop"}
+                  </button>
+                  <button onClick={generate} style={{padding:"13px 16px",borderRadius:8,
+                    border:"1px solid rgba(255,255,255,0.08)",background:"transparent",
+                    color:"#e0e8f0",cursor:"pointer",fontSize:11,fontFamily:"inherit",fontWeight:600}}>
+                    🔄 Regenerate
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════
+          TAB 1: COMPETITOR KEYWORDS
+      ══════════════════════════════════════════ */}
+      {tab===1 && (
+        <div>
+          <div style={{marginBottom:14,padding:12,borderRadius:8,background:"rgba(255,184,0,0.06)",border:"1px solid rgba(255,184,0,0.2)",fontSize:12,color:"#ffb800",lineHeight:1.7}}>
+            🕵️ <strong>Strategy:</strong> These are keywords your competitors (Fastmoss, Kalodata, Shoplus, Exlasso) rank for. Writing posts targeting these keywords steals their traffic and positions TikProfitPro as the better alternative.
+          </div>
+          <div style={{display:"grid",gap:7}}>
+            {COMPETITOR_KEYWORDS.map((k,i) => (
+              <div key={i} style={{background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.06)",
+                borderRadius:8,padding:"12px 14px",display:"grid",
+                gridTemplateColumns:"1fr auto auto auto auto",alignItems:"center",gap:14}}>
+                <div>
+                  <div style={{fontWeight:600,fontSize:12,marginBottom:3,color:"#e0e8f0"}}>{k.kw}</div>
+                  <div style={{display:"flex",gap:6}}>
+                    <span style={{fontSize:9,padding:"2px 7px",borderRadius:20,background:"rgba(255,184,0,0.1)",color:"#ffb800"}}>vs {k.comp}</span>
+                    <span style={{fontSize:9,padding:"2px 7px",borderRadius:20,background:`${ic(k.intent)}12`,color:ic(k.intent)}}>{k.intent}</span>
+                  </div>
+                </div>
+                <div style={{textAlign:"center"}}>
+                  <div style={{fontSize:14,fontWeight:700,color:"#00cfff"}}>{k.vol}</div>
+                  <div style={{fontSize:9,color:"#3a5268"}}>searches/mo</div>
+                </div>
+                <div style={{textAlign:"center"}}>
+                  <div style={{fontSize:11,fontWeight:600,color:k.difficulty.includes("Low")?"#00ff88":"#ffb800"}}>{k.difficulty}</div>
+                  <div style={{fontSize:9,color:"#3a5268"}}>difficulty</div>
+                </div>
+                <div style={{textAlign:"center"}}>
+                  <div style={{fontSize:11,fontWeight:700,color:"#00ff88"}}>High</div>
+                  <div style={{fontSize:9,color:"#3a5268"}}>priority</div>
+                </div>
+                <button onClick={()=>{setSelKw(k);setKwSource("competitor");setCustomKw("");setGscKw("");setTab(0);}}
+                  style={{padding:"6px 14px",borderRadius:6,border:"1px solid rgba(0,255,136,0.25)",
+                    background:"rgba(0,255,136,0.06)",color:"#00ff88",cursor:"pointer",fontSize:10,
+                    fontFamily:"inherit",fontWeight:700,whiteSpace:"nowrap"}}>
+                  Write Post →
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════
+          TAB 2: USER QUERIES
+      ══════════════════════════════════════════ */}
+      {tab===2 && (
+        <div>
+          <div style={{marginBottom:14,padding:12,borderRadius:8,background:"rgba(0,207,255,0.06)",border:"1px solid rgba(0,207,255,0.2)",fontSize:12,color:"#00cfff",lineHeight:1.7}}>
+            🔍 <strong>Strategy:</strong> These are the exact phrases USA TikTok Shop sellers type into Google when looking for product research tools. Ranking for these queries = direct buyer intent traffic to tikprofitpro.shop.
+          </div>
+          <div style={{display:"grid",gap:7}}>
+            {USER_QUERIES.map((k,i) => (
+              <div key={i} style={{background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.06)",
+                borderRadius:8,padding:"12px 14px",display:"grid",
+                gridTemplateColumns:"1fr auto auto auto",alignItems:"center",gap:14}}>
+                <div>
+                  <div style={{fontWeight:600,fontSize:12,marginBottom:3,color:"#e0e8f0"}}>{k.kw}</div>
+                  <span style={{fontSize:9,padding:"2px 7px",borderRadius:20,background:`${ic(k.intent)}12`,color:ic(k.intent)}}>{k.intent}</span>
+                </div>
+                <div style={{textAlign:"center"}}>
+                  <div style={{fontSize:14,fontWeight:700,color:"#00cfff"}}>{k.vol}</div>
+                  <div style={{fontSize:9,color:"#3a5268"}}>searches/mo</div>
+                </div>
+                <div style={{textAlign:"center"}}>
+                  <div style={{fontSize:11,fontWeight:600,color:k.difficulty.includes("Low")?"#00ff88":"#ffb800"}}>{k.difficulty}</div>
+                  <div style={{fontSize:9,color:"#3a5268"}}>difficulty</div>
+                </div>
+                <button onClick={()=>{setSelKw(k);setKwSource("userquery");setCustomKw("");setGscKw("");setTab(0);}}
+                  style={{padding:"6px 14px",borderRadius:6,border:"1px solid rgba(0,207,255,0.25)",
+                    background:"rgba(0,207,255,0.06)",color:"#00cfff",cursor:"pointer",fontSize:10,
+                    fontFamily:"inherit",fontWeight:700,whiteSpace:"nowrap"}}>
+                  Write Post →
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════
+          TAB 3: SCHEDULER
+      ══════════════════════════════════════════ */}
+      {tab===3 && (
+        <div style={{display:"grid",gap:8}}>
+          {scheduled.map((p,i) => (
+            <div key={i} style={{background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.06)",
+              borderRadius:8,padding:"12px 14px",display:"grid",
+              gridTemplateColumns:"1fr auto auto",alignItems:"center",gap:14}}>
+              <div>
+                <div style={{fontWeight:600,marginBottom:3,fontSize:12,color:"#e0e8f0"}}>{p.title}</div>
+                <div style={{fontSize:10,color:"#3a5268"}}>🔑 {p.keyword}</div>
+              </div>
+              <div style={{fontSize:11,color:"#5a7a8a"}}>{p.date}</div>
+              <Pill status={p.status}/>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════
+          TAB 4: PUBLISHER
+      ══════════════════════════════════════════ */}
+      {tab===4 && (
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+          <Panel title="🔌 Live Integrations">
+            {[
+              {name:"OpenAI GPT-4o",        note:"via /generate-blog-post",      icon:"🤖", live:true},
+              {name:"Ghost Publisher",       note:"via /publish-blog-post",       icon:"👻", live:true},
+              {name:"Ghost CMS",             note:"blog.tikprofitpro.shop",       icon:"⚡", live:true},
+              {name:"Competitor Research",   note:"16 competitor keywords loaded",icon:"🕵️", live:true},
+              {name:"User Query Targeting",  note:"10 buyer intent queries",      icon:"🔍", live:true},
+              {name:"GSC Integration",       note:"Manual keyword input",         icon:"📊", live:true},
+              {name:"Google Search Console", note:"Auto-ping after publish",      icon:"🔍", live:false},
+              {name:"Unsplash Images",       note:"Auto featured images",         icon:"🖼️", live:false},
+            ].map((s,i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                padding:"9px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                <div>
+                  <div style={{fontSize:12,fontWeight:600}}>{s.icon} {s.name}</div>
+                  <div style={{fontSize:10,color:"#3a5268"}}>{s.note}</div>
+                </div>
+                <span style={{fontSize:10,padding:"2px 9px",borderRadius:20,
+                  background:s.live?"rgba(0,255,136,0.1)":"rgba(255,255,255,0.04)",
+                  color:s.live?"#00ff88":"#3a5268"}}>
+                  {s.live?"✅ Live":"Soon"}
+                </span>
+              </div>
+            ))}
+          </Panel>
+          <Panel title="⚙️ SEO Rules Active">
+            {[
+              {rule:"Word count enforced",       value:"1000-1200 words"},
+              {rule:"USA local signals",          value:"3× per post"},
+              {rule:"Viral product embeds",       value:"2 products auto-linked"},
+              {rule:"Internal Read More links",   value:"4 links per post"},
+              {rule:"TikProfitPro CTA",           value:"2× per post"},
+              {rule:"Competitor KW targeting",    value:"16 keywords"},
+              {rule:"User query targeting",       value:"10 queries"},
+              {rule:"Target posts/week",          value:"2 posts"},
+              {rule:"Best publish days",          value:"Tue & Thu"},
+              {rule:"AI engine",                  value:"GPT-4o"},
+            ].map((r,i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",
+                borderBottom:"1px solid rgba(255,255,255,0.04)",fontSize:11}}>
+                <span style={{color:"#5a7a8a"}}>{r.rule}</span>
+                <span style={{color:"#00ff88",fontWeight:600}}>{r.value}</span>
+              </div>
+            ))}
+          </Panel>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════
+          TAB 5: SETTINGS
+      ══════════════════════════════════════════ */}
+      {tab===5 && (
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+
+          {/* Published Posts Manager */}
+          <Panel title="📚 Published Posts (Internal Links Pool)">
+            <div style={{fontSize:10,color:"#3a5268",marginBottom:10,lineHeight:1.6}}>
+              These posts are automatically added as internal links in every new post you publish. Add new posts here after publishing.
+            </div>
+            <div style={{maxHeight:220,overflowY:"auto",marginBottom:10}}>
+              {publishedPosts.map((p,i)=>(
+                <div key={i} style={{padding:"7px 9px",borderRadius:5,marginBottom:4,
+                  background:"rgba(0,255,136,0.04)",border:"1px solid rgba(0,255,136,0.1)",
+                  display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11,color:"#c0d0e0",marginBottom:1}}>{p.title}</div>
+                    <div style={{fontSize:9,color:"#3a5268"}}>{p.url}</div>
+                  </div>
+                  <button onClick={()=>setPublishedPosts(prev=>prev.filter((_,j)=>j!==i))}
+                    style={{background:"none",border:"none",color:"#ff4444",cursor:"pointer",fontSize:14,flexShrink:0}}>×</button>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              <input value={newPostTitle} onChange={e=>setNewPostTitle(e.target.value)}
+                placeholder="Post title..."
+                style={{padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                  border:"1px solid rgba(255,255,255,0.08)",color:"#e0e8f0",fontSize:11}}/>
+              <input value={newPostUrl} onChange={e=>setNewPostUrl(e.target.value)}
+                placeholder="Full URL (https://blog.tikprofitpro.shop/slug/)"
+                style={{padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                  border:"1px solid rgba(255,255,255,0.08)",color:"#e0e8f0",fontSize:11}}/>
+              <button onClick={()=>{
+                if(newPostTitle&&newPostUrl){
+                  setPublishedPosts(prev=>[{title:newPostTitle,url:newPostUrl},...prev]);
+                  setNewPostTitle(""); setNewPostUrl("");
+                }
+              }} style={{padding:"8px",borderRadius:6,border:"none",
+                background:"rgba(0,255,136,0.12)",color:"#00ff88",
+                cursor:"pointer",fontSize:11,fontFamily:"inherit",fontWeight:700}}>
+                + Add Post to Pool
+              </button>
+            </div>
+          </Panel>
+
+          {/* GSC Instructions */}
+          <Panel title="📊 Google Search Console Setup">
+            <div style={{fontSize:11,color:"#5a7a8a",lineHeight:1.8}}>
+              <div style={{marginBottom:12}}>
+                <strong style={{color:"#00cfff"}}>How to get keywords from GSC:</strong>
+              </div>
+              {[
+                "1. Go to search.google.com/search-console",
+                "2. Select tikprofitpro.shop property",
+                "3. Click Performance → Search Results",
+                "4. Sort by Impressions (descending)",
+                "5. Look for queries with high impressions but low clicks",
+                "6. Copy those keywords",
+                "7. Come to SEO Autopilot → AI Writer",
+                "8. Select 'GSC / Custom' as keyword source",
+                "9. Paste the keyword → Generate → Publish",
+              ].map((s,i)=>(
+                <div key={i} style={{padding:"4px 0",borderBottom:"1px solid rgba(255,255,255,0.04)",fontSize:10,color:i===0?"#00cfff":"#5a7a8a"}}>{s}</div>
+              ))}
+              <div style={{marginTop:12,padding:10,borderRadius:6,
+                background:"rgba(0,255,136,0.06)",border:"1px solid rgba(0,255,136,0.15)",fontSize:10,color:"#00ff88"}}>
+                💡 High impressions + low clicks = Google shows your page but people don't click. Writing a better post on that keyword = instant traffic boost.
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

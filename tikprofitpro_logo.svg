@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" width="400" height="120">
+  <defs>
+    <!-- Main gradient for background -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0a0a0a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1a1a2e;stop-opacity:1" />
+    </linearGradient>
+    <!-- Green accent gradient -->
+    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00C853;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#00E676;stop-opacity:1" />
+    </linearGradient>
+    <!-- Icon glow -->
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <!-- Subtle shadow -->
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#00C853" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Background pill -->
+  <rect x="0" y="0" width="400" height="120" rx="16" ry="16" fill="url(#bgGrad)"/>
+
+  <!-- Icon container circle -->
+  <circle cx="60" cy="60" r="42" fill="#111827" stroke="#00C853" stroke-width="1.5" opacity="0.9"/>
+
+  <!-- TikTok-style music note / play icon base -->
+  <!-- Upward arrow / chart bars suggesting profit -->
+  <g filter="url(#glow)" transform="translate(60,60)">
+    <!-- Bar chart bars -->
+    <rect x="-22" y="8" width="10" height="14" rx="2" fill="#00C853" opacity="0.5"/>
+    <rect x="-9" y="0" width="10" height="22" rx="2" fill="#00C853" opacity="0.75"/>
+    <rect x="4" y="-10" width="10" height="32" rx="2" fill="url(#greenGrad)"/>
+    <!-- Upward arrow on top of tallest bar -->
+    <polygon points="9,-14 14,-22 19,-14" fill="#00E676"/>
+    <!-- TikTok-style note dot -->
+    <circle cx="-17" cy="-18" r="5" fill="#00C853" opacity="0.6"/>
+    <rect x="-13" y="-28" width="3" height="14" rx="1.5" fill="#00C853" opacity="0.6"/>
+  </g>
+
+  <!-- "Tik" text -->
+  <text x="118" y="52"
+    font-family="'Arial Black', 'Arial Bold', Arial, sans-serif"
+    font-weight="900"
+    font-size="34"
+    fill="#ffffff"
+    letter-spacing="-0.5">Tik</text>
+
+  <!-- "Profit" text in green -->
+  <text x="158" y="52"
+    font-family="'Arial Black', 'Arial Bold', Arial, sans-serif"
+    font-weight="900"
+    font-size="34"
+    fill="url(#greenGrad)"
+    filter="url(#shadow)"
+    letter-spacing="-0.5">Profit</text>
+
+  <!-- "Pro" text smaller, white -->
+  <text x="298" y="52"
+    font-family="'Arial Black', 'Arial Bold', Arial, sans-serif"
+    font-weight="900"
+    font-size="34"
+    fill="#ffffff"
+    letter-spacing="-0.5">Pro</text>
+
+  <!-- Tagline -->
+  <text x="118" y="76"
+    font-family="Arial, sans-serif"
+    font-size="12"
+    fill="#888888"
+    letter-spacing="2">TIKTOK SHOP · FIND · SOURCE · PROFIT</text>
+
+  <!-- Green underline accent under Profit -->
+  <rect x="158" y="56" width="136" height="2.5" rx="1.5" fill="url(#greenGrad)" opacity="0.6"/>
+
+  <!-- Small version indicator dot -->
+  <circle cx="376" cy="20" r="4" fill="#00C853" opacity="0.8"/>
+  <circle cx="376" cy="20" r="7" fill="none" stroke="#00C853" stroke-width="1" opacity="0.3"/>
+</svg>

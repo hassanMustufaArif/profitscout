@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>TikProfitPro SEO Autopilot v2.1</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;scrollbar-width:thin;scrollbar-color:rgba(0,255,136,0.3) rgba(255,255,255,0.05)}
+*::-webkit-scrollbar{width:5px}*::-webkit-scrollbar-thumb{background:rgba(0,255,136,0.3);border-radius:3px}
+body{background:#060a10;font-family:'Courier New',monospace;color:#c8daea;min-height:100vh}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes scan{0%{transform:translateY(-100%)}100%{transform:translateY(100vh)}}
+.pulse{animation:pulse 2s infinite}.blink{animation:blink 1s infinite}
+.grid-bg{position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:linear-gradient(rgba(0,255,136,0.03) 1px,transparent 1px),
+  linear-gradient(90deg,rgba(0,255,136,0.03) 1px,transparent 1px);
+  background-size:44px 44px}
+.scan-line{position:fixed;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(0,255,136,0.25),transparent);
+  animation:scan 8s linear infinite;z-index:0;pointer-events:none}
+input,textarea,select{font-family:'Courier New',monospace}
+</style>
+</head>
+<body>
+<div class="grid-bg"></div>
+<div class="scan-line"></div>
+<div id="root"></div>
+<script type="text/babel">
+const {useState} = React;
+
+const API_BASE     = "https://api.tikprofitpro.shop";
+const GENERATE_URL = `${API_BASE}/generate-blog-post`;
+const PUBLISH_URL  = `${API_BASE}/publish-blog-post`;
+const BLOG_URL     = "https://blog.tikprofitpro.shop";
+const BRAND        = "TikProfitPro";
+const DOMAIN       = "tikprofitpro.shop";
+
+// ── COMPETITOR KEYWORDS ─────────────────────────────
+const COMPETITOR_KEYWORDS = [
+  {kw:"fastmoss alternative",               comp:"Fastmoss", vol:"1,400", difficulty:"Low",    intent:"Money"},
+  {kw:"fastmoss vs kalodata",               comp:"Fastmoss", vol:"880",   difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop analytics tool",         comp:"Fastmoss", vol:"3,200", difficulty:"Medium", intent:"Money"},
+  {kw:"tiktok shop spy tool",               comp:"Fastmoss", vol:"2,100", difficulty:"Low",    intent:"Money"},
+  {kw:"kalodata alternative",               comp:"Kalodata", vol:"1,200", difficulty:"Low",    intent:"Money"},
+  {kw:"kalodata free alternative",          comp:"Kalodata", vol:"760",   difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop product tracker",        comp:"Kalodata", vol:"2,800", difficulty:"Medium", intent:"Money"},
+  {kw:"shoplus alternative",                comp:"Shoplus",  vol:"680",   difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop winning products",       comp:"Shoplus",  vol:"5,400", difficulty:"Medium", intent:"Money"},
+  {kw:"tiktok creative center alternative", comp:"TikTok",   vol:"2,300", difficulty:"Low",    intent:"Money"},
+];
+
+// ── USER QUERIES ────────────────────────────────────
+const USER_QUERIES = [
+  {kw:"how to find viral products on tiktok shop",    vol:"18,000", difficulty:"Medium", intent:"Info"},
+  {kw:"how to find winning products for tiktok shop", vol:"12,000", difficulty:"Medium", intent:"Info"},
+  {kw:"best tiktok shop product research tool",       vol:"4,200",  difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop product research tool free",       vol:"2,800",  difficulty:"Low",    intent:"Money"},
+  {kw:"how to find trending products tiktok 2026",    vol:"22,000", difficulty:"Medium", intent:"Info"},
+  {kw:"tiktok shop trending products finder",         vol:"6,500",  difficulty:"Low",    intent:"Money"},
+  {kw:"how to research tiktok shop products",         vol:"9,800",  difficulty:"Medium", intent:"Info"},
+  {kw:"find viral tiktok products before they trend", vol:"7,200",  difficulty:"Low",    intent:"Info"},
+  {kw:"tiktok shop dropshipping product research",    vol:"5,100",  difficulty:"Low",    intent:"Money"},
+  {kw:"tiktok shop product sourcing tool",            vol:"3,400",  difficulty:"Low",    intent:"Money"},
+];
+
+// ── TARGET KEYWORDS ─────────────────────────────────
+const TARGET_KEYWORDS = [
+  {kw:"TikTok Shop product research tool",    vol:"1,200",  difficulty:"Low",      intent:"Money"},
+  {kw:"best products to sell on TikTok Shop", vol:"8,000",  difficulty:"Medium",   intent:"Money"},
+  {kw:"TikTok Shop winning products",         vol:"3,500",  difficulty:"Low",      intent:"Money"},
+  {kw:"how to sell on TikTok Shop 2026",      vol:"22,000", difficulty:"Medium",   intent:"Info"},
+  {kw:"TikTok Shop for beginners",            vol:"18,000", difficulty:"Medium",   intent:"Info"},
+  {kw:"TikTok Shop dropshipping products",    vol:"2,800",  difficulty:"Low",      intent:"Money"},
+  {kw:"TikTok Shop profit margin calculator", vol:"2,100",  difficulty:"Very Low", intent:"Tool"},
+  {kw:"trending TikTok Shop products 2026",   vol:"5,400",  difficulty:"Low",      intent:"Info"},
+];
+
+// ── VIRAL PRODUCTS with SOURCES ─────────────────────
+// Source = where to buy/source the product (main selling point)
+const VIRAL_PRODUCTS = [
+  {name:"LED Strip Lights",     score:94, category:"Home Decor", aliUrl:"https://www.aliexpress.com/wholesale?SearchText=led+strip+lights", aliSource:"AliExpress", margin:"72%", researchUrl:`https://${DOMAIN}/?product=led-strip-lights`},
+  {name:"Portable Blender",     score:91, category:"Kitchen",    aliUrl:"https://www.aliexpress.com/wholesale?SearchText=portable+blender",  aliSource:"AliExpress", margin:"68%", researchUrl:`https://${DOMAIN}/?product=portable-blender`},
+  {name:"Posture Corrector",    score:89, category:"Health",     aliUrl:"https://www.aliexpress.com/wholesale?SearchText=posture+corrector", aliSource:"AliExpress", margin:"75%", researchUrl:`https://${DOMAIN}/?product=posture-corrector`},
+  {name:"Car Phone Holder",     score:87, category:"Automotive", aliUrl:"https://www.aliexpress.com/wholesale?SearchText=car+phone+holder",  aliSource:"AliExpress", margin:"65%", researchUrl:`https://${DOMAIN}/?product=car-phone-holder`},
+  {name:"Resistance Bands Set", score:85, category:"Fitness",    aliUrl:"https://www.aliexpress.com/wholesale?SearchText=resistance+bands",  aliSource:"AliExpress", margin:"70%", researchUrl:`https://${DOMAIN}/?product=resistance-bands`},
+  {name:"Magnetic Phone Case",  score:83, category:"Accessories",aliUrl:"https://www.aliexpress.com/wholesale?SearchText=magnetic+phone+case",aliSource:"AliExpress", margin:"63%", researchUrl:`https://${DOMAIN}/?product=magnetic-phone-case`},
+  {name:"Air Purifier Mini",    score:88, category:"Home",       aliUrl:"https://www.aliexpress.com/wholesale?SearchText=mini+air+purifier",  aliSource:"AliExpress", margin:"71%", researchUrl:`https://${DOMAIN}/?product=air-purifier-mini`},
+  {name:"Teeth Whitening Kit",  score:86, category:"Beauty",     aliUrl:"https://www.aliexpress.com/wholesale?SearchText=teeth+whitening+kit",aliSource:"AliExpress", margin:"78%", researchUrl:`https://${DOMAIN}/?product=teeth-whitening`},
+];
+
+const TEMPLATES = [
+  {type:"Pillar Guide",    icon:"📘"},
+  {type:"Trending Report", icon:"🔥"},
+  {type:"Comparison Post", icon:"⚖️"},
+  {type:"Tutorial",        icon:"🎓"},
+  {type:"Case Study",      icon:"📊"},
+  {type:"Tool Page",       icon:"🛠️"},
+];
+
+const TABS = ["🤖 AI Writer","🎯 Competitor KWs","🔍 User Queries","📅 Scheduler","📤 Publisher","⚙️ Settings"];
+const ic = i => i==="Money"?"#00ff88":i==="Info"?"#4db8ff":i==="Tool"?"#ffb800":"#ff88cc";
+const sc = s => s>=80?"#00ff88":s>=60?"#ffb800":"#ff4444";
+
+const DEFAULT_POSTS = [
+  {title:"Complete Guide to TikTok Shop Product Research 2026", url:`${BLOG_URL}/tiktok-shop-product-research-guide-2026/`},
+  {title:"10 Best Products to Sell on TikTok Shop Right Now",   url:`${BLOG_URL}/best-products-tiktok-shop/`},
+  {title:"TikTok Shop vs Amazon: Which Is More Profitable?",    url:`${BLOG_URL}/tiktok-shop-vs-amazon/`},
+  {title:"How to Find Winning Products for TikTok Shop",        url:`${BLOG_URL}/find-winning-products-tiktok-shop/`},
+];
+
+function Panel({title,children,style={}}) {
+  return (
+    <div style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:16,...style}}>
+      <div style={{fontSize:11,fontWeight:700,marginBottom:14,color:"#ffffff",letterSpacing:"1px",textTransform:"uppercase"}}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function Pill({status}) {
+  const c = status==="published"?{bg:"rgba(0,255,136,0.2)",col:"#00ff88"}
+           :status==="scheduled"?{bg:"rgba(77,184,255,0.2)",col:"#4db8ff"}
+           :                     {bg:"rgba(255,184,0,0.2)", col:"#ffb800"};
+  return <span style={{fontSize:10,padding:"3px 10px",borderRadius:20,fontWeight:700,background:c.bg,color:c.col,border:`1px solid ${c.col}40`}}>{status}</span>;
+}
+
+function App() {
+  const [tab,        setTab]        = useState(0);
+
+  // Multi-source keyword selection: pick 2 from each source
+  const [selTarget,   setSelTarget]   = useState([TARGET_KEYWORDS[0], TARGET_KEYWORDS[2]]);
+  const [selComp,     setSelComp]     = useState([COMPETITOR_KEYWORDS[0], COMPETITOR_KEYWORDS[4]]);
+  const [selQuery,    setSelQuery]    = useState([USER_QUERIES[0], USER_QUERIES[2]]);
+  const [gscKw1,      setGscKw1]      = useState("");
+  const [gscKw2,      setGscKw2]      = useState("");
+
+  const [selTpl,     setSelTpl]     = useState(TEMPLATES[0]);
+  const [generating, setGenerating] = useState(false);
+  const [streamText, setStreamText] = useState("");
+  const [post,       setPost]       = useState(null);
+  const [score,      setScore]      = useState(null);
+  const [pubStatus,  setPubStatus]  = useState(null);
+  const [pubUrl,     setPubUrl]     = useState(null);
+  const [pubErr,     setPubErr]     = useState(null);
+  const [agentMsg,   setAgentMsg]   = useState(null);
+  const [error,      setError]      = useState(null);
+  const [selProducts,setSelProducts]= useState([VIRAL_PRODUCTS[0], VIRAL_PRODUCTS[1]]);
+  const [publishedPosts, setPublishedPosts] = useState(DEFAULT_POSTS);
+  const [newPostTitle,   setNewPostTitle]   = useState("");
+  const [newPostUrl,     setNewPostUrl]     = useState("");
+
+  // Scheduler state — fully working
+  const [scheduled, setScheduled] = useState([
+    {id:1, title:"Complete Guide to TikTok Shop Product Research 2026", date:"2026-03-13", status:"published", keyword:"TikTok Shop product research"},
+    {id:2, title:"10 Best Products to Sell on TikTok Shop Right Now",   date:"2026-03-15", status:"scheduled", keyword:"best products TikTok Shop"},
+    {id:3, title:"TikTok Shop vs Amazon: Which Is More Profitable?",    date:"2026-03-18", status:"draft",     keyword:"TikTok Shop vs Amazon"},
+    {id:4, title:"How to Find Viral TikTok Shop Products",              date:"2026-03-20", status:"scheduled", keyword:"viral TikTok Shop products"},
+  ]);
+  const [newSchedTitle,  setNewSchedTitle]  = useState("");
+  const [newSchedKw,     setNewSchedKw]     = useState("");
+  const [newSchedDate,   setNewSchedDate]   = useState("");
+  const [newSchedStatus, setNewSchedStatus] = useState("scheduled");
+
+  // Toggle keyword selection in a list (max 2)
+  const toggleKw = (list, setList, kw) => {
+    const exists = list.some(k => k.kw === kw.kw);
+    if (exists) setList(list.filter(k => k.kw !== kw.kw));
+    else if (list.length < 2) setList([...list, kw]);
+    else setList([list[1], kw]);
+  };
+
+  // Collect all selected keywords across ALL sources
+  const allSelectedKws = [
+    ...selTarget,
+    ...selComp,
+    ...selQuery,
+    ...(gscKw1.trim() ? [{kw: gscKw1.trim(), source:"GSC"}] : []),
+    ...(gscKw2.trim() ? [{kw: gscKw2.trim(), source:"GSC"}] : []),
+  ];
+
+  // Primary keyword = first target keyword
+  const primaryKw = selTarget[0]?.kw || allSelectedKws[0]?.kw || "";
+
+  // ── BUILD MEGA PROMPT ────────────────────────────
+  const buildPrompt = () => {
+    const internalLinks = publishedPosts.slice(0,4).map(p => `- [${p.title}](${p.url})`).join("\n");
+    const p1 = selProducts[0];
+    const p2 = selProducts[1];
+
+    const kwList = allSelectedKws.map((k,i) => `${i+1}. "${k.kw}"`).join("\n");
+
+    return `You are a senior SEO content writer for ${BRAND} — a TikTok Shop product research SaaS at ${DOMAIN} built for USA TikTok Shop sellers.
+
+PRIMARY KEYWORD (title + H1 + slug): "${primaryKw}"
+
+SECONDARY KEYWORDS — naturally weave ALL of these into the post body (do not force, make it flow naturally):
+${kwList}
+
+Post type: ${selTpl.type}
+
+══════════════════════════════════════
+STRICT REQUIREMENTS — ALL MUST BE MET
+══════════════════════════════════════
+
+【RULE 1 — WORD COUNT】
+The post body MUST contain between 1000 and 1200 words EXACTLY.
+- Count every word carefully before finishing.
+- If you reach 1200 words, stop and write the conclusion.
+- If you are under 1000 words, expand sections before finishing.
+- This is non-negotiable. Do NOT submit under 1000 or over 1200 words.
+
+【RULE 2 — USA LOCAL SIGNALS】
+Mention "USA" naturally EXACTLY 3 times:
+  - Time 1: In the introduction paragraph
+  - Time 2: Inside a body section or subheading
+  - Time 3: In the conclusion paragraph
+This tells Google this content targets USA TikTok Shop sellers.
+
+【RULE 3 — VIRAL PRODUCTS WITH SUPPLIER SOURCE】
+Embed these 2 trending products naturally into the post. For EACH product you MUST:
+  a) Mention the product name with a link to TikProfitPro research page
+  b) Mention where to SOURCE it (the supplier link) — this is the MAIN SELLING POINT
+  c) Mention the profit margin
+  d) Make it data-driven and natural — NOT promotional
+
+Product 1: "${p1.name}"
+  - Virality Score: ${p1.score}
+  - Profit Margin: ${p1.margin}
+  - Research link: ${p1.researchUrl}
+  - Source/Supplier: ${p1.aliSource} → ${p1.aliUrl}
+
+Product 2: "${p2.name}"
+  - Virality Score: ${p2.score}
+  - Profit Margin: ${p2.margin}
+  - Research link: ${p2.researchUrl}
+  - Source/Supplier: ${p2.aliSource} → ${p2.aliUrl}
+
+Example of correct embedding (use this style):
+"For example, [${p1.name}](${p1.researchUrl}) currently has a virality score of ${p1.score} on TikProfitPro, with a ${p1.margin} profit margin. USA sellers can source it directly from [${p1.aliSource}](${p1.aliUrl}) for under $5 per unit."
+
+【RULE 4 — READ MORE INTERNAL LINKS】
+At the very end of the post content, add this exact section:
+
+---
+## 📚 Read More Guides
+
+Looking to grow your TikTok Shop business in the USA? Explore these resources:
+
+${internalLinks}
+---
+
+【RULE 5 — TIKPROFITPRO CTA】
+Mention ${BRAND} at ${DOMAIN} exactly twice:
+  - Once naturally in the middle of the post
+  - Once in the conclusion with a clear CTA to start free
+
+══════════════════════════════════════
+OUTPUT FORMAT — RETURN EXACTLY THIS
+══════════════════════════════════════
+
+---TITLE---
+[SEO title under 60 chars — include primary keyword]
+
+---META---
+[Meta description 150-160 chars — include primary keyword + USA + CTA]
+
+---SLUG---
+[URL slug: lowercase, hyphens only, under 60 chars]
+
+---CONTENT---
+[Full markdown post — ALL 5 rules must be satisfied]
+
+---WORD_COUNT---
+[Single integer — exact word count of the CONTENT section only]
+
+---SEO_SCORE---
+[XX/100 — one sentence reason]
+
+---RULES_CHECK---
+[List each rule and whether it passed: RULE1:PASS/FAIL RULE2:PASS/FAIL RULE3:PASS/FAIL RULE4:PASS/FAIL RULE5:PASS/FAIL]`;
+  };
+
+  // ── GENERATE ────────────────────────────────────
+  const generate = async () => {
+    if (!primaryKw) { setError("Please select at least one Target Keyword first."); return; }
+    setGenerating(true);
+    setStreamText("");
+    setPost(null);
+    setScore(null);
+    setPubStatus(null);
+    setPubUrl(null);
+    setPubErr(null);
+    setError(null);
+    setAgentMsg(`⚙️ Building prompt with ${allSelectedKws.length} keywords from all sources...`);
+    await new Promise(r => setTimeout(r, 500));
+    setAgentMsg("🤖 GPT-4o generating 1000-1200 word post...");
+
+    try {
+      const res = await fetch(GENERATE_URL, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({prompt: buildPrompt()}),
+      });
+      if (!res.ok) throw new Error(`Server ${res.status}: ${await res.text()}`);
+      const data = await res.json();
+      let full = "";
+      if (data?.choices?.[0]?.message?.content) full = data.choices[0].message.content;
+      else if (data?.content?.[0]?.text) full = data.content.map(c=>c.text||"").join("");
+      else if (data?.error) throw new Error(data.error.message);
+      else throw new Error("Unexpected response: " + JSON.stringify(data).slice(0,200));
+      if (!full.trim()) throw new Error("Empty response.");
+
+      setAgentMsg("✍️ Streaming enhanced post...");
+      let i = 0;
+      const iv = setInterval(()=>{
+        i += 30;
+        setStreamText(full.slice(0,i));
+        if (i >= full.length) {
+          clearInterval(iv);
+          parsePost(full);
+          setGenerating(false);
+          setAgentMsg(null);
+        }
+      }, 6);
+    } catch(e) {
+      setError(e.message);
+      setGenerating(false);
+      setAgentMsg(null);
+    }
+  };
+
+  const parsePost = (text) => {
+    const ext = tag => {
+      const m = text.match(new RegExp(`---${tag}---\\n([\\s\\S]*?)(?=\\n---[A-Z_]+---|$)`));
+      return m ? m[1].trim() : "";
+    };
+    const content   = ext("CONTENT");
+    const scoreRaw  = ext("SEO_SCORE");
+    const wcRaw     = ext("WORD_COUNT");
+    const rulesRaw  = ext("RULES_CHECK");
+    const scoreNum  = parseInt((scoreRaw.match(/(\d+)/)||["","78"])[1]);
+    const wc        = parseInt(wcRaw) || content.split(/\s+/).filter(Boolean).length;
+    const p1 = selProducts[0], p2 = selProducts[1];
+    setPost({
+      title:   ext("TITLE") || primaryKw,
+      meta:    ext("META"),
+      slug:    ext("SLUG")  || primaryKw.toLowerCase().replace(/[^a-z0-9]+/g,"-"),
+      content, seoRaw: scoreRaw, rulesRaw,
+      checks: {
+        wc, wcOk: wc>=1000 && wc<=1200,
+        usa:     (content.match(/\bUSA\b/g)||[]).length,
+        readMore: content.includes("Read More Guides"),
+        prod1:   content.includes(p1.name),
+        prod1src: content.includes(p1.aliSource),
+        prod2:   content.includes(p2.name),
+        prod2src: content.includes(p2.aliSource),
+      },
+    });
+    setScore(scoreNum);
+    setScheduled(prev => [{
+      id: Date.now(), title: ext("TITLE")||primaryKw,
+      date: new Date().toISOString().split("T")[0],
+      status:"draft", keyword: primaryKw
+    }, ...prev]);
+  };
+
+  // ── PUBLISH ──────────────────────────────────────
+  const publish = async () => {
+    if (!post) return;
+    setPubStatus("publishing");
+    setPubErr(null);
+    setAgentMsg("🚀 Publishing to blog.tikprofitpro.shop...");
+    try {
+      const res = await fetch(PUBLISH_URL, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({title:post.title, slug:post.slug, meta:post.meta, content:post.content}),
+      });
+      const data = await res.json();
+      if (data?.errors?.length) throw new Error(data.errors[0].message);
+      const slug = data?.posts?.[0]?.slug || post.slug;
+      const url  = `${BLOG_URL}/${slug}/`;
+      setPubStatus("published");
+      setPubUrl(url);
+      setAgentMsg("✅ Live on Ghost!");
+      setPublishedPosts(prev => [{title:post.title, url}, ...prev].slice(0,8));
+      setScheduled(prev => prev.map(p =>
+        p.title===post.title ? {...p, status:"published", date:new Date().toISOString().split("T")[0]} : p
+      ));
+      setTimeout(()=>setAgentMsg(null), 3000);
+    } catch(e) {
+      setPubStatus("error");
+      setPubErr(e.message);
+      setAgentMsg(null);
+    }
+  };
+
+  const pubCount   = scheduled.filter(p=>p.status==="published").length;
+  const schedCount = scheduled.filter(p=>p.status==="scheduled").length;
+  const draftCount = scheduled.filter(p=>p.status==="draft").length;
+
+  // ── RENDER ───────────────────────────────────────
+  return (
+    <div style={{position:"relative",zIndex:1,maxWidth:1180,margin:"0 auto",padding:"20px 14px"}}>
+
+      {/* HEADER */}
+      <div style={{marginBottom:18,borderBottom:"1px solid rgba(0,255,136,0.15)",paddingBottom:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{width:40,height:40,borderRadius:9,background:"linear-gradient(135deg,#00ff88,#00cfff)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:900,color:"#060a10",flexShrink:0}}>⚡</div>
+          <div style={{flex:1}}>
+            <div style={{fontSize:19,fontWeight:800,color:"#ffffff",letterSpacing:"-0.5px"}}>
+              TikProfitPro <span style={{color:"#00ff88"}}>SEO Autopilot</span>
+              <span style={{fontSize:10,marginLeft:8,padding:"2px 9px",borderRadius:20,background:"rgba(0,255,136,0.15)",color:"#00ff88",fontWeight:700,verticalAlign:"middle",border:"1px solid rgba(0,255,136,0.3)"}}>v2.1</span>
+            </div>
+            <div style={{fontSize:10,color:"#7a9db8",letterSpacing:"1.5px",textTransform:"uppercase",marginTop:2}}>
+              Multi-Source Keywords → GPT-4o → 1000-1200 words → Ghost Publisher
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{width:8,height:8,borderRadius:"50%",background:"#00ff88",display:"inline-block"}} className="pulse"/>
+            <span style={{fontSize:11,color:"#00ff88",fontWeight:700}}>ALL SYSTEMS LIVE</span>
+          </div>
+        </div>
+        {agentMsg && (
+          <div style={{marginTop:10,padding:"9px 14px",background:"rgba(0,255,136,0.07)",border:"1px solid rgba(0,255,136,0.25)",borderRadius:7,fontSize:12,color:"#00ff88",display:"flex",alignItems:"center",gap:8}}>
+            <span className="pulse">●</span> {agentMsg}
+          </div>
+        )}
+      </div>
+
+      {/* STATS */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:16}}>
+        {[
+          {label:"Published",     value:pubCount,                       color:"#00ff88"},
+          {label:"Scheduled",     value:schedCount,                     color:"#4db8ff"},
+          {label:"Drafts",        value:draftCount,                     color:"#ffb800"},
+          {label:"KWs Selected",  value:allSelectedKws.length,          color:"#ff88cc"},
+          {label:"Word Target",   value:"1000-1200",                    color:"#00ff88"},
+          {label:"AI Engine",     value:"GPT-4o",                       color:"#00cfff"},
+        ].map((s,i)=>(
+          <div key={i} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.09)",borderRadius:9,padding:"11px 13px"}}>
+            <div style={{fontSize:17,fontWeight:800,color:s.color}}>{s.value}</div>
+            <div style={{fontSize:10,color:"#8aabb8",marginTop:1,textTransform:"uppercase",letterSpacing:"0.5px"}}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* TABS */}
+      <div style={{display:"flex",gap:3,marginBottom:16,flexWrap:"wrap"}}>
+        {TABS.map((t,i)=>(
+          <button key={i} onClick={()=>setTab(i)} style={{
+            padding:"8px 15px",borderRadius:6,border:"none",cursor:"pointer",
+            fontSize:11,fontFamily:"inherit",fontWeight:700,
+            background:tab===i?"linear-gradient(135deg,#00ff88,#00cfff)":"rgba(255,255,255,0.05)",
+            color:tab===i?"#060a10":"#8aabb8",transition:"all 0.15s",
+          }}>{t}</button>
+        ))}
+      </div>
+
+      {/* ══ TAB 0: AI WRITER ══ */}
+      {tab===0 && (
+        <div style={{display:"grid",gridTemplateColumns:"310px 1fr",gap:14}}>
+
+          {/* LEFT */}
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+
+            {/* MULTI-SOURCE KEYWORD SELECTOR */}
+            <Panel title="🔑 Keywords — Select 2 from EACH source">
+              <div style={{fontSize:11,color:"#7ab8d8",marginBottom:10,lineHeight:1.6,background:"rgba(77,184,255,0.07)",padding:"8px 10px",borderRadius:6,border:"1px solid rgba(77,184,255,0.2)"}}>
+                All selected keywords get woven into every post. Select up to 2 from each source for maximum SEO coverage.
+              </div>
+
+              {/* Target Keywords */}
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:10,color:"#00ff88",fontWeight:700,marginBottom:6,letterSpacing:"1px"}}>🎯 TARGET KEYWORDS ({selTarget.length}/2 selected)</div>
+                <div style={{maxHeight:130,overflowY:"auto"}}>
+                  {TARGET_KEYWORDS.map((k,i)=>{
+                    const sel = selTarget.some(s=>s.kw===k.kw);
+                    return (
+                      <div key={i} onClick={()=>toggleKw(selTarget,setSelTarget,k)}
+                        style={{padding:"6px 9px",borderRadius:5,cursor:"pointer",marginBottom:2,
+                          background:sel?"rgba(0,255,136,0.1)":"rgba(255,255,255,0.02)",
+                          border:sel?"1px solid rgba(0,255,136,0.35)":"1px solid rgba(255,255,255,0.06)",
+                          display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div style={{fontSize:11,color:sel?"#ffffff":"#b0c8d8",flex:1}}>{k.kw}</div>
+                        <div style={{display:"flex",gap:4,alignItems:"center",flexShrink:0}}>
+                          <span style={{fontSize:9,color:ic(k.intent)}}>{k.vol}</span>
+                          {sel && <span style={{fontSize:12,color:"#00ff88"}}>✓</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Competitor Keywords */}
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:10,color:"#ffb800",fontWeight:700,marginBottom:6,letterSpacing:"1px"}}>🕵️ COMPETITOR KEYWORDS ({selComp.length}/2 selected)</div>
+                <div style={{maxHeight:130,overflowY:"auto"}}>
+                  {COMPETITOR_KEYWORDS.map((k,i)=>{
+                    const sel = selComp.some(s=>s.kw===k.kw);
+                    return (
+                      <div key={i} onClick={()=>toggleKw(selComp,setSelComp,k)}
+                        style={{padding:"6px 9px",borderRadius:5,cursor:"pointer",marginBottom:2,
+                          background:sel?"rgba(255,184,0,0.1)":"rgba(255,255,255,0.02)",
+                          border:sel?"1px solid rgba(255,184,0,0.35)":"1px solid rgba(255,255,255,0.06)",
+                          display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div style={{fontSize:11,color:sel?"#ffffff":"#b0c8d8",flex:1}}>{k.kw}</div>
+                        <div style={{display:"flex",gap:4,alignItems:"center",flexShrink:0}}>
+                          <span style={{fontSize:9,color:"#ffb800"}}>vs {k.comp}</span>
+                          {sel && <span style={{fontSize:12,color:"#ffb800"}}>✓</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* User Queries */}
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:10,color:"#4db8ff",fontWeight:700,marginBottom:6,letterSpacing:"1px"}}>🔍 USER QUERIES ({selQuery.length}/2 selected)</div>
+                <div style={{maxHeight:130,overflowY:"auto"}}>
+                  {USER_QUERIES.map((k,i)=>{
+                    const sel = selQuery.some(s=>s.kw===k.kw);
+                    return (
+                      <div key={i} onClick={()=>toggleKw(selQuery,setSelQuery,k)}
+                        style={{padding:"6px 9px",borderRadius:5,cursor:"pointer",marginBottom:2,
+                          background:sel?"rgba(77,184,255,0.1)":"rgba(255,255,255,0.02)",
+                          border:sel?"1px solid rgba(77,184,255,0.35)":"1px solid rgba(255,255,255,0.06)",
+                          display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div style={{fontSize:11,color:sel?"#ffffff":"#b0c8d8",flex:1}}>{k.kw}</div>
+                        <div style={{display:"flex",gap:4,alignItems:"center",flexShrink:0}}>
+                          <span style={{fontSize:9,color:"#4db8ff"}}>{k.vol}</span>
+                          {sel && <span style={{fontSize:12,color:"#4db8ff"}}>✓</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* GSC Keywords */}
+              <div>
+                <div style={{fontSize:10,color:"#ff88cc",fontWeight:700,marginBottom:6,letterSpacing:"1px"}}>📊 GSC KEYWORDS (manual)</div>
+                <input value={gscKw1} onChange={e=>setGscKw1(e.target.value)}
+                  placeholder="GSC keyword 1 (from Search Console)..."
+                  style={{width:"100%",padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                    border:"1px solid rgba(255,136,204,0.25)",color:"#e0e8f0",fontSize:11,marginBottom:5}}/>
+                <input value={gscKw2} onChange={e=>setGscKw2(e.target.value)}
+                  placeholder="GSC keyword 2 (from Search Console)..."
+                  style={{width:"100%",padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                    border:"1px solid rgba(255,136,204,0.25)",color:"#e0e8f0",fontSize:11}}/>
+              </div>
+
+              {/* Summary */}
+              <div style={{marginTop:10,padding:"8px 10px",borderRadius:6,background:"rgba(0,255,136,0.05)",border:"1px solid rgba(0,255,136,0.15)"}}>
+                <div style={{fontSize:10,color:"#00ff88",fontWeight:700,marginBottom:4}}>✓ ACTIVE KEYWORDS ({allSelectedKws.length} total)</div>
+                <div style={{fontSize:10,color:"#7ab8d8",lineHeight:1.7}}>
+                  {allSelectedKws.map((k,i)=><span key={i} style={{display:"block"}}>· {k.kw}</span>)}
+                </div>
+              </div>
+            </Panel>
+
+            {/* Post Type */}
+            <Panel title="📝 Post Type">
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+                {TEMPLATES.map((t,i)=>(
+                  <div key={i} onClick={()=>setSelTpl(t)}
+                    style={{padding:"8px",borderRadius:5,cursor:"pointer",
+                      background:selTpl.type===t.type?"rgba(0,207,255,0.12)":"rgba(255,255,255,0.02)",
+                      border:selTpl.type===t.type?"1px solid rgba(0,207,255,0.4)":"1px solid rgba(255,255,255,0.07)",
+                      fontSize:11,textAlign:"center"}}>
+                    <div style={{fontSize:16}}>{t.icon}</div>
+                    <div style={{color:selTpl.type===t.type?"#4db8ff":"#8aabb8",marginTop:2,fontSize:10,fontWeight:600}}>{t.type}</div>
+                  </div>
+                ))}
+              </div>
+            </Panel>
+
+            {/* Viral Products */}
+            <Panel title="🔥 Viral Products + Sources">
+              <div style={{fontSize:10,color:"#7ab8d8",marginBottom:8,lineHeight:1.5}}>
+                Products will be embedded WITH supplier source links and profit margins. Select 2:
+              </div>
+              {VIRAL_PRODUCTS.map((p,i)=>{
+                const isSel = selProducts.some(s=>s.name===p.name);
+                return (
+                  <div key={i} onClick={()=>{
+                    if(isSel) setSelProducts(prev=>prev.filter(s=>s.name!==p.name));
+                    else if(selProducts.length<2) setSelProducts(prev=>[...prev,p]);
+                    else setSelProducts(prev=>[prev[1],p]);
+                  }} style={{padding:"7px 9px",borderRadius:5,cursor:"pointer",marginBottom:3,
+                    background:isSel?"rgba(255,184,0,0.08)":"rgba(255,255,255,0.02)",
+                    border:isSel?"1px solid rgba(255,184,0,0.35)":"1px solid rgba(255,255,255,0.07)",
+                    display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div>
+                      <div style={{fontSize:11,color:isSel?"#ffffff":"#b0c8d8",fontWeight:isSel?700:400}}>{p.name}</div>
+                      <div style={{fontSize:9,color:"#7ab8d8",marginTop:1}}>
+                        {p.aliSource} · Margin: <span style={{color:"#00ff88"}}>{p.margin}</span>
+                      </div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{color:"#00ff88",fontSize:11,fontWeight:700}}>🔥{p.score}</div>
+                      {isSel && <div style={{fontSize:9,color:"#ffb800"}}>✓ selected</div>}
+                    </div>
+                  </div>
+                );
+              })}
+            </Panel>
+
+            {/* SEO Checklist */}
+            <Panel title="✅ SEO Rules Status">
+              {[
+                {rule:"Word count 1000-1200",       on:true,                       note:"Enforced in prompt"},
+                {rule:"USA × 3 signals",            on:true,                       note:"Auto-added"},
+                {rule:"Viral products (2)",         on:selProducts.length===2,     note:selProducts.map(p=>p.name.split(" ")[0]).join(", ")},
+                {rule:"Supplier sources shown",     on:selProducts.length===2,     note:"AliExpress links"},
+                {rule:"Read More internal links",   on:publishedPosts.length>0,    note:`${publishedPosts.length} posts`},
+                {rule:"Multi-source keywords",      on:allSelectedKws.length>=4,   note:`${allSelectedKws.length} active`},
+                {rule:"Competitor KWs",             on:selComp.length>0,           note:`${selComp.length} selected`},
+                {rule:"User queries",               on:selQuery.length>0,          note:`${selQuery.length} selected`},
+              ].map((r,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                  padding:"5px 0",borderBottom:"1px solid rgba(255,255,255,0.05)",fontSize:11}}>
+                  <div>
+                    <span style={{color:r.on?"#d0e8f0":"#7ab8d8"}}>{r.rule}</span>
+                    {r.note && <span style={{fontSize:9,color:r.on?"#00ff88":"#5a7a8a",marginLeft:6}}>{r.note}</span>}
+                  </div>
+                  <span style={{color:r.on?"#00ff88":"#4a6a7a",fontSize:13,fontWeight:700}}>{r.on?"✓":"○"}</span>
+                </div>
+              ))}
+            </Panel>
+
+            <button onClick={generate} disabled={generating||!primaryKw} style={{
+              padding:"14px",borderRadius:8,border:"none",
+              cursor:generating||!primaryKw?"not-allowed":"pointer",
+              background:generating?"rgba(0,255,136,0.12)":!primaryKw?"rgba(255,255,255,0.05)":"linear-gradient(135deg,#00ff88,#00cfff)",
+              color:generating||!primaryKw?"#5a7a8a":"#060a10",
+              fontWeight:800,fontSize:13,fontFamily:"inherit",letterSpacing:"0.5px",
+            }}>
+              {generating?`⏳ Generating with ${allSelectedKws.length} keywords...`:"⚡ Generate SEO Post"}
+            </button>
+            {primaryKw && <div style={{fontSize:10,color:"#7ab8d8",textAlign:"center"}}>Primary KW: "{primaryKw}"</div>}
+          </div>
+
+          {/* RIGHT */}
+          <div>
+            {error && !generating && (
+              <div style={{padding:14,borderRadius:10,background:"rgba(255,68,68,0.07)",border:"1px solid rgba(255,68,68,0.3)",marginBottom:12}}>
+                <div style={{color:"#ff8080",fontWeight:700,marginBottom:6}}>⚠️ Error</div>
+                <div style={{fontSize:11,color:"#ffaaaa",wordBreak:"break-all"}}>{error}</div>
+              </div>
+            )}
+
+            {!post && !generating && !error && (
+              <div style={{height:520,display:"flex",alignItems:"center",justifyContent:"center",
+                background:"rgba(255,255,255,0.015)",borderRadius:10,
+                border:"1px dashed rgba(255,255,255,0.08)",flexDirection:"column",gap:14}}>
+                <div style={{fontSize:56}}>🚀</div>
+                <div style={{color:"#8aabb8",fontSize:14,fontWeight:600}}>Ready to Generate</div>
+                <div style={{color:"#5a7a8a",fontSize:12}}>Select keywords from all 4 sources → Click Generate</div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap",justifyContent:"center",maxWidth:400}}>
+                  {["1000-1200 words","USA × 3","Supplier sources","Internal links","Multi-source KWs"].map((f,i)=>(
+                    <span key={i} style={{fontSize:10,padding:"3px 10px",borderRadius:20,
+                      background:"rgba(0,255,136,0.07)",color:"#00ff88",border:"1px solid rgba(0,255,136,0.2)"}}>✓ {f}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {generating && (
+              <div style={{background:"rgba(0,0,0,0.4)",borderRadius:10,padding:18,
+                border:"1px solid rgba(0,255,136,0.15)",height:520,overflowY:"auto"}}>
+                <div style={{fontSize:10,color:"#00ff88",marginBottom:10,letterSpacing:"2px",fontWeight:700}}>
+                  ● GPT-4o WRITING ({allSelectedKws.length} KEYWORDS · 1000-1200 WORDS · ALL SEO RULES)
+                </div>
+                <pre style={{fontSize:11,color:"#7ab8d8",whiteSpace:"pre-wrap",lineHeight:1.9,margin:0}}>
+                  {streamText}<span className="blink" style={{color:"#00ff88"}}>█</span>
+                </pre>
+              </div>
+            )}
+
+            {post && !generating && (
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+
+                {/* Quality Check Grid */}
+                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+                  {[
+                    {label:"Word Count",   val:post.checks.wc,   ok:post.checks.wcOk,
+                     disp:post.checks.wc,  note:post.checks.wcOk?"✓ Target met":"⚠ Regenerate"},
+                    {label:"USA Signals",  val:post.checks.usa,  ok:post.checks.usa>=3,
+                     disp:`${post.checks.usa}×`, note:post.checks.usa>=3?"✓ Found":"⚠ Check"},
+                    {label:"Read More",    val:post.checks.readMore, ok:post.checks.readMore,
+                     disp:post.checks.readMore?"✓":"✗", note:post.checks.readMore?"Links added":"Missing"},
+                    {label:"Prod Sources", val:post.checks.prod1src&&post.checks.prod2src,
+                     ok:post.checks.prod1src&&post.checks.prod2src,
+                     disp:post.checks.prod1src&&post.checks.prod2src?"✓":"⚠",
+                     note:post.checks.prod1src&&post.checks.prod2src?"Both sources":"Check sources"},
+                  ].map((c,i)=>(
+                    <div key={i} style={{background:"rgba(0,0,0,0.35)",borderRadius:8,padding:"10px 12px",
+                      border:`1px solid ${c.ok?"rgba(0,255,136,0.25)":"rgba(255,184,0,0.25)"}`}}>
+                      <div style={{fontSize:18,fontWeight:800,color:c.ok?"#00ff88":"#ffb800"}}>{c.disp}</div>
+                      <div style={{fontSize:9,color:"#8aabb8",textTransform:"uppercase",letterSpacing:"0.5px",marginTop:2}}>{c.label}</div>
+                      <div style={{fontSize:9,color:c.ok?"#00ff88":"#ffb800",marginTop:2}}>{c.note}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Rules Check */}
+                {post.rulesRaw && (
+                  <div style={{padding:"10px 12px",borderRadius:8,background:"rgba(0,0,0,0.25)",
+                    border:"1px solid rgba(255,255,255,0.08)",fontSize:10,color:"#8aabb8"}}>
+                    <span style={{color:"#ffffff",fontWeight:700,marginRight:8}}>AI Rules Check:</span>
+                    {post.rulesRaw}
+                  </div>
+                )}
+
+                {/* SEO Score */}
+                {score && (
+                  <div style={{background:"rgba(0,0,0,0.25)",borderRadius:9,padding:12,
+                    border:`1px solid ${sc(score)}25`,display:"flex",alignItems:"center",gap:14}}>
+                    <div style={{width:52,height:52,borderRadius:"50%",flexShrink:0,
+                      border:`3px solid ${sc(score)}`,display:"flex",alignItems:"center",
+                      justifyContent:"center",fontSize:17,fontWeight:800,color:sc(score)}}>{score}</div>
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:700,color:"#ffffff",fontSize:13}}>SEO Score</div>
+                      <div style={{fontSize:10,color:"#8aabb8",marginTop:2}}>{post.seoRaw}</div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:10,color:"#7ab8d8"}}>Keywords used</div>
+                      <div style={{fontSize:12,color:"#00ff88",fontWeight:700}}>{allSelectedKws.length} keywords</div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Title + Slug */}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                  {[{label:"Title Tag",val:post.title},{label:"URL Slug",val:`/${post.slug}`}].map((f,i)=>(
+                    <div key={i} style={{background:"rgba(0,0,0,0.25)",borderRadius:7,padding:10,
+                      border:"1px solid rgba(255,255,255,0.09)"}}>
+                      <div style={{fontSize:9,color:"#8aabb8",marginBottom:3,textTransform:"uppercase",letterSpacing:"1px"}}>{f.label}</div>
+                      <div style={{fontSize:11,color:"#e0e8f0",fontWeight:600}}>{f.val}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Meta */}
+                {post.meta && (
+                  <div style={{background:"rgba(0,0,0,0.25)",borderRadius:7,padding:10,border:"1px solid rgba(255,255,255,0.09)"}}>
+                    <div style={{fontSize:9,color:"#8aabb8",marginBottom:3,textTransform:"uppercase",letterSpacing:"1px"}}>Meta Description</div>
+                    <div style={{fontSize:11,color:"#d0e0f0",lineHeight:1.7}}>{post.meta}</div>
+                  </div>
+                )}
+
+                {/* Content Preview */}
+                <div style={{background:"rgba(0,0,0,0.25)",borderRadius:9,padding:12,
+                  border:"1px solid rgba(255,255,255,0.08)",maxHeight:200,overflowY:"auto"}}>
+                  <div style={{fontSize:9,color:"#8aabb8",marginBottom:8,textTransform:"uppercase",letterSpacing:"1px"}}>Content Preview</div>
+                  <pre style={{fontSize:10,color:"#8aabb8",whiteSpace:"pre-wrap",lineHeight:1.9,margin:0}}>{post.content?.slice(0,1000)}...</pre>
+                </div>
+
+                {pubStatus==="published" && pubUrl && (
+                  <div style={{padding:12,borderRadius:8,background:"rgba(0,255,136,0.07)",border:"1px solid rgba(0,255,136,0.3)"}}>
+                    <div style={{color:"#00ff88",fontWeight:700,marginBottom:6,fontSize:14}}>🎉 Live on Ghost!</div>
+                    <a href={pubUrl} target="_blank" style={{color:"#4db8ff",fontSize:12,wordBreak:"break-all"}}>{pubUrl}</a>
+                  </div>
+                )}
+
+                {pubStatus==="error" && (
+                  <div style={{padding:10,borderRadius:8,background:"rgba(255,68,68,0.07)",border:"1px solid rgba(255,68,68,0.3)",fontSize:11,color:"#ff9090"}}>
+                    ⚠️ {pubErr}
+                  </div>
+                )}
+
+                {!post.checks.wcOk && (
+                  <div style={{padding:10,borderRadius:8,background:"rgba(255,184,0,0.07)",border:"1px solid rgba(255,184,0,0.3)",fontSize:11,color:"#ffb800"}}>
+                    ⚠️ Word count is {post.checks.wc} — outside 1000-1200 target. Click Regenerate to try again.
+                  </div>
+                )}
+
+                <div style={{display:"flex",gap:8}}>
+                  <button onClick={publish} disabled={pubStatus==="publishing"||pubStatus==="published"} style={{
+                    flex:1,padding:"13px",borderRadius:8,border:"none",cursor:"pointer",
+                    background:pubStatus==="published"?"rgba(0,255,136,0.12)"
+                             :pubStatus==="publishing"?"rgba(0,255,136,0.08)"
+                             :"linear-gradient(135deg,#00ff88,#00cfff)",
+                    color:pubStatus==="published"?"#00ff88":"#060a10",
+                    fontWeight:800,fontSize:12,fontFamily:"inherit",
+                  }}>
+                    {pubStatus==="publishing"?"🚀 Publishing..."
+                    :pubStatus==="published" ?"✅ Published on Ghost!"
+                    :"🚀 Publish to blog.tikprofitpro.shop"}
+                  </button>
+                  <button onClick={generate} style={{padding:"13px 16px",borderRadius:8,
+                    border:"1px solid rgba(255,255,255,0.1)",background:"transparent",
+                    color:"#d0e0f0",cursor:"pointer",fontSize:11,fontFamily:"inherit",fontWeight:700}}>
+                    🔄 Regenerate
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ══ TAB 1: COMPETITOR KWS ══ */}
+      {tab===1 && (
+        <div>
+          <div style={{marginBottom:12,padding:12,borderRadius:8,background:"rgba(255,184,0,0.07)",border:"1px solid rgba(255,184,0,0.25)",fontSize:12,color:"#ffcc60",lineHeight:1.7}}>
+            🕵️ <strong>Strategy:</strong> These are keywords Fastmoss, Kalodata, Shoplus and Exlasso rank for. Writing posts on these keywords steals their traffic and positions TikProfitPro as the better alternative. Click "Select" to add them to your AI Writer.
+          </div>
+          <div style={{display:"grid",gap:7}}>
+            {COMPETITOR_KEYWORDS.map((k,i)=>{
+              const isSel = selComp.some(s=>s.kw===k.kw);
+              return (
+                <div key={i} style={{background:"rgba(255,255,255,0.025)",
+                  border:`1px solid ${isSel?"rgba(255,184,0,0.35)":"rgba(255,255,255,0.08)"}`,
+                  borderRadius:8,padding:"12px 14px",display:"grid",
+                  gridTemplateColumns:"1fr auto auto auto auto",alignItems:"center",gap:12}}>
+                  <div>
+                    <div style={{fontWeight:600,fontSize:12,color:"#e0e8f0",marginBottom:3}}>{k.kw}</div>
+                    <div style={{display:"flex",gap:6}}>
+                      <span style={{fontSize:9,padding:"2px 7px",borderRadius:20,background:"rgba(255,184,0,0.12)",color:"#ffb800",border:"1px solid rgba(255,184,0,0.2)"}}>vs {k.comp}</span>
+                      <span style={{fontSize:9,padding:"2px 7px",borderRadius:20,background:`${ic(k.intent)}12`,color:ic(k.intent)}}>{k.intent}</span>
+                    </div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:14,fontWeight:700,color:"#4db8ff"}}>{k.vol}</div>
+                    <div style={{fontSize:9,color:"#7ab8d8"}}>searches/mo</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:11,fontWeight:600,color:k.difficulty.includes("Low")?"#00ff88":"#ffb800"}}>{k.difficulty}</div>
+                    <div style={{fontSize:9,color:"#7ab8d8"}}>difficulty</div>
+                  </div>
+                  <div>
+                    {isSel && <span style={{fontSize:10,color:"#ffb800",fontWeight:700}}>✓ Selected</span>}
+                  </div>
+                  <button onClick={()=>{toggleKw(selComp,setSelComp,k); setTab(0);}}
+                    style={{padding:"6px 12px",borderRadius:6,
+                      border:`1px solid ${isSel?"rgba(255,68,68,0.4)":"rgba(255,184,0,0.3)"}`,
+                      background:isSel?"rgba(255,68,68,0.08)":"rgba(255,184,0,0.07)",
+                      color:isSel?"#ff8080":"#ffb800",cursor:"pointer",fontSize:10,fontFamily:"inherit",fontWeight:700}}>
+                    {isSel?"Remove":"Select →"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ══ TAB 2: USER QUERIES ══ */}
+      {tab===2 && (
+        <div>
+          <div style={{marginBottom:12,padding:12,borderRadius:8,background:"rgba(77,184,255,0.07)",border:"1px solid rgba(77,184,255,0.25)",fontSize:12,color:"#7ad0ff",lineHeight:1.7}}>
+            🔍 <strong>Strategy:</strong> These are the exact phrases USA TikTok Shop sellers type into Google when looking for product research tools. Ranking for these queries = direct buyer intent traffic to tikprofitpro.shop. Click "Select" to add to AI Writer.
+          </div>
+          <div style={{display:"grid",gap:7}}>
+            {USER_QUERIES.map((k,i)=>{
+              const isSel = selQuery.some(s=>s.kw===k.kw);
+              return (
+                <div key={i} style={{background:"rgba(255,255,255,0.025)",
+                  border:`1px solid ${isSel?"rgba(77,184,255,0.35)":"rgba(255,255,255,0.08)"}`,
+                  borderRadius:8,padding:"12px 14px",display:"grid",
+                  gridTemplateColumns:"1fr auto auto auto",alignItems:"center",gap:12}}>
+                  <div>
+                    <div style={{fontWeight:600,fontSize:12,color:"#e0e8f0",marginBottom:3}}>{k.kw}</div>
+                    <span style={{fontSize:9,padding:"2px 7px",borderRadius:20,background:`${ic(k.intent)}12`,color:ic(k.intent)}}>{k.intent}</span>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:14,fontWeight:700,color:"#4db8ff"}}>{k.vol}</div>
+                    <div style={{fontSize:9,color:"#7ab8d8"}}>searches/mo</div>
+                  </div>
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:11,fontWeight:600,color:k.difficulty.includes("Low")?"#00ff88":"#ffb800"}}>{k.difficulty}</div>
+                    <div style={{fontSize:9,color:"#7ab8d8"}}>difficulty</div>
+                  </div>
+                  <button onClick={()=>{toggleKw(selQuery,setSelQuery,k); setTab(0);}}
+                    style={{padding:"6px 12px",borderRadius:6,
+                      border:`1px solid ${isSel?"rgba(255,68,68,0.4)":"rgba(77,184,255,0.3)"}`,
+                      background:isSel?"rgba(255,68,68,0.08)":"rgba(77,184,255,0.07)",
+                      color:isSel?"#ff8080":"#4db8ff",cursor:"pointer",fontSize:10,fontFamily:"inherit",fontWeight:700}}>
+                    {isSel?"Remove":"Select →"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ══ TAB 3: SCHEDULER ══ */}
+      {tab===3 && (
+        <div>
+          {/* Add new scheduled post */}
+          <Panel title="➕ Schedule New Post" style={{marginBottom:14}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr auto auto",gap:8,alignItems:"end"}}>
+              <div>
+                <div style={{fontSize:10,color:"#8aabb8",marginBottom:4}}>Post Title</div>
+                <input value={newSchedTitle} onChange={e=>setNewSchedTitle(e.target.value)}
+                  placeholder="Post title..."
+                  style={{width:"100%",padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                    border:"1px solid rgba(255,255,255,0.1)",color:"#e0e8f0",fontSize:11}}/>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"#8aabb8",marginBottom:4}}>Keyword</div>
+                <input value={newSchedKw} onChange={e=>setNewSchedKw(e.target.value)}
+                  placeholder="Target keyword..."
+                  style={{width:"100%",padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                    border:"1px solid rgba(255,255,255,0.1)",color:"#e0e8f0",fontSize:11}}/>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"#8aabb8",marginBottom:4}}>Date</div>
+                <input type="date" value={newSchedDate} onChange={e=>setNewSchedDate(e.target.value)}
+                  style={{width:"100%",padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                    border:"1px solid rgba(255,255,255,0.1)",color:"#e0e8f0",fontSize:11}}/>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"#8aabb8",marginBottom:4}}>Status</div>
+                <select value={newSchedStatus} onChange={e=>setNewSchedStatus(e.target.value)}
+                  style={{padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.7)",
+                    border:"1px solid rgba(255,255,255,0.1)",color:"#e0e8f0",fontSize:11}}>
+                  <option value="draft">Draft</option>
+                  <option value="scheduled">Scheduled</option>
+                  <option value="published">Published</option>
+                </select>
+              </div>
+              <button onClick={()=>{
+                if(newSchedTitle && newSchedDate) {
+                  setScheduled(prev=>[...prev,{
+                    id:Date.now(), title:newSchedTitle,
+                    date:newSchedDate, status:newSchedStatus,
+                    keyword:newSchedKw||"—"
+                  }]);
+                  setNewSchedTitle(""); setNewSchedKw(""); setNewSchedDate(""); setNewSchedStatus("scheduled");
+                }
+              }} style={{padding:"7px 14px",borderRadius:5,border:"none",
+                background:"linear-gradient(135deg,#00ff88,#00cfff)",
+                color:"#060a10",cursor:"pointer",fontWeight:800,fontSize:12,fontFamily:"inherit",whiteSpace:"nowrap"}}>
+                + Add
+              </button>
+            </div>
+          </Panel>
+
+          {/* Stats */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+            {[
+              {label:"Published", value:pubCount,   color:"#00ff88"},
+              {label:"Scheduled", value:schedCount, color:"#4db8ff"},
+              {label:"Drafts",    value:draftCount, color:"#ffb800"},
+            ].map((s,i)=>(
+              <div key={i} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.09)",borderRadius:9,padding:"12px 16px",textAlign:"center"}}>
+                <div style={{fontSize:24,fontWeight:800,color:s.color}}>{s.value}</div>
+                <div style={{fontSize:10,color:"#8aabb8",textTransform:"uppercase",letterSpacing:"1px"}}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Scheduled list */}
+          <div style={{display:"grid",gap:7}}>
+            {scheduled.length===0 && (
+              <div style={{padding:30,textAlign:"center",color:"#5a7a8a",fontSize:12}}>No posts scheduled yet. Add one above or generate and publish a post.</div>
+            )}
+            {scheduled.map((p,i)=>(
+              <div key={p.id} style={{background:"rgba(255,255,255,0.025)",
+                border:`1px solid ${p.status==="published"?"rgba(0,255,136,0.2)":p.status==="scheduled"?"rgba(77,184,255,0.2)":"rgba(255,184,0,0.2)"}`,
+                borderRadius:8,padding:"12px 14px",
+                display:"grid",gridTemplateColumns:"1fr auto auto auto",alignItems:"center",gap:12}}>
+                <div>
+                  <div style={{fontWeight:600,marginBottom:3,fontSize:12,color:"#e0e8f0"}}>{p.title}</div>
+                  <div style={{fontSize:10,color:"#7ab8d8"}}>🔑 {p.keyword}</div>
+                </div>
+                <div style={{fontSize:11,color:"#8aabb8",whiteSpace:"nowrap"}}>{p.date}</div>
+                <Pill status={p.status}/>
+                <div style={{display:"flex",gap:4"}}>
+                  {/* Status toggle */}
+                  <select value={p.status}
+                    onChange={e=>setScheduled(prev=>prev.map(s=>s.id===p.id?{...s,status:e.target.value}:s))}
+                    style={{padding:"4px 7px",borderRadius:4,background:"rgba(0,0,0,0.5)",
+                      border:"1px solid rgba(255,255,255,0.1)",color:"#c0d8e0",fontSize:10,cursor:"pointer"}}>
+                    <option value="draft">Draft</option>
+                    <option value="scheduled">Scheduled</option>
+                    <option value="published">Published</option>
+                  </select>
+                  <button onClick={()=>setScheduled(prev=>prev.filter(s=>s.id!==p.id))}
+                    style={{padding:"4px 8px",borderRadius:4,background:"rgba(255,68,68,0.08)",
+                      border:"1px solid rgba(255,68,68,0.25)",color:"#ff8080",cursor:"pointer",fontSize:12,marginLeft:4}}>×</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ══ TAB 4: PUBLISHER ══ */}
+      {tab===4 && (
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+          <Panel title="🔌 Live Integrations">
+            {[
+              {name:"OpenAI GPT-4o",       note:"via /generate-blog-post",       icon:"🤖", live:true},
+              {name:"Ghost Publisher",      note:"via /publish-blog-post",        icon:"👻", live:true},
+              {name:"Ghost CMS",            note:"blog.tikprofitpro.shop",        icon:"⚡", live:true},
+              {name:"Competitor Research",  note:"10 competitor keywords loaded", icon:"🕵️", live:true},
+              {name:"User Query Targeting", note:"10 buyer intent queries",       icon:"🔍", live:true},
+              {name:"Supplier Sources",     note:"AliExpress links auto-embedded",icon:"🏭", live:true},
+              {name:"Multi-Source KWs",     note:"Target+Comp+Query+GSC",         icon:"🔑", live:true},
+              {name:"Google Search Console",note:"Auto-ping after publish",       icon:"📊", live:false},
+              {name:"Unsplash Images",      note:"Auto featured images",          icon:"🖼️", live:false},
+            ].map((s,i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                padding:"9px 0",borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
+                <div>
+                  <div style={{fontSize:12,fontWeight:600,color:"#d0e0f0"}}>{s.icon} {s.name}</div>
+                  <div style={{fontSize:10,color:"#7ab8d8"}}>{s.note}</div>
+                </div>
+                <span style={{fontSize:10,padding:"2px 9px",borderRadius:20,
+                  background:s.live?"rgba(0,255,136,0.12)":"rgba(255,255,255,0.05)",
+                  color:s.live?"#00ff88":"#5a7a8a",border:`1px solid ${s.live?"rgba(0,255,136,0.25)":"rgba(255,255,255,0.08)"}`}}>
+                  {s.live?"✅ Live":"Soon"}
+                </span>
+              </div>
+            ))}
+          </Panel>
+          <Panel title="⚙️ SEO Rules Config">
+            {[
+              {rule:"Word count",           value:"1000-1200 words (strict)"},
+              {rule:"USA signals",          value:"3× per post"},
+              {rule:"Viral products",       value:"2 per post + sources"},
+              {rule:"Supplier links",       value:"AliExpress embedded"},
+              {rule:"Internal links",       value:"Read More section"},
+              {rule:"Keyword sources",      value:"Target + Comp + Query + GSC"},
+              {rule:"Max keywords/post",    value:"8 (2 from each source)"},
+              {rule:"TikProfitPro CTA",     value:"2× per post"},
+              {rule:"Target posts/week",    value:"2 posts"},
+              {rule:"Best publish days",    value:"Tuesday & Thursday"},
+              {rule:"AI engine",            value:"GPT-4o"},
+            ].map((r,i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",
+                borderBottom:"1px solid rgba(255,255,255,0.05)",fontSize:11}}>
+                <span style={{color:"#8aabb8"}}>{r.rule}</span>
+                <span style={{color:"#00ff88",fontWeight:700}}>{r.value}</span>
+              </div>
+            ))}
+          </Panel>
+        </div>
+      )}
+
+      {/* ══ TAB 5: SETTINGS ══ */}
+      {tab===5 && (
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+          <Panel title="📚 Internal Links Pool">
+            <div style={{fontSize:10,color:"#7ab8d8",marginBottom:10,lineHeight:1.6}}>
+              These posts are automatically linked in every new post's "Read More Guides" section. Posts you publish are auto-added here.
+            </div>
+            <div style={{maxHeight:240,overflowY:"auto",marginBottom:10}}>
+              {publishedPosts.map((p,i)=>(
+                <div key={i} style={{padding:"7px 9px",borderRadius:5,marginBottom:4,
+                  background:"rgba(0,255,136,0.05)",border:"1px solid rgba(0,255,136,0.15)",
+                  display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11,color:"#d0e0f0",marginBottom:1}}>{p.title}</div>
+                    <div style={{fontSize:9,color:"#7ab8d8"}}>{p.url}</div>
+                  </div>
+                  <button onClick={()=>setPublishedPosts(prev=>prev.filter((_,j)=>j!==i))}
+                    style={{background:"none",border:"none",color:"#ff6060",cursor:"pointer",fontSize:16,flexShrink:0}}>×</button>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              <input value={newPostTitle} onChange={e=>setNewPostTitle(e.target.value)}
+                placeholder="Post title..."
+                style={{padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                  border:"1px solid rgba(255,255,255,0.1)",color:"#e0e8f0",fontSize:11}}/>
+              <input value={newPostUrl} onChange={e=>setNewPostUrl(e.target.value)}
+                placeholder="https://blog.tikprofitpro.shop/slug/"
+                style={{padding:"7px 10px",borderRadius:5,background:"rgba(0,0,0,0.4)",
+                  border:"1px solid rgba(255,255,255,0.1)",color:"#e0e8f0",fontSize:11}}/>
+              <button onClick={()=>{
+                if(newPostTitle&&newPostUrl){
+                  setPublishedPosts(prev=>[{title:newPostTitle,url:newPostUrl},...prev]);
+                  setNewPostTitle(""); setNewPostUrl("");
+                }
+              }} style={{padding:"8px",borderRadius:6,border:"none",
+                background:"rgba(0,255,136,0.12)",color:"#00ff88",
+                cursor:"pointer",fontSize:11,fontFamily:"inherit",fontWeight:700,
+                border:"1px solid rgba(0,255,136,0.25)"}}>
+                + Add to Pool
+              </button>
+            </div>
+          </Panel>
+
+          <Panel title="📊 GSC Instructions">
+            <div style={{fontSize:11,color:"#8aabb8",lineHeight:1.9}}>
+              <div style={{marginBottom:8,color:"#4db8ff",fontWeight:700}}>How to get keywords from Google Search Console:</div>
+              {[
+                "1. Go to search.google.com/search-console",
+                "2. Select tikprofitpro.shop property",
+                "3. Click Performance → Search Results",
+                "4. Sort by Impressions descending",
+                "5. Find queries with high impressions, low clicks",
+                "6. Copy those keywords",
+                "7. Go to AI Writer tab",
+                "8. Paste into GSC Keyword 1 and 2 fields",
+                "9. Click Generate",
+              ].map((s,i)=>(
+                <div key={i} style={{padding:"4px 0",borderBottom:"1px solid rgba(255,255,255,0.04)",fontSize:10,color:i===0?"#4db8ff":"#8aabb8"}}>{s}</div>
+              ))}
+              <div style={{marginTop:12,padding:10,borderRadius:6,
+                background:"rgba(0,255,136,0.06)",border:"1px solid rgba(0,255,136,0.2)",fontSize:10,color:"#00ff88",lineHeight:1.7}}>
+                💡 High impressions + low clicks = Google shows your page but users don't click. Writing a better targeted post = instant traffic boost.
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
