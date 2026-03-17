@@ -4,7 +4,7 @@ ProfitScout — FastAPI Backend
 Run with:  uvicorn main:app --reload
 API Docs:  http://127.0.0.1:8000/docs
 """
-
+from fastapi.responses import PlainTextResponse
 import os
 import httpx
 import jwt
@@ -702,27 +702,31 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
 # ENDPOINT 13 — Create Checkout (supports Pro + Ultimate)
 # ==============================================================================
 @app.post("/publish-blog-post")
-
 async def publish_blog_post(request: dict):
-    import httpx, jwt, time, os
+    import httpx, jwt, time, os, json
 
     ghost_url     = os.environ.get("GHOST_URL", "https://blog.tikprofitpro.shop")
     admin_api_key = os.environ.get("GHOST_ADMIN_API_KEY", "")
-    
+
+    if not admin_api_key or ":" not in admin_api_key:
+        return {"errors": [{"message": "GHOST_ADMIN_API_KEY missing or invalid"}]}
+
     title         = request.get("title", "Untitled")
     slug          = request.get("slug", "")
     meta          = request.get("meta", "")
     content       = request.get("content", "")
-    feature_image = request.get("feature_image", None)  # ← NEW
+    feature_image = request.get("feature_image", None)
 
     # Build Ghost JWT
-    admin_api_key = os.environ.get("GHOST_ADMIN_API_KEY", "")
-    if not admin_api_key or ":" not in admin_api_key:
-        return {"errors": [{"message": f"GHOST_ADMIN_API_KEY missing or invalid. Got: '{admin_api_key[:10]}...'"}]}
     key_id, key_secret = admin_api_key.split(":")
     iat = int(time.time())
     payload = {"iat": iat, "exp": iat + 300, "aud": "/admin/"}
-    token = jwt.encode(payload, bytes.fromhex(key_secret), algorithm="HS256", headers={"kid": key_id})
+    token = jwt.encode(
+        payload,
+        bytes.fromhex(key_secret),
+        algorithm="HS256",
+        headers={"kid": key_id}
+    )
 
     # Build mobiledoc
     mobiledoc = json.dumps({
@@ -735,31 +739,39 @@ async def publish_blog_post(request: dict):
 
     post_data = {
         "posts": [{
-            "title":        title,
-            "slug":         slug,
+            "title":          title,
+            "slug":           slug,
             "custom_excerpt": meta,
-            "mobiledoc":    mobiledoc,
-            "status":       "published",
+            "mobiledoc":      mobiledoc,
+            "status":         "published",
         }]
     }
 
-    # Add feature image if provided
     if feature_image:
-        post_data["posts"][0]["feature_image"] = feature_image  # ← NEW
+        post_data["posts"][0]["feature_image"] = feature_image
 
     async with httpx.AsyncClient() as client:
         res = await client.post(
             f"{ghost_url}/ghost/api/admin/posts/",
             headers={
-                "Authorization": f"Ghost {token}",
-                "Content-Type":  "application/json",
+                "Authorization":  f"Ghost {token}",
+                "Content-Type":   "application/json",
                 "Accept-Version": "v5.0",
             },
             json=post_data,
             timeout=30.0,
         )
 
-    return res.json()
+    data = res.json()
+
+    # ── Auto-ping Google & Bing after successful publish ──
+    if data.get("posts"):
+        published_slug = data["posts"][0].get("slug", slug)
+        published_url  = f"https://blog.tikprofitpro.shop/{published_slug}/"
+        await ping_google(published_url)
+        print(f"✅ Published and pinged: {published_url}")
+
+    return data
 
 # ─── Blog Post Generator via OpenAI ──────────────────────────────
 @app.post("/generate-blog-post")
@@ -819,3 +831,42 @@ async def get_image(query: str = "ecommerce"):
         return {"url": None, "error": f"No results from Unsplash. Total: {data.get('total', 0)}"}
     except Exception as e:
         return {"url": None, "error": str(e)}
+    
+    # ─── Google Search Console Auto-Ping ─────────────────────────────
+async def ping_google(url: str):
+    """Ping Google to index a new URL immediately after publishing"""
+    import httpx
+    try:
+        # Method 1: Google Ping (IndexNow)
+        async with httpx.AsyncClient() as client:
+            # Ping Google Search via IndexNow protocol
+            await client.get(
+                f"https://www.google.com/ping?sitemap=https://blog.tikprofitpro.shop/sitemap.xml",
+                timeout=10.0,
+            )
+            # Also ping Bing (IndexNow) — they share signals with Google
+            await client.post(
+                "https://api.indexnow.org/indexnow",
+                json={
+                    "host":    "blog.tikprofitpro.shop",
+                    "key":     os.environ.get("INDEXNOW_KEY", ""),
+                    "urlList": [url],
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=10.0,
+            )
+    except Exception as e:
+        print(f"Ping error (non-fatal): {e}")
+
+
+@app.get("/indexnow")
+async def indexnow_verify():
+    indexnow_key = os.environ.get("INDEXNOW_KEY", "")
+    return PlainTextResponse(indexnow_key)
+
+@app.get("/{full_path:path}")
+async def catch_txt(full_path: str):
+    indexnow_key = os.environ.get("INDEXNOW_KEY", "")
+    if full_path == f"{indexnow_key}.txt":
+        return PlainTextResponse(indexnow_key)
+    return PlainTextResponse("not found", status_code=404)
