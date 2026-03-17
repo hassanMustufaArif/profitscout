@@ -870,3 +870,33 @@ async def catch_txt(full_path: str):
     if full_path == f"{indexnow_key}.txt":
         return PlainTextResponse(indexnow_key)
     return PlainTextResponse("not found", status_code=404)
+
+    @app.post("/ghost-admin")
+async def ghost_admin(request: dict):
+    import httpx, jwt, time, os
+    
+    admin_api_key = os.environ.get("GHOST_ADMIN_API_KEY", "")
+    ghost_url     = os.environ.get("GHOST_URL", "https://blog.tikprofitpro.shop")
+    
+    key_id, key_secret = admin_api_key.split(":")
+    iat     = int(time.time())
+    payload = {"iat": iat, "exp": iat + 300, "aud": "/admin/"}
+    token   = jwt.encode(payload, bytes.fromhex(key_secret), algorithm="HS256", headers={"kid": key_id})
+    
+    method   = request.get("method", "GET")
+    endpoint = request.get("endpoint", "/ghost/api/admin/posts/")
+    body     = request.get("body", {})
+    
+    async with httpx.AsyncClient() as client:
+        res = await client.request(
+            method,
+            f"{ghost_url}{endpoint}",
+            headers={
+                "Authorization":  f"Ghost {token}",
+                "Content-Type":   "application/json",
+                "Accept-Version": "v5.0",
+            },
+            json=body if body else None,
+            timeout=30.0,
+        )
+    return res.json()
