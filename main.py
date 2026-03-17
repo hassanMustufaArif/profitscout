@@ -900,3 +900,33 @@ async def ghost_admin(request: dict):
             timeout=30.0,
         )
     return res.json()
+
+@app.get("/shops")
+async def get_shops(limit: int = 50):
+    from supabase import create_client
+    import os
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    sb  = create_client(url, key)
+    res = sb.table("shops")\
+            .select("*")\
+            .order("created_at", desc=True)\
+            .limit(limit)\
+            .execute()
+    return {"shops": res.data}
+
+@app.get("/creators")
+async def get_creators(
+    creator_type: str = None,
+    limit: int = 50
+):
+    from supabase import create_client
+    import os
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    sb  = create_client(url, key)
+    query = sb.table("creators").select("*").limit(limit)
+    if creator_type:
+        query = query.eq("creator_type", creator_type)
+    res = query.order("followers", desc=True).execute()
+    return {"creators": res.data}
