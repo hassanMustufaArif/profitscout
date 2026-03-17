@@ -864,6 +864,8 @@ async def indexnow_verify():
     indexnow_key = os.environ.get("INDEXNOW_KEY", "")
     return PlainTextResponse(indexnow_key)
 
+
+
 @app.get("/{full_path:path}")
 async def catch_txt(full_path: str):
     indexnow_key = os.environ.get("INDEXNOW_KEY", "")
