@@ -864,36 +864,30 @@ async def indexnow_verify():
     indexnow_key = os.environ.get("INDEXNOW_KEY", "")
     return PlainTextResponse(indexnow_key)
 
+# ─── Get Shops ───────────────────────────────────────────────────
 @app.get("/shops")
 async def get_shops(limit: int = 50):
-    from supabase import create_client
-    import os
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_KEY")
-    sb  = create_client(url, key)
-    res = sb.table("shops")\
-            .select("*")\
-            .order("created_at", desc=True)\
-            .limit(limit)\
-            .execute()
-    return {"shops": res.data}
+    try:
+        res = supabase.table("shops")\
+                .select("*")\
+                .order("created_at", desc=True)\
+                .limit(limit)\
+                .execute()
+        return {"shops": res.data}
+    except Exception as e:
+        return {"shops": [], "error": str(e)}
 
+# ─── Get Creators ─────────────────────────────────────────────────
 @app.get("/creators")
-async def get_creators(
-    creator_type: str = None,
-    limit: int = 50
-):
-    from supabase import create_client
-    import os
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_KEY")
-    sb  = create_client(url, key)
-    query = sb.table("creators").select("*").limit(limit)
-    if creator_type:
-        query = query.eq("creator_type", creator_type)
-    res = query.order("followers", desc=True).execute()
-    return {"creators": res.data}
-
+async def get_creators(creator_type: str = None, limit: int = 50):
+    try:
+        query = supabase.table("creators").select("*").limit(limit)
+        if creator_type:
+            query = query.eq("creator_type", creator_type)
+        res = query.order("followers", desc=True).execute()
+        return {"creators": res.data}
+    except Exception as e:
+        return {"creators": [], "error": str(e)}
 @app.get("/{full_path:path}")
 async def catch_txt(full_path: str):
     indexnow_key = os.environ.get("INDEXNOW_KEY", "")
