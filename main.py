@@ -925,4 +925,22 @@ async def ghost_admin(request: dict):
         )
     return res.json()
 
+# ─── Image Proxy ─────────────────────────────────────────────────
+@app.get("/proxy-image")
+async def proxy_image(url: str):
+    import httpx
+    from fastapi.responses import Response
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(url, headers={
+                "Referer": "https://www.tiktok.com/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }, timeout=10.0, follow_redirects=True)
+        return Response(
+            content=res.content,
+            media_type=res.headers.get("content-type", "image/jpeg"),
+            headers={"Cache-Control": "public, max-age=86400"}
+        )
+    except:
+        return Response(status_code=404)
 
