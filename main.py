@@ -866,14 +866,27 @@ async def indexnow_verify():
 
 # ─── Get Shops ───────────────────────────────────────────────────
 @app.get("/shops")
-async def get_shops(limit: int = 50):
+async def get_shops(
+    limit: int = 50,
+    offset: int = 0,
+    sort_by: str = "gmv_total"
+):
     try:
+        # Valid sort columns
+        allowed_sorts = ["gmv_total", "gmv_growth_pct", "created_at", "follower_count"]
+        order_col = sort_by if sort_by in allowed_sorts else "gmv_total"
+
         res = supabase.table("shops")\
                 .select("*")\
-                .order("created_at", desc=True)\
-                .limit(limit)\
+                .order(order_col, desc=True)\
+                .range(offset, offset + limit - 1)\
                 .execute()
-        return {"shops": res.data}
+        return {
+            "shops": res.data,
+            "total": 4502,
+            "limit": limit,
+            "offset": offset
+        }
     except Exception as e:
         return {"shops": [], "error": str(e)}
 
