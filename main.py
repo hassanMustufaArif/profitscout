@@ -25,6 +25,12 @@ import hashlib
 import json
 
 load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+class GenerateListingRequest(BaseModel):
+    product_name: str
+    price: float
+    category: str = ""
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -864,6 +870,46 @@ async def indexnow_verify():
     indexnow_key = os.environ.get("INDEXNOW_KEY", "")
     return PlainTextResponse(indexnow_key)
 
+@app.post("/generate-listing")
+async def generate_listing(req: GenerateListingRequest):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{
+                        "role": "user",
+                        "content": f"""You are a TikTok Shop product listing expert. Generate a compelling listing for this product.
+
+Product: {req.product_name}
+Price: ${req.price}
+Category hint: {req.category}
+
+Respond ONLY in JSON with no markdown:
+{{
+  "description": "2-3 sentence compelling product description for TikTok Shop",
+  "category": "one of: Beauty & Personal Care, Health & Wellness, Fashion & Apparel, Home & Kitchen, Electronics, Pet Supplies",
+  "sellingPoints": "point1\\npoint2\\npoint3\\npoint4\\npoint5"
+}}"""
+                    }],
+                    "max_tokens": 500,
+                    "temperature": 0.7
+                }
+            )
+        data = response.json()
+        text = data["choices"][0]["message"]["content"]
+        parsed = json.loads(text)
+        return parsed
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 # ─── Get Shops ───────────────────────────────────────────────────
 @app.get("/shops")
 async def get_shops(
