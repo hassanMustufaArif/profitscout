@@ -520,11 +520,7 @@ async def get_suppliers_by_platform(
 
         plan = await get_user_plan(request)
 
-        if plan == "free":
-            raise HTTPException(
-                status_code=403,
-                detail="Supplier search requires a Pro or Ultimate plan. Please upgrade."
-            )
+        
 
         product_result = (
             supabase.table("tiktok_products")
@@ -550,7 +546,7 @@ async def get_suppliers_by_platform(
             product_title=product["product_name"],
             tiktok_price=product["tiktok_price"] or 0,
             platform=platform,
-            user_email="free_user"   # prevents engine from deducting again
+            user_email=user_email   # prevents engine from deducting again
         )
 
         return result
