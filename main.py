@@ -69,16 +69,37 @@ async def get_user_plan(request: Request):
     try:
         user_response = supabase.auth.get_user(token)
         email = user_response.user.email
-        print(f"get_user_plan: email={email}")  # ADD THIS
+        print(f"get_user_plan: email={email}")
         result = supabase.table("users").select("plan").eq("user_email", email).execute()
-        print(f"get_user_plan: result={result.data}")  # ADD THIS
-        if result.data and len(result.data) > 0:
-            return result.data[0].get("plan", "free")
-        return "free"
+        print(f"get_user_plan: result={result.data}")
+        plan = result.data[0].get("plan", "free") if result.data else "free"
+        ensure_user_credits(email, plan)  # Auto-create credits if not exist
+        return plan
     except Exception as e:
-        print(f"get_user_plan ERROR: {e}")  # ADD THIS
+        print(f"get_user_plan ERROR: {e}")
         return "free"
 
+def ensure_user_credits(user_email: str, plan: str):
+    """Auto-create credit record for new users if it doesn't exist."""
+    try:
+        existing = supabase.table("user_credits").select("id").eq("user_email", user_email).execute()
+        if not existing.data:
+            from datetime import datetime, timezone
+            import datetime as dt
+            now = datetime.now(timezone.utc)
+            next_month = (now.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+            credits = 50 if plan == "pro" else 120 if plan == "ultimate" else 5
+            supabase.table("user_credits").insert({
+                "user_email": user_email,
+                "plan": plan,
+                "credits_total": credits,
+                "credits_used": 0,
+                "period_start": now.isoformat(),
+                "period_end": next_month.isoformat()
+            }).execute()
+            print(f"ensure_user_credits: Created {credits} credits for {user_email}")
+    except Exception as e:
+        print(f"ensure_user_credits error: {e}")
 
 # ==============================================================================
 # ENDPOINT 1 — Health Check
