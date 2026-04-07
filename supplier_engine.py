@@ -85,8 +85,8 @@ def check_and_deduct_credit(user_email: str, plan: str, product_id: str, platfor
     Cached results skip this entirely (no credit charged for cache hits).
     """
     # Free users, legacy, anonymous — always allow, no deduction
-    if plan not in ("pro", "ultimate") or not user_email or user_email in ("anonymous", "free_user", "legacy"):
-        return {"allowed": True, "credits_used": 0, "credits_total": 999}
+    if not user_email or user_email in ("anonymous", "free_user", "legacy"):
+          return {"allowed": True, "credits_used": 0, "credits_total": 999}
 
     try:
         result = (
