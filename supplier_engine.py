@@ -136,7 +136,7 @@ def check_and_deduct_credit(user_email: str, plan: str, product_id: str, platfor
 
 def initialize_credits(user_email: str, plan: str):
     """Create or update credits when user subscribes."""
-    credits = 50 if plan == "pro" else 120 if plan == "ultimate" else 0
+    credits = 50 if plan == "pro" else 120 if plan == "ultimate" else 5
     now = datetime.now(timezone.utc)
     import datetime as dt
     next_month = (now.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
