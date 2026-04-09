@@ -724,9 +724,12 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
 # ==============================================================================
 # ENDPOINT 13 — Create Checkout (supports Pro + Ultimate)
 # ==============================================================================
+from fastapi import Request
 @app.post("/publish-blog-post")
-async def publish_blog_post(request: dict):
+async def publish_blog_post(request: Request):
     import httpx, jwt, time, os, json
+
+    body = await request.json()  # ← add this line
 
     ghost_url     = os.environ.get("GHOST_URL", "https://blog.tikprofitpro.shop")
     admin_api_key = os.environ.get("GHOST_ADMIN_API_KEY", "")
@@ -734,11 +737,11 @@ async def publish_blog_post(request: dict):
     if not admin_api_key or ":" not in admin_api_key:
         return {"errors": [{"message": "GHOST_ADMIN_API_KEY missing or invalid"}]}
 
-    title         = request.get("title", "Untitled")
-    slug          = request.get("slug", "")
-    meta          = request.get("meta", "")
-    content       = request.get("content", "")
-    feature_image = request.get("feature_image", None)
+    title         = body.get("title", "Untitled")  # ← change request → body
+    slug          = body.get("slug", "")
+    meta          = body.get("meta", "")
+    content       = body.get("content", "")
+    feature_image = body.get("feature_image", None)
 
     # Build Ghost JWT
     key_id, key_secret = admin_api_key.split(":")
