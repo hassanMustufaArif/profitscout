@@ -729,7 +729,10 @@ from fastapi import Request
 async def publish_blog_post(request: Request):
     import httpx, jwt, time, os, json
 
-    body = await request.json()  # ← add this line
+    try:
+           body = await request.json()
+    except Exception:
+           body = {}
 
     ghost_url     = os.environ.get("GHOST_URL", "https://blog.tikprofitpro.shop")
     admin_api_key = os.environ.get("GHOST_ADMIN_API_KEY", "")
