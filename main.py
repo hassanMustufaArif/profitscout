@@ -16,7 +16,9 @@ from datetime import datetime, timezone, timedelta
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from supplier_engine import find_suppliers, find_suppliers_by_platform, check_credits, initialize_credits, check_and_deduct_credit
-
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from openai import AsyncOpenAI
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from typing import Optional
@@ -1026,3 +1028,72 @@ async def proxy_image(url: str):
     except:
         return Response(status_code=404)
 
+# ── Add CORS (allow localhost HTML file to call your API) ──
+# Find your existing app = FastAPI(...) and add this after it:
+#
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],          # local only, fine for personal tools
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# ── OpenAI client ──
+openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+# ── AI Proxy endpoint ──
+@app.post("/api/ai-proxy")
+async def ai_proxy(request: Request):
+    """
+    Receives a payload from job_hunt.html and forwards to OpenAI.
+    Keeps your API key safe on the server — never exposed to browser.
+    """
+    try:
+        body = await request.json()
+
+        model     = body.get("model", "gpt-4o-mini")
+        messages  = body.get("messages", [])
+        max_tok   = body.get("max_tokens", 2000)
+        tools     = body.get("tools", None)       # optional tool calls
+        temp      = body.get("temperature", 0.7)
+
+        kwargs = dict(
+            model=model,
+            messages=messages,
+            max_tokens=max_tok,
+            temperature=temp,
+        )
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        response = await openai_client.chat.completions.create(**kwargs)
+
+        # Return in a simple unified format the HTML file expects
+        content = response.choices[0].message.content or ""
+        return JSONResponse({
+            "content": content,
+            "model": response.model,
+            "usage": {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+            }
+        })
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ── Serve job_hunt.html at /jobs ──
+@app.get("/jobs", response_class=HTMLResponse)
+async def serve_job_hunt():
+    """
+    Open http://localhost:8000/jobs in your browser.
+    Place job_hunt.html in the same folder as main.py (F:\\profitscout\\)
+    """
+    html_path = os.path.join(os.path.dirname(__file__), "job_hunt.html")
+    if not os.path.exists(html_path):
+        return HTMLResponse("<h2>job_hunt.html not found — place it in F:\\profitscout\\</h2>", status_code=404)
+    with open(html_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
