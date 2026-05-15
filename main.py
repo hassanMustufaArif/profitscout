@@ -10,14 +10,15 @@ import httpx
 import jwt
 import time
 from fastapi import APIRouter
+from fastapi import Request, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi import FastAPI, HTTPException, Query, Security, Request
-from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone, timedelta
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from supplier_engine import find_suppliers, find_suppliers_by_platform, check_credits, initialize_credits, check_and_deduct_credit
-from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
 from openai import AsyncOpenAI
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -25,9 +26,15 @@ from typing import Optional
 import hmac
 import hashlib
 import json
+import pdfplumber
+import tempfile
+
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+ADZUNA_ID  = os.environ.get("ADZUNA_APP_ID", "")
+ADZUNA_KEY = os.environ.get("ADZUNA_APP_KEY", "")
 
 class GenerateListingRequest(BaseModel):
     product_name: str
@@ -41,6 +48,19 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
 
+def scheduled_autopilot():
+    try:
+        from autopilot import run
+        print("⏰ Scheduled autopilot starting...")
+        run()
+    except Exception as e:
+        print(f"❌ Autopilot error: {e}")
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(scheduled_autopilot, 'cron', hour=9, minute=0)
+scheduler.start()
+print("✅ Autopilot scheduler started — runs daily at 9AM UTC")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,6 +68,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 # --- API Key Auth ---
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -972,128 +994,273 @@ async def get_creators(creator_type: str = None, limit: int = 50):
         return {"creators": res.data}
     except Exception as e:
         return {"creators": [], "error": str(e)}
-@app.get("/{full_path:path}")
-async def catch_txt(full_path: str):
-    indexnow_key = os.environ.get("INDEXNOW_KEY", "")
-    if full_path == f"{indexnow_key}.txt":
-        return PlainTextResponse(indexnow_key)
-    return PlainTextResponse("not found", status_code=404)
-
-@app.post("/ghost-admin")
-async def ghost_admin(request: dict):
-    import httpx, jwt, time, os
     
-    admin_api_key = os.environ.get("GHOST_ADMIN_API_KEY", "")
-    ghost_url     = os.environ.get("GHOST_URL", "https://blog.tikprofitpro.shop")
-    
-    key_id, key_secret = admin_api_key.split(":")
-    iat     = int(time.time())
-    payload = {"iat": iat, "exp": iat + 300, "aud": "/admin/"}
-    token   = jwt.encode(payload, bytes.fromhex(key_secret), algorithm="HS256", headers={"kid": key_id})
-    
-    method   = request.get("method", "GET")
-    endpoint = request.get("endpoint", "/ghost/api/admin/posts/")
-    body     = request.get("body", {})
-    
-    async with httpx.AsyncClient() as client:
-        res = await client.request(
-            method,
-            f"{ghost_url}{endpoint}",
-            headers={
-                "Authorization":  f"Ghost {token}",
-                "Content-Type":   "application/json",
-                "Accept-Version": "v5.0",
-            },
-            json=body if body else None,
-            timeout=30.0,
-        )
-    return res.json()
-
-# ─── Image Proxy ─────────────────────────────────────────────────
-@app.get("/proxy-image")
-async def proxy_image(url: str):
-    import httpx
-    from fastapi.responses import Response
+# ================================================================
+# /api/jobs — real jobs from Remotive + Adzuna
+# ================================================================
+@app.get("/api/jobs")
+async def get_jobs(niches: str = "", location: str = "remote", job_type: str = "Any"):
+    niche_list = [n.strip().lower() for n in niches.split(",") if n.strip()]
+    all_jobs = []
+ 
+    # 1. REMOTIVE — free, no key needed
     try:
-        async with httpx.AsyncClient() as client:
-            res = await client.get(url, headers={
-                "Referer": "https://www.tiktok.com/",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }, timeout=10.0, follow_redirects=True)
-        return Response(
-            content=res.content,
-            media_type=res.headers.get("content-type", "image/jpeg"),
-            headers={"Cache-Control": "public, max-age=86400"}
+        async with httpx.AsyncClient(timeout=10) as client:
+            for niche in niche_list[:3]:
+                r = await client.get(
+                    f"https://remotive.com/api/remote-jobs?search={niche.replace(' ','+')}&limit=20"
+                )
+                if r.status_code == 200:
+                    for j in r.json().get("jobs", []):
+                        all_jobs.append({
+                            "id":          str(j.get("id")),
+                            "title":       j.get("title", ""),
+                            "company":     j.get("company_name", ""),
+                            "source":      "Remotive",
+                            "location":    j.get("candidate_required_location", "Remote"),
+                            "type":        j.get("job_type", "full_time").replace("_", "-").title(),
+                            "salary":      j.get("salary") or "Not listed",
+                            "description": (j.get("description", "")[:300] + "...").strip(),
+                            "url":         j.get("url", ""),
+                            "applyEmail":  "",
+                            "postedDate":  j.get("publication_date", "")[:10],
+                            "skills":      j.get("tags", [])[:6],
+                            "badge":       "new",
+                            "real":        True,
+                        })
+    except Exception as e:
+        print(f"[Remotive error] {e}")
+ 
+    # 2. ADZUNA — free key from developer.adzuna.com
+    if ADZUNA_ID and ADZUNA_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                for niche in niche_list[:2]:
+                    r = await client.get(
+                        f"https://api.adzuna.com/v1/api/jobs/us/search/1"
+                        f"?app_id={ADZUNA_ID}&app_key={ADZUNA_KEY}"
+                        f"&results_per_page=10&what={niche.replace(' ','%20')}"
+                        f"&content-type=application/json"
+                    )
+                    if r.status_code == 200:
+                        for j in r.json().get("results", []):
+                            sal = ""
+                            if j.get("salary_min") and j.get("salary_max"):
+                                sal = f"${int(j['salary_min']):,} – ${int(j['salary_max']):,}"
+                            all_jobs.append({
+                                "id":          str(j.get("id")),
+                                "title":       j.get("title", ""),
+                                "company":     j.get("company", {}).get("display_name", ""),
+                                "source":      "Adzuna",
+                                "location":    j.get("location", {}).get("display_name", "Remote"),
+                                "type":        "Full-time",
+                                "salary":      sal or "Not listed",
+                                "description": (j.get("description", "")[:300] + "...").strip(),
+                                "url":         j.get("redirect_url", ""),
+                                "applyEmail":  "",
+                                "postedDate":  j.get("created", "")[:10],
+                                "skills":      [],
+                                "badge":       "new",
+                                "real":        True,
+                            })
+        except Exception as e:
+            print(f"[Adzuna error] {e}")
+ 
+    # Deduplicate
+    seen, unique = set(), []
+    for j in all_jobs:
+        key = f"{j['title'].lower()}|{j['company'].lower()}"
+        if key not in seen:
+            seen.add(key)
+            unique.append(j)
+ 
+    # Score against niches
+    def score(job):
+        text = (job["title"] + " " + job["description"] + " " + " ".join(job.get("skills",[]))).lower()
+        s = 50
+        for n in niche_list:
+            words = n.split()
+            if all(w in text for w in words): s += 30
+            elif any(w in text for w in words): s += 15
+        if job.get("salary") and job["salary"] != "Not listed": s += 5
+        if job.get("postedDate", "") >= "2026-04": s += 8
+        return min(s, 99)
+ 
+    for j in unique:
+        j["match"] = score(j)
+        j["badge"] = "hot" if j["match"] >= 85 else "featured" if j["match"] >= 70 else "new"
+ 
+    unique.sort(key=lambda x: x["match"], reverse=True)
+ 
+    return JSONResponse({
+        "jobs": unique[:15],
+        "total": len(unique),
+        "sources": {
+            "remotive": sum(1 for j in unique[:15] if j["source"] == "Remotive"),
+            "adzuna":   sum(1 for j in unique[:15] if j["source"] == "Adzuna"),
+        }
+    })
+ 
+ 
+# ================================================================
+# /api/parse-cv — upload PDF, GPT extracts structured profile
+# ================================================================
+@app.post("/api/parse-cv")
+async def parse_cv(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return JSONResponse({"error": "Only PDF files supported"}, status_code=400)
+ 
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+ 
+    try:
+        text = ""
+        with pdfplumber.open(tmp_path) as pdf:
+            for page in pdf.pages:
+                text += (page.extract_text() or "") + "\n"
+        os.unlink(tmp_path)
+    except Exception as e:
+        return JSONResponse({"error": f"PDF read error: {str(e)}"}, status_code=500)
+ 
+    if not text.strip():
+        return JSONResponse({"error": "Could not extract text from PDF"}, status_code=400)
+ 
+    prompt = f"""Extract structured info from this CV. Return ONLY valid JSON, no markdown:
+{{
+  "name": "full name",
+  "email": "email or empty string",
+  "role": "current or most recent job title",
+  "linkedin": "linkedin url or empty string",
+  "skills": "comma separated top 10 technical skills",
+  "bio": "2-sentence professional summary",
+  "projects": "comma separated key projects max 5",
+  "experience_years": "number as string",
+  "education": "degree and institution"
+}}
+CV:
+{text[:4000]}"""
+ 
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=600,
+            temperature=0.2,
         )
-    except:
-        return Response(status_code=404)
-
-# ── Add CORS (allow localhost HTML file to call your API) ──
-# Find your existing app = FastAPI(...) and add this after it:
-#
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],          # local only, fine for personal tools
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# ── OpenAI client ──
-openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
-
-# ── AI Proxy endpoint ──
+        raw = resp.choices[0].message.content or ""
+        s, e = raw.find("{"), raw.rfind("}")
+        return JSONResponse({"profile": json.loads(raw[s:e+1]), "cv_text": text[:2000]})
+    except Exception as ex:
+        return JSONResponse({"error": f"Parse error: {str(ex)}"}, status_code=500)
+ 
+ 
+# ================================================================
+# /api/extract-email — fetch job page, GPT extracts apply email
+# ================================================================
+@app.get("/api/extract-email")
+async def extract_email(url: str = ""):
+    """
+    Fetches the job posting page and uses GPT to extract
+    any apply/contact email address from the HTML content.
+    Returns {"email": "found@email.com"} or {"email": ""}
+    """
+    if not url:
+        return JSONResponse({"email": ""})
+ 
+    # Fetch the job page
+    try:
+        async with httpx.AsyncClient(
+            timeout=12,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        ) as client:
+            r = await client.get(url)
+            html = r.text
+    except Exception as e:
+        print(f"[extract-email fetch error] {e}")
+        return JSONResponse({"email": "", "error": str(e)})
+ 
+    # Strip HTML tags — keep only visible text
+    import re
+    text = re.sub(r'<[^>]+>', ' ', html)
+    text = re.sub(r'\s+', ' ', text).strip()
+ 
+    # Quick regex pass first — fast and free
+    email_pattern = re.findall(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', text)
+    # Filter out common non-apply emails
+    exclude = ['sentry', 'noreply', 'no-reply', 'example', 'placeholder', 'wixpress',
+               '.png', '.jpg', 'support@', 'info@lever', 'info@greenhouse']
+    candidates = [e for e in email_pattern if not any(x in e.lower() for x in exclude)]
+ 
+    if candidates:
+        # Return the first clean candidate directly — no GPT needed
+        return JSONResponse({"email": candidates[0], "all": candidates[:5], "method": "regex"})
+ 
+    # No email found via regex — try GPT on page text
+    try:
+        prompt = f"""Look at this job posting page text and find any email address for applying or contacting about the job.
+Return ONLY valid JSON: {{"email": "found@email.com"}} or {{"email": ""}} if none found.
+Do not invent or guess emails. Only return real emails visible in the text.
+ 
+Page text (first 2000 chars):
+{text[:2000]}"""
+ 
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=80,
+            temperature=0,
+        )
+        raw = resp.choices[0].message.content or ""
+        s, e = raw.find("{"), raw.rfind("}")
+        result = json.loads(raw[s:e+1])
+        result["method"] = "gpt"
+        return JSONResponse(result)
+    except Exception as ex:
+        return JSONResponse({"email": "", "error": str(ex)})
+ 
+ 
+# ================================================================
+# /api/ai-proxy — cover email + CV summary generation (unchanged)
+# ================================================================
 @app.post("/api/ai-proxy")
 async def ai_proxy(request: Request):
-    """
-    Receives a payload from job_hunt.html and forwards to OpenAI.
-    Keeps your API key safe on the server — never exposed to browser.
-    """
     try:
         body = await request.json()
-
-        model     = body.get("model", "gpt-4o-mini")
-        messages  = body.get("messages", [])
-        max_tok   = body.get("max_tokens", 2000)
-        tools     = body.get("tools", None)       # optional tool calls
-        temp      = body.get("temperature", 0.7)
-
-        kwargs = dict(
-            model=model,
-            messages=messages,
-            max_tokens=max_tok,
-            temperature=temp,
+        resp = await openai_client.chat.completions.create(
+            model       = body.get("model", "gpt-4o-mini"),
+            messages    = body.get("messages", []),
+            max_tokens  = body.get("max_tokens", 2000),
+            temperature = body.get("temperature", 0.7),
         )
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-
-        response = await openai_client.chat.completions.create(**kwargs)
-
-        # Return in a simple unified format the HTML file expects
-        content = response.choices[0].message.content or ""
-        return JSONResponse({
-            "content": content,
-            "model": response.model,
-            "usage": {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-            }
-        })
-
+        return JSONResponse({"content": resp.choices[0].message.content or ""})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# ── Serve job_hunt.html at /jobs ──
+ 
+ 
+# ================================================================
+# /jobs — serves job_hunt.html
+# ================================================================
 @app.get("/jobs", response_class=HTMLResponse)
-async def serve_job_hunt():
-    """
-    Open http://localhost:8000/jobs in your browser.
-    Place job_hunt.html in the same folder as main.py (F:\\profitscout\\)
-    """
-    html_path = os.path.join(os.path.dirname(__file__), "job_hunt.html")
-    if not os.path.exists(html_path):
-        return HTMLResponse("<h2>job_hunt.html not found — place it in F:\\profitscout\\</h2>", status_code=404)
-    with open(html_path, "r", encoding="utf-8") as f:
+async def job_hunt_ui():
+    path = r"F:\profitscout\job_hunt.html"
+    if not os.path.exists(path):
+        return HTMLResponse(f"<h2>job_hunt.html not found at {path}</h2>", status_code=404)
+    with open(path, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
+ 
+
+ # ─── Daily Blog Autopilot Endpoint ───────────────────────────────
+@app.post("/run-autopilot")
+async def run_autopilot(secret: str = ""):
+    if secret != os.environ.get("AUTOPILOT_SECRET", "tpp2026secret"):
+        return {"error": "unauthorized"}
+    try:
+        from autopilot import run
+        import threading
+        thread = threading.Thread(target=run)
+        thread.start()
+        return {"status": "started", "message": "Autopilot running in background"}
+    except Exception as e:
+        return {"error": str(e)}
