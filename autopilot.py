@@ -110,62 +110,56 @@ def generate_blog_post(keyword, products):
 
 Write a detailed, SEO-optimized blog post for the keyword: "{keyword}"
 
-Include these REAL trending products naturally in the content (use their real names, prices, GMV):
+Include these REAL trending products naturally in the content:
 {products_text}
 
-STRICT REQUIREMENTS:
-1. Word count: exactly 1000-1200 words
-2. Mention "USA", "United States", or "US sellers" at least 3 times
+REQUIREMENTS:
+1. Word count: 1000-1200 words
+2. Mention USA or US sellers at least 3 times
 3. Include H2 and H3 subheadings
-4. Include a bullet-point list of trending products with prices
-5. Add 2 CTAs mentioning TikProfitPro tool at [{int_link[0]}]({int_link[1]})
-6. End with a "Read More" section with 3 internal links to: https://tikprofitpro.shop
-7. Tone: helpful, data-driven, practical for TikTok Shop sellers
-8. NO generic filler — every paragraph must have specific data
-9. Format in clean Markdown
-10. Do NOT wrap in ```markdown``` code fences
+4. Bullet list of trending products with prices
+5. 2 CTAs mentioning TikProfitPro at [{int_link[0]}]({int_link[1]})
+6. End with Read More section linking to https://tikprofitpro.shop
+7. Clean Markdown format
+8. Do NOT wrap in ```markdown``` fences
 
 Write the full blog post now:"""
 
-    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not ANTHROPIC_API_KEY:
-        raise Exception("ANTHROPIC_API_KEY not set in .env")
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+    if not GROQ_API_KEY:
+        raise Exception("GROQ_API_KEY not set in .env")
 
     for attempt in range(3):
         try:
             res = requests.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "x-api-key":         ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type":      "application/json",
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type":  "application/json",
                 },
                 json={
-                    "model":      "claude-haiku-4-5-20251001",
-                    "max_tokens": 2000,
-                    "messages":   [{"role": "user", "content": prompt}],
+                    "model":       "llama-3.3-70b-versatile",
+                    "messages":    [{"role": "user", "content": prompt}],
+                    "max_tokens":  2000,
+                    "temperature": 0.7,
                 },
-                timeout=120
+                timeout=60
             )
-            print(f"  🔍 Claude status: {res.status_code}")
+            print(f"  🔍 Groq status: {res.status_code}")
             if res.status_code == 429:
                 wait = 30 * (attempt + 1)
-                print(f"  ⏳ Rate limited — waiting {wait}s (retry {attempt+1}/3)...")
+                print(f"  ⏳ Rate limited — waiting {wait}s...")
                 time.sleep(wait)
                 continue
             res.raise_for_status()
             data = res.json()
-            if "content" in data:
-                return data["content"][0]["text"]
-            else:
-                print(f"  ⚠️  Unexpected response: {str(data)[:300]}")
-                raise Exception(f"Unexpected Claude response: {str(data)[:200]}")
+            return data["choices"][0]["message"]["content"]
         except Exception as e:
             print(f"  ❌ Attempt {attempt+1} failed: {e}")
             if attempt == 2:
-                raise Exception(f"Blog generation failed after 3 retries: {e}")
+                raise Exception(f"Blog generation failed: {e}")
             time.sleep(20)
-            
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Fetch Unsplash Image
 # ══════════════════════════════════════════════════════════════════════════════
@@ -355,6 +349,16 @@ def run():
         "https://images.unsplash.com/photo-1563013544-824ae1b704d3?w=1200",
         "https://images.unsplash.com/photo-1607082348824-0a96f2a4b9da?w=1200",
         "https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=1200",
+        "https://images.unsplash.com/photo-1611162616475-46b635cb6868?w=1200",
+        "https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?w=1200",
+        "https://images.unsplash.com/photo-1563013544-824ae1b704d3?w=1200",
+        "https://images.unsplash.com/photo-1607082348824-0a96f2a4b9da?w=1200",
+        "https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=1200",
+        "https://images.unsplash.com/photo-1472851294608-062f824d29cc?w=1200",
+        "https://images.unsplash.com/photo-1571781926291-c477ebfd024b?w=1200",
+        "https://images.unsplash.com/photo-1585771724684-38269d6639fd?w=1200",
+        "https://images.unsplash.com/photo-1519389950473-47ba0277781c?w=1200",
+        "https://images.unsplash.com/photo-1533750349088-cd871a92f312?w=1200",
     ]
     if not image_url:
         image_url = random.choice(FALLBACK_IMAGES)
