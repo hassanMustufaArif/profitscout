@@ -63,6 +63,9 @@ INTERNAL_LINKS = [
 ]
 
 
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Fetch Trending Products from Supabase
 # ══════════════════════════════════════════════════════════════════════════════
@@ -241,8 +244,46 @@ def ping_indexnow(post_url):
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN AUTOPILOT FUNCTION
 # ══════════════════════════════════════════════════════════════════════════════
+def already_posted_today():
+    """Check if autopilot already ran today"""
+    import httpx, time
+    
+    def get_token():
+        key_id, key_secret = GHOST_ADMIN_API_KEY.split(":")
+        iat = int(time.time())
+        return jwt.encode(
+            {"iat": iat, "exp": iat + 300, "aud": "/admin/"},
+            bytes.fromhex(key_secret), algorithm="HS256",
+            headers={"kid": key_id}
+        )
+    
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    headers = {"Authorization": f"Ghost {get_token()}"}
+    try:
+        res = httpx.get(
+            f"{GHOST_URL}/ghost/api/admin/posts/?limit=5&fields=published_at",
+            headers=headers, timeout=10
+        )
+        posts = res.json().get("posts", [])
+        for p in posts:
+            if p.get("published_at", "").startswith(today):
+                return True
+    except:
+        pass
+    return False
 
 def run():
+    print("=" * 60)
+    print(f"  TikProfitPro — Daily Blog Autopilot")
+    print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print("=" * 60)
+
+    # ── Guard: don't post twice in one day ──────────────────────
+    if already_posted_today():
+        print("⏭️  Already posted today — skipping to prevent duplicates.")
+        return
+    
+
     print("=" * 60)
     print(f"  TikProfitPro — Daily Blog Autopilot")
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
