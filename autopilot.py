@@ -120,23 +120,34 @@ STRICT REQUIREMENTS:
 4. Include a bullet-point list of trending products with prices
 5. Add 2 CTAs mentioning TikProfitPro tool at [{int_link[0]}]({int_link[1]})
 6. End with a "Read More" section with 3 internal links to: https://tikprofitpro.shop
-7. Include real product links where relevant
-8. Tone: helpful, data-driven, practical for TikTok Shop sellers
-9. NO generic filler — every paragraph must have specific data or actionable advice
-10. Format in clean Markdown
+7. Tone: helpful, data-driven, practical for TikTok Shop sellers
+8. NO generic filler — every paragraph must have specific data
+9. Format in clean Markdown
+10. Do NOT wrap in ```markdown``` code fences
 
 Write the full blog post now:"""
 
-    # ── Use our own FastAPI endpoint instead of calling OpenAI directly ──
-    API_BASE = os.environ.get("API_BASE_URL", "https://api.tikprofitpro.shop")
-    
+    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not ANTHROPIC_API_KEY:
+        raise Exception("ANTHROPIC_API_KEY not set in .env")
+
     for attempt in range(3):
         try:
             res = requests.post(
-                f"{API_BASE}/generate-blog-post",
-                json={"prompt": prompt},
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key":         ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type":      "application/json",
+                },
+                json={
+                    "model":      "claude-haiku-4-5-20251001",
+                    "max_tokens": 2000,
+                    "messages":   [{"role": "user", "content": prompt}],
+                },
                 timeout=120
             )
+            print(f"  🔍 Claude status: {res.status_code}")
             if res.status_code == 429:
                 wait = 30 * (attempt + 1)
                 print(f"  ⏳ Rate limited — waiting {wait}s (retry {attempt+1}/3)...")
@@ -144,21 +155,17 @@ Write the full blog post now:"""
                 continue
             res.raise_for_status()
             data = res.json()
-            print(f"  🔍 API response keys: {list(data.keys())}")  # debug
-            data = res.json()
-            # Handle Claude response format
             if "content" in data:
                 return data["content"][0]["text"]
-            elif "choices" in data:
-                return data["choices"][0]["message"]["content"]
             else:
-                raise Exception(f"Unexpected response: {str(data)[:200]}")
+                print(f"  ⚠️  Unexpected response: {str(data)[:300]}")
+                raise Exception(f"Unexpected Claude response: {str(data)[:200]}")
         except Exception as e:
+            print(f"  ❌ Attempt {attempt+1} failed: {e}")
             if attempt == 2:
                 raise Exception(f"Blog generation failed after 3 retries: {e}")
             time.sleep(20)
-
-
+            
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Fetch Unsplash Image
 # ══════════════════════════════════════════════════════════════════════════════
@@ -313,7 +320,7 @@ def run():
         print(f"   [{p['virality_score']}%] {p['product_name'][:50]}")
 
     # ── Generate blog post ────────────────────────────────────────────────────
-    print(f"\n✍️  Generating blog post with GPT-4o...")
+    print(f"\n✍️  Generating blog post with Claude...")
     content = generate_blog_post(keyword, products)
     word_count = len(content.split())
     print(f"✅ Generated: {word_count} words")
