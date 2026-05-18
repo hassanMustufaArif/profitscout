@@ -144,7 +144,16 @@ Write the full blog post now:"""
                 continue
             res.raise_for_status()
             data = res.json()
-            return data["choices"][0]["message"]["content"]
+            print(f"  🔍 API response keys: {list(data.keys())}")  # debug
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            elif "error" in data:
+                print(f"  ⚠️  API error: {data['error']}")
+                raise Exception(f"API error: {data['error']}")
+            else:
+                print(f"  ⚠️  Unexpected response: {str(data)[:200]}")
+                raise Exception(f"Unexpected response format: {str(data)[:200]}")
+            
         except Exception as e:
             if attempt == 2:
                 raise Exception(f"Blog generation failed after 3 retries: {e}")
