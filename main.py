@@ -843,7 +843,7 @@ async def generate_blog_post(request: dict):
                 "Content-Type":  "application/json",
             },
             json={
-                "model":      "gpt-4o",
+                "model": "gpt-3.5-turbo",
                 "max_tokens": 8000,
                 "messages": [
                     {"role": "system", "content": "You are an expert SEO content writer."},
