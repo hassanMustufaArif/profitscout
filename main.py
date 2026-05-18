@@ -829,30 +829,25 @@ async def publish_blog_post(request: Request):
 # ─── Blog Post Generator via OpenAI ──────────────────────────────
 @app.post("/generate-blog-post")
 async def generate_blog_post(request: dict):
-    import httpx
-    import os
-
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    import httpx, os
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     prompt  = request.get("prompt", "")
 
     async with httpx.AsyncClient() as client:
         res = await client.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.anthropic.com/v1/messages",
             headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type":  "application/json",
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type":      "application/json",
             },
             json={
-                "model": "gpt-3.5-turbo",
-                "max_tokens": 8000,
-                "messages": [
-                    {"role": "system", "content": "You are an expert SEO content writer."},
-                    {"role": "user",   "content": prompt},
-                ],
+                "model":      "claude-haiku-4-5-20251001",
+                "max_tokens": 2000,
+                "messages": [{"role": "user", "content": prompt}],
             },
             timeout=120.0,
         )
-    return res.json()
 
 
 @app.get("/get-image")
