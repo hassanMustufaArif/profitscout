@@ -124,20 +124,28 @@ STRICT REQUIREMENTS:
 
 Write the full blog post now:"""
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2000,
-        "temperature": 0.7,
-    }
-    res = requests.post("https://api.openai.com/v1/chat/completions",
-                        headers=headers, json=body, timeout=60)
-    res.raise_for_status()
-    return res.json()["choices"][0]["message"]["content"]
+    # ── Use our own FastAPI endpoint instead of calling OpenAI directly ──
+    API_BASE = os.environ.get("API_BASE_URL", "https://api.tikprofitpro.shop")
+    
+    for attempt in range(3):
+        try:
+            res = requests.post(
+                f"{API_BASE}/generate-blog-post",
+                json={"prompt": prompt},
+                timeout=120
+            )
+            if res.status_code == 429:
+                wait = 30 * (attempt + 1)
+                print(f"  ⏳ Rate limited — waiting {wait}s (retry {attempt+1}/3)...")
+                time.sleep(wait)
+                continue
+            res.raise_for_status()
+            data = res.json()
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            if attempt == 2:
+                raise Exception(f"Blog generation failed after 3 retries: {e}")
+            time.sleep(20)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
