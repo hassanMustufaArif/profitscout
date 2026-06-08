@@ -32,35 +32,49 @@ INDEXNOW_KEY        = os.getenv("INDEXNOW_KEY", "tikprofitpro2026xK9mN3")
 
 # ── Rotating keyword pool ──────────────────────────────────────────────────────
 KEYWORDS = [
-    "best TikTok Shop products this week USA",
-    "trending TikTok Shop products 2026",
-    "TikTok Shop product research tool USA",
-    "how to find winning products on TikTok Shop",
-    "TikTok Shop dropshipping products USA 2026",
-    "fastmoss alternative free",
-    "kalodata alternative USA",
-    "TikTok Shop best selling products",
-    "viral TikTok products to sell 2026",
-    "TikTok Shop for beginners USA guide",
-    "how to find trending products on TikTok",
-    "TikTok Shop seller tips USA",
-    "best niches TikTok Shop 2026",
-    "TikTok Shop beauty products trending",
-    "TikTok Shop health products USA",
-    "how to research TikTok Shop products",
-    "TikTok Shop vs Amazon which is better 2026",
-    "most profitable TikTok Shop products",
-    "TikTok Shop product research for beginners",
-    "TikTok Shop winning product criteria",
+    "how to find trending products on TikTok Shop USA 2026",
+    "best TikTok Shop products under $20 USA",
+    "TikTok Shop vs Amazon dropshipping which is better 2026",
+    "how to use TikTok Shop for beginners step by step USA",
+    "kalodata alternative free TikTok Shop research tool",
+    "fastmoss alternative USA TikTok sellers 2026",
+    "how to find winning TikTok Shop products without paid tools",
+    "TikTok Shop beauty products trending USA 2026",
+    "best TikTok Shop niches for beginners USA",
+    "TikTok Shop health and wellness products USA 2026",
+    "how to dropship on TikTok Shop USA complete guide",
+    "TikTok Shop product research tool free USA",
+    "best selling TikTok Shop products this week USA",
+    "how to make money on TikTok Shop USA 2026",
+    "TikTok Shop for small business owners USA guide",
+    "trending TikTok Shop kitchen products USA 2026",
+    "TikTok Shop electronics products trending USA",
+    "how to find TikTok Shop suppliers USA guide",
+    "TikTok Shop vs Shopify which is better for beginners",
+    "TikTok Shop winning product criteria checklist USA",
+    "best TikTok Shop tools for sellers USA 2026",
+    "how to analyze TikTok Shop product trends USA",
+    "TikTok Shop fashion products trending USA 2026",
+    "TikTok Shop profit calculator free tool USA",
+    "how to scale TikTok Shop business USA 2026",
 ]
 
 # ── Internal links pool ────────────────────────────────────────────────────────
+# ── Internal links pool (used in blog CTAs) ───────────────────────────────────
 INTERNAL_LINKS = [
     ("TikTok Shop product research tool", "https://tikprofitpro.shop"),
     ("find trending TikTok Shop products", "https://tikprofitpro.shop"),
     ("TikTok Shop profit calculator",      "https://tikprofitpro.shop/profit-calculator"),
     ("TikTok Shop supplier finder",        "https://tikprofitpro.shop"),
 ]
+
+# ── Social media links (added to every blog post footer) ─────────────────────
+SOCIAL_LINKS = {
+    "facebook":  "https://facebook.com/tikprofitpro",   # ← replace with your page URL
+    "linkedin":  "https://linkedin.com/company/tikprofitpro",  # ← replace with your page URL
+    "instagram": "https://instagram.com/tikprofitpro",  # ← replace with your page URL
+    "tiktok":    "https://tiktok.com/@tikprofitpro",    # ← replace with your page URL
+}
 
 
 
@@ -119,9 +133,24 @@ REQUIREMENTS:
 3. Include H2 and H3 subheadings
 4. Bullet list of trending products with prices
 5. 2 CTAs mentioning TikProfitPro at [{int_link[0]}]({int_link[1]})
-6. End with Read More section linking to https://tikprofitpro.shop
+6. End with these exact two sections at the bottom:
+
+## Stay Connected
+Follow TikProfitPro for daily trending products and TikTok Shop tips:
+- 📘 [Facebook]({SOCIAL_LINKS["https://www.facebook.com/Ecomchains"]})
+- 💼 [LinkedIn]({SOCIAL_LINKS["https://www.linkedin.com/in/sodewala"]})
+- 📸 [Instagram]({SOCIAL_LINKS["https://www.instagram.com/arifsodewala/]})
+- 🎵 [TikTok]({SOCIAL_LINKS["https://tiktok.com/@tikprofitpro"]})
+
+## Read More
+- [TikTok Shop Product Research Tool](https://tikprofitpro.shop)
+- [Find Trending TikTok Shop Products](https://tikprofitpro.shop)
+- [TikTok Shop Profit Calculator](https://tikprofitpro.shop/profit-calculator)
+
 7. Clean Markdown format
 8. Do NOT wrap in ```markdown``` fences
+
+Write the full blog post now:"""
 
 Write the full blog post now:"""
 
@@ -344,7 +373,6 @@ def run():
     
     # Fallback images if Unsplash fails
     FALLBACK_IMAGES = [
-        "https://images.unsplash.com/photo-1611162616475-46b635cb6868?w=1200",
         "https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?w=1200",
         "https://images.unsplash.com/photo-1563013544-824ae1b704d3?w=1200",
         "https://images.unsplash.com/photo-1607082348824-0a96f2a4b9da?w=1200",
