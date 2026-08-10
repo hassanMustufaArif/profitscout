@@ -858,8 +858,8 @@ async def generate_blog_post(request: dict):
             return {"content": None, "error": f"Groq error: {data}"}
 
         content = data["choices"][0]["message"]["content"]
-        return {"content": content}
-
+        return data
+        
     except Exception as e:
         return {"content": None, "error": str(e)}
 
