@@ -827,27 +827,41 @@ async def publish_blog_post(request: Request):
     return data
 
 # ─── Blog Post Generator via OpenAI ──────────────────────────────
+# ─── Blog Post Generator via Groq ──────────────────────────────
 @app.post("/generate-blog-post")
 async def generate_blog_post(request: dict):
     import httpx, os
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = os.environ.get("GROQ_API_KEY", "")
     prompt  = request.get("prompt", "")
 
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":         api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type":      "application/json",
-            },
-            json={
-                "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 2000,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=120.0,
-        )
+    if not api_key:
+        return {"content": None, "error": "GROQ_API_KEY not set in Render"}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "model":      "llama-3.3-70b-versatile",
+                    "max_tokens": 2000,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=120.0,
+            )
+        data = res.json()
+
+        if "choices" not in data:
+            return {"content": None, "error": f"Groq error: {data}"}
+
+        content = data["choices"][0]["message"]["content"]
+        return {"content": content}
+
+    except Exception as e:
+        return {"content": None, "error": str(e)}
 
 
 @app.get("/get-image")
