@@ -441,7 +441,7 @@ async def search_products(
             supabase.table("tiktok_products")
             .select("*")
             .eq("is_active", True)
-            .ilike("title", f"%{q}%")
+            .ilike("product_name", f"%{q}%")
             .order("virality_score", desc=True)
             .range(offset, offset + limit - 1)
             .execute()
