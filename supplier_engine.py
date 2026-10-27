@@ -180,7 +180,7 @@ def calculate_profit(
 ) -> dict:
     referral_rate = 0.03 if is_new_seller else 0.06
     referral_fee = sale_price * referral_rate
-    transaction_fee = sale_price * 0.029
+    transaction_fee = 0.0  # US TikTok Shop: no separate payment fee (included in 6% referral)
     affiliate_commission = sale_price * (affiliate_commission_rate / 100)
 
     if fbt_enabled:
@@ -527,17 +527,7 @@ Return ONLY valid JSON — no text outside the array."""
 
     except Exception as e:
         print(f"  Ranking error: {e}")
-        return [
-            {
-                "index": i,
-                "rank_reason": "Auto-selected (ranking unavailable)",
-                "whitelabel_likely": False,
-                "recommendation_tag": f"Option {i+1}",
-                "profitable": False,
-                "product_match": False
-            }
-            for i in range(min(3, len(raw_suppliers)))
-        ]
+        return []  # never show unmatched listings as "suppliers"
 
 
 # ==============================================================================
@@ -744,23 +734,27 @@ def find_suppliers_by_platform(
     product_title: str,
     tiktok_price: float,
     platform: str,
-    user_email: str
+    user_email: str = "",
+    product_image_url: str = "",
+    use_photo: bool = True,
 ) -> dict:
     """
-    Search a single platform for suppliers.
+    Search ONE platform for suppliers. This function never touches credits:
+    main.py charges (and refunds) around it. Returns success=False when nothing
+    usable was found so main.py can refund.
 
-    Credit handling:
-    - If user_email == "free_user": main.py already did check+deduct — skip here
-    - If user_email is a real email (legacy path): do check+deduct internally
-    - Cached results never deduct a credit regardless
+    Photo search (when the product has an image):
+      - AliExpress: official reverse image search if API keys are set
+      - all platforms: GPT vision writes the keyword from the photo
+      - all platforms: candidates are checked photo-vs-photo and mismatches dropped
     """
+    from image_search import (
+        vision_keyword, aliexpress_image_search, verify_by_image, photo_search_available,
+    )
 
-    print(f"\n{'='*55}")
-    print(f"[{platform.upper()}] Finding suppliers for: {product_title[:60]}...")
-    print(f"TikTok Price: ${tiktok_price} | User: {user_email}")
-    print(f"{'='*55}")
+    print(f"\n[{platform.upper()}] {product_title[:60]} | ${tiktok_price} | photo={bool(product_image_url and use_photo)}")
 
-    # Check for cached results — no credit charged for cache hits
+    # Cache: results already found for this product+platform (shared by all users)
     existing = (
         supabase.table("suppliers")
         .select("*")
@@ -768,100 +762,86 @@ def find_suppliers_by_platform(
         .eq("platform", platform)
         .execute()
     )
-
-    if existing.data and len(existing.data) > 0:
-        print(f"  Cached {platform} suppliers found — no credit deducted")
+    if existing.data:
         for supplier in existing.data:
             cogs = supplier.get("unit_cost_min") or supplier.get("unit_cost_max") or 0
             supplier["_profit"] = calculate_profit(sale_price=tiktok_price, cogs=cogs)
-            if not supplier.get("_image_url"):
-                supplier["_image_url"] = supplier.get("image_url", "")
+            supplier["_image_url"] = supplier.get("_image_url") or supplier.get("image_url", "")
         existing.data.sort(key=lambda x: x.get("_profit", {}).get("margin_pct", -999), reverse=True)
-        return {
-            "success":         True,
-            "cached":          True,
-            "platform":        platform,
-            "credit_deducted": False,
-            "suppliers":       existing.data
-        }
+        return {"success": True, "cached": True, "platform": platform, "suppliers": existing.data}
 
-    # ── Credit handling ────────────────────────────────────────────────────────
-    # "free_user" means main.py already called check_and_deduct_credit() — skip
-    # Any real email in legacy path (e.g. called directly) — check+deduct here
-    internal_deduct = user_email not in ("free_user", "anonymous", "legacy", "")
+    photo = bool(product_image_url and use_photo)
+    match_method = "text"
+    results: list = []
 
-    if internal_deduct:
-        # Legacy path: engine handles credits itself
-        credit_info = check_credits(user_email)
-        if credit_info["credits_remaining"] <= 0:
-            return {
-                "success":   False,
-                "message":   f"No credits remaining. You've used {credit_info['credits_used']}/{credit_info['credits_total']} credits this month. Upgrade your plan for more credits.",
-                "platform":  platform,
-                "credits":   credit_info,
-                "suppliers": []
-            }
-        # Deduct before search
-        result = supabase.table("user_credits").select("credits_used").eq("user_email", user_email).execute()
-        if result.data:
-            current = result.data[0]["credits_used"]
-            supabase.table("user_credits").update(
-                {"credits_used": current + 1}
-            ).eq("user_email", user_email).execute()
+    # 1) True reverse image search (AliExpress official API)
+    if photo and platform == "aliexpress" and photo_search_available():
+        results = aliexpress_image_search(product_image_url)
+        if results:
+            match_method = "photo_api"
 
-    # Normalize title
-    normalized_keyword = normalize_product_title(product_title)
-
-    # Search platform
-    if platform == "alibaba":
-        results = search_alibaba(normalized_keyword, max_results=15)
-    elif platform == "aliexpress":
-        results = search_aliexpress(normalized_keyword, max_results=10)
-    elif platform == "amazon":
-        results = search_amazon(normalized_keyword, max_results=10)
-    else:
-        return {"success": False, "message": f"Unknown platform: {platform}", "suppliers": []}
+    # 2) Keyword: from the photo when we have one, else from the title
+    keyword = None
+    if not results:
+        if photo:
+            keyword = vision_keyword(product_image_url, product_title)
+            if keyword:
+                match_method = "photo_keyword"
+        if not keyword:
+            keyword = normalize_product_title(product_title)
+        if platform == "alibaba":
+            results = search_alibaba(keyword, max_results=15)
+        elif platform == "aliexpress":
+            results = search_aliexpress(keyword, max_results=10)
+        elif platform == "amazon":
+            results = search_amazon(keyword, max_results=10)
+        else:
+            return {"success": False, "message": f"Unknown platform: {platform}", "suppliers": []}
 
     if not results:
-        return {
-            "success":         False,
-            "message":         f"No suppliers found on {platform} for '{normalized_keyword}'. 1 credit was used.",
-            "platform":        platform,
-            "keyword":         normalized_keyword,
-            "credit_deducted": True,
-            "suppliers":       []
-        }
+        return {"success": False, "platform": platform, "keyword": keyword,
+                "message": f"No {platform} listings found for this product. Your credit was not used.",
+                "suppliers": []}
 
-    # Rank with GPT-4o
+    # 3) Photo-vs-photo check drops different products
+    verified_scores = {}
+    if photo:
+        cands = []
+        for i, raw in enumerate(results[:8]):
+            d = extract_supplier_data(raw, platform)
+            if d and d.get("image_url"):
+                cands.append({"index": i, "image_url": d["image_url"], "title": d["product_title"]})
+        verified = verify_by_image(product_image_url, cands) if cands else None
+        if verified is not None:
+            if not verified:
+                return {"success": False, "platform": platform, "keyword": keyword,
+                        "message": f"Found {platform} listings, but none were the same product in the photo check. Your credit was not used.",
+                        "suppliers": []}
+            verified_scores = {v["index"]: v["score"] for v in verified}
+            results = [results[v["index"]] for v in verified]
+            match_method = match_method if match_method != "text" else "photo_verified"
+
+    # 4) Rank (price, MOQ, trust) among the remaining matches
     ranked = rank_suppliers(results, tiktok_price, product_title, platform)
-
     if not ranked:
-        return {
-            "success":         False,
-            "message":         f"Found {len(results)} results on {platform} but none matched '{product_title}'. Try a different platform. 1 credit was used.",
-            "platform":        platform,
-            "keyword":         normalized_keyword,
-            "credit_deducted": True,
-            "suppliers":       []
-        }
+        return {"success": False, "platform": platform, "keyword": keyword,
+                "message": f"Found {len(results)} {platform} listings but none matched. Your credit was not used.",
+                "suppliers": []}
 
-    # Save and return
     saved = save_suppliers(product_id, results, ranked, tiktok_price, platform)
+    if not saved:
+        return {"success": False, "platform": platform, "message": "Could not save suppliers. Your credit was not used.", "suppliers": []}
 
-    profitable_count = sum(1 for s in saved if s.get("_profit", {}).get("margin_pct", 0) >= 20)
-    updated_credits  = check_credits(user_email) if internal_deduct else {"credits_remaining": "N/A"}
-
-    print(f"\n✅ {platform} complete — {len(saved)} suppliers, {profitable_count} profitable, keyword: '{normalized_keyword}'")
-
+    for s in saved:
+        s["_match_method"] = match_method
     return {
-        "success":            True,
-        "cached":             False,
-        "platform":           platform,
-        "normalized_keyword": normalized_keyword,
-        "credit_deducted":    True,
-        "credits_remaining":  updated_credits.get("credits_remaining", "N/A"),
-        "profitable_count":   profitable_count,
-        "suppliers":          saved
+        "success": True,
+        "cached": False,
+        "platform": platform,
+        "normalized_keyword": keyword,
+        "match_method": match_method,
+        "profitable_count": sum(1 for s in saved if s.get("_profit", {}).get("margin_pct", 0) >= 20),
+        "suppliers": saved,
     }
 
 

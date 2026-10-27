@@ -16,7 +16,8 @@ from fastapi import FastAPI, HTTPException, Query, Security, Request
 from datetime import datetime, timezone, timedelta
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
-from supplier_engine import find_suppliers, find_suppliers_by_platform, check_credits, initialize_credits, check_and_deduct_credit
+from supplier_engine import find_suppliers, find_suppliers_by_platform, initialize_credits
+import credits as credits_v2
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from openai import AsyncOpenAI
@@ -40,6 +41,7 @@ class GenerateListingRequest(BaseModel):
     product_name: str
     price: float
     category: str = ""
+    image_url: str = ""
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -104,24 +106,9 @@ async def get_user_plan(request: Request):
         return "free"
 
 def ensure_user_credits(user_email: str, plan: str):
-    """Auto-create credit record for new users if it doesn't exist."""
+    """Create/roll over the credit row. Plan comes from users.plan inside the DB function."""
     try:
-        existing = supabase.table("user_credits").select("id").eq("user_email", user_email).execute()
-        if not existing.data:
-            from datetime import datetime, timezone
-            import datetime as dt
-            now = datetime.now(timezone.utc)
-            next_month = (now.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
-            credits = 50 if plan == "pro" else 120 if plan == "ultimate" else 5
-            supabase.table("user_credits").insert({
-                "user_email": user_email,
-                "plan": plan,
-                "credits_total": credits,
-                "credits_used": 0,
-                "period_start": now.isoformat(),
-                "period_end": next_month.isoformat()
-            }).execute()
-            print(f"ensure_user_credits: Created {credits} credits for {user_email}")
+        credits_v2.get_balance(user_email)
     except Exception as e:
         print(f"ensure_user_credits error: {e}")
 
@@ -459,149 +446,120 @@ async def search_products(
 
 
     # ==============================================================================
-# ENDPOINT 8 — Find Suppliers (legacy — Alibaba only, backward compatible)
 # ==============================================================================
-@app.get("/products/{product_id}/suppliers")
-async def get_suppliers(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
-    try:
-        plan = await get_user_plan(request)
-
-        auth_header = request.headers.get("Authorization")
-        user_email = "anonymous"
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header.replace("Bearer ", "")
-            try:
-                user_response = supabase.auth.get_user(token)
-                user_email = user_response.user.email
-            except Exception:
-                pass
-
-        product_result = (
-            supabase.table("tiktok_products")
-            .select("id, title, tiktok_price")
-            .eq("id", product_id)
-            .single()
-            .execute()
-        )
-        if not product_result.data:
-            raise HTTPException(status_code=404, detail="Product not found")
-        product = product_result.data
-
-        # Check + deduct BEFORE search (atomic, no double-billing)
-        credit = check_and_deduct_credit(user_email, plan, product_id, "alibaba")
-        if not credit["allowed"]:
-            raise HTTPException(
-                status_code=402,
-                detail=f"No credits remaining. You've used {credit['credits_used']}/{credit['credits_total']} credits. Please upgrade your plan."
-            )
-
-        result = find_suppliers_by_platform(
-            product_id=product["id"],
-            product_title=product["title"],
-            tiktok_price=product["tiktok_price"] or 0,
-            platform="alibaba",
-            user_email="free_user"   # prevents engine from deducting again
-        )
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ==============================================================================
-# ENDPOINT 9 — Find Suppliers by Platform (credit-based)
-# GET /products/{product_id}/suppliers/{platform}
+# ENDPOINT 8/9 — Find Suppliers (credits v2 + photo search)
+# GET /products/{product_id}/suppliers/{platform}?photo=true
 # platform = alibaba | aliexpress | amazon
+#
+# Credit rules (see credits.py):
+#   - cached results and products you already unlocked are FREE
+#   - otherwise 1 credit is reserved before the search and REFUNDED if nothing usable is found
+#   - the engine never charges; this endpoint is the only place credits move
 # ==============================================================================
-@app.get("/products/{product_id}/suppliers/{platform}")
-async def get_suppliers_by_platform(
-    product_id: str,
-    platform:   str,
-    request:    Request,
-    api_key:    str = Security(verify_api_key),
-):
-    """Search a specific platform. Costs 1 credit."""
-
-    if platform not in ["alibaba", "aliexpress", "amazon"]:
+def _supplier_search(product_id: str, platform: str, request: Request, photo: bool):
+    if platform not in ("alibaba", "aliexpress", "amazon"):
         raise HTTPException(status_code=400, detail="Platform must be: alibaba, aliexpress, or amazon")
 
-    try:
-        auth_header = request.headers.get("Authorization")
-        user_email = None
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header.replace("Bearer ", "")
-            try:
-                user_response = supabase.auth.get_user(token)
-                user_email = user_response.user.email
-            except Exception:
-                pass
+    user_email = credits_v2.email_from_request(request)
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Sign in to search suppliers")
 
-        if not user_email:
-            raise HTTPException(status_code=401, detail="Authentication required for supplier search")
+    product_result = (
+        supabase.table("tiktok_products")
+        .select("id, product_name, tiktok_price, thumbnail_url, image_storage_url")
+        .eq("id", product_id)
+        .single()
+        .execute()
+    )
+    if not product_result.data:
+        raise HTTPException(status_code=404, detail="Product not found")
+    product = product_result.data
+    image_url = product.get("image_storage_url") or product.get("thumbnail_url") or ""
 
-        plan = await get_user_plan(request)
+    # Free paths first: shared cache, or this user already unlocked it
+    has_cache = bool(
+        supabase.table("suppliers").select("id").eq("tiktok_product_id", product_id)
+        .eq("platform", platform).limit(1).execute().data
+    )
+    already = credits_v2.is_unlocked(user_email, product_id, platform)
 
-        
-
-        product_result = (
-            supabase.table("tiktok_products")
-            .select("id, product_name, tiktok_price")
-            .eq("id", product_id)
-            .single()
-            .execute()
-        )
-        if not product_result.data:
-            raise HTTPException(status_code=404, detail="Product not found")
-        product = product_result.data
-
-        # Check + deduct BEFORE search (atomic, no double-billing)
-        credit = check_and_deduct_credit(user_email, plan, product_id, platform)
-        if not credit["allowed"]:
+    charged = False
+    if not has_cache and not already:
+        try:
+            credit = credits_v2.consume(user_email, product_id, platform, "image" if photo else "text")
+        except credits_v2.CreditError as e:
+            print(f"credit system error: {e}")
+            raise HTTPException(status_code=503, detail="Credits are temporarily unavailable. Please try again in a minute.")
+        if not credit.get("allowed"):
             raise HTTPException(
                 status_code=402,
-                detail=f"No credits remaining. You've used {credit['credits_used']}/{credit['credits_total']} credits. Please upgrade your plan."
+                detail={
+                    "code": "no_credits",
+                    "message": f"You've used all {credit.get('credits_total', 0)} credits for this period.",
+                    "credits": credit,
+                },
             )
+        charged = bool(credit.get("charged"))
 
+    try:
         result = find_suppliers_by_platform(
             product_id=product["id"],
             product_title=product["product_name"],
             tiktok_price=product["tiktok_price"] or 0,
             platform=platform,
-            user_email=user_email   # prevents engine from deducting again
+            user_email=user_email,
+            product_image_url=image_url,
+            use_photo=photo,
         )
-
-        return result
-
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        if charged:
+            credits_v2.refund(user_email, product_id, platform)
+        raise HTTPException(status_code=500, detail=f"Supplier search failed. Your credit was not used. ({e})")
+
+    if charged and not result.get("success"):
+        credits_v2.refund(user_email, product_id, platform)
+        charged = False
+
+    try:
+        result["credits"] = credits_v2.get_balance(user_email)
+    except credits_v2.CreditError:
+        pass
+    result["credit_charged"] = charged
+    return result
+
+
+@app.get("/products/{product_id}/suppliers/{platform}")
+async def get_suppliers_by_platform(
+    product_id: str,
+    platform:   str,
+    request:    Request,
+    photo:      bool = Query(default=True, description="Use the product photo to match suppliers"),
+    api_key:    str = Security(verify_api_key),
+):
+    return _supplier_search(product_id, platform, request, photo)
+
+
+@app.get("/products/{product_id}/suppliers")
+async def get_suppliers(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
+    """Legacy route. Used to give unlimited free Alibaba searches; now same rules as above."""
+    return _supplier_search(product_id, "alibaba", request, True)
 
 
 # ==============================================================================
-# ENDPOINT 10 — Get User Credits
+# ENDPOINT 10 — Get User Credits (single source of truth for the UI)
 # ==============================================================================
 @app.get("/credits")
 async def get_credits(request: Request, api_key: str = Security(verify_api_key)):
-    """Get user's current credit balance."""
-    auth_header = request.headers.get("Authorization")
-    user_email = None
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.replace("Bearer ", "")
-        try:
-            user_response = supabase.auth.get_user(token)
-            user_email = user_response.user.email
-        except Exception:
-            pass
-
+    user_email = credits_v2.email_from_request(request)
     if not user_email:
         raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        return {"success": True, "credits": credits_v2.get_balance(user_email)}
+    except credits_v2.CreditError as e:
+        print(f"credit system error: {e}")
+        raise HTTPException(status_code=503, detail="Credits are temporarily unavailable")
 
-    credits = check_credits(user_email)
-    return {"success": True, "credits": credits}
+
 # ==============================================================================
 # ENDPOINT 11 — LemonSqueezy Webhook
 # ==============================================================================
@@ -927,45 +885,63 @@ async def indexnow_verify():
     return PlainTextResponse(indexnow_key)
 
 @app.post("/generate-listing")
-async def generate_listing(req: GenerateListingRequest):
+async def generate_listing(req: GenerateListingRequest, request: Request):
+    """
+    Draft a TikTok Shop listing. Rewritten to stop generic "AI slop":
+    - looks at the product photo, so it describes the real item
+    - banned-word list (no "elevate", "game-changer", "must-have", emojis...)
+    - concrete specs only; unknown facts become [fill in] placeholders instead of invented claims
+    - respects TikTok Shop rules: no medical claims, no "best/#1", no competitor brands
+    Requires a signed-in user (it spends OpenAI money).
+    """
+    if not credits_v2.email_from_request(request):
+        raise HTTPException(status_code=401, detail="Sign in to generate listings")
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+    image_part = []
+    if req.image_url:
+        from image_search import fetch_image_bytes, _data_url
+        img = fetch_image_bytes(req.image_url)
+        if img:
+            image_part = [{"type": "image_url", "image_url": {"url": _data_url(img), "detail": "low"}}]
+
+    system = """You write TikTok Shop product listings for a US seller who will sell their OWN white-label version of this product.
+
+Write like a careful human merchandiser, not a marketer:
+- Plain, specific, short sentences. Say what it is, what it's made of, size, what's in the box, who it's for.
+- Only state facts you can see in the photo or read in the input. If a spec is unknown, write [fill in: size], [fill in: material] etc. Never invent numbers, certifications, ingredients or results.
+- BANNED words/phrases: elevate, game-changer, must-have, revolutionary, transform, unleash, ultimate, perfect, effortless, seamless, luxurious, premium quality, take it to the next level, say goodbye, look no further, whether you're, in today's world, viral, best, #1, guaranteed. No emojis. No exclamation marks.
+- TikTok Shop policy: no medical or cure claims, no before/after promises, no other brands' names.
+- Title: max 120 characters, format "<Product type> - <key spec/material> - <key use>", no brand, no ALL CAPS.
+
+Respond ONLY with JSON:
+{"title": "...",
+ "description": "3-4 short factual sentences",
+ "sellingPoints": "5 lines separated by \\n, each starting with the feature, then the concrete benefit",
+ "category": "one of: Beauty & Personal Care, Health, Fashion Accessories, Womenswear & Underwear, Home Supplies, Kitchenware, Phones & Electronics, Pet Supplies, Sports & Outdoor, Tools & Hardware, Toys & Hobbies",
+ "missing_info": ["specs the seller must fill in before publishing"]}"""
+
+    user_text = f"""Reference product title (from a competitor, may contain their brand; do NOT copy it): {req.product_name}
+Selling price: ${req.price}
+Category hint: {req.category}"""
+
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [{
-                        "role": "user",
-                        "content": f"""You are a TikTok Shop product listing expert. Generate a compelling listing for this product.
-
-Product: {req.product_name}
-Price: ${req.price}
-Category hint: {req.category}
-
-Respond ONLY in JSON with no markdown:
-{{
-  "description": "2-3 sentence compelling product description for TikTok Shop",
-  "category": "one of: Beauty & Personal Care, Health & Wellness, Fashion & Apparel, Home & Kitchen, Electronics, Pet Supplies",
-  "sellingPoints": "point1\\npoint2\\npoint3\\npoint4\\npoint5"
-}}"""
-                    }],
-                    "max_tokens": 500,
-                    "temperature": 0.7
-                }
-            )
-        data = response.json()
-        text = data["choices"][0]["message"]["content"]
-        parsed = json.loads(text)
-        return parsed
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            max_tokens=700,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": [{"type": "text", "text": user_text}] + image_part},
+            ],
+        )
+        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+
 # ─── Get Shops ───────────────────────────────────────────────────
 @app.get("/shops")
 async def get_shops(
@@ -1234,7 +1210,8 @@ Page text (first 2000 chars):
 # /api/ai-proxy — cover email + CV summary generation (unchanged)
 # ================================================================
 @app.post("/api/ai-proxy")
-async def ai_proxy(request: Request):
+async def ai_proxy(request: Request, api_key: str = Security(verify_api_key)):
+    # Was open to the whole internet: anyone could spend the OpenAI balance.
     try:
         body = await request.json()
         resp = await openai_client.chat.completions.create(
@@ -1263,7 +1240,7 @@ async def job_hunt_ui():
  # ─── Daily Blog Autopilot Endpoint ───────────────────────────────
 @app.post("/run-autopilot")
 async def run_autopilot(secret: str = ""):
-    if secret != os.environ.get("AUTOPILOT_SECRET", "tpp2026secret"):
+    if secret != os.environ.get("AUTOPILOT_SECRET") or object():
         return {"error": "unauthorized"}
     try:
         from autopilot import run
