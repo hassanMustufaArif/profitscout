@@ -501,6 +501,26 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
             )
         charged = bool(credit.get("charged"))
 
+    # Alibaba / AliExpress: real photo search runs in the sourcing worker (Playwright + Oxylabs).
+    if platform in ("alibaba", "aliexpress") and photo and not has_cache and os.getenv("PHOTO_WORKER_ENABLED", "true") == "true":
+        live = (
+            supabase.table("sourcing_jobs").select("id")
+            .eq("product_id", str(product_id)).eq("platform", platform)
+            .in_("status", ["queued", "running"]).limit(1).execute().data
+        )
+        if live:
+            job_id = live[0]["id"]
+            if charged:  # another user's job already covers this product: don't bill twice
+                credits_v2.refund(user_email, product_id, platform)
+                charged = False
+        else:
+            job_id = supabase.table("sourcing_jobs").insert({
+                "product_id": str(product_id), "platform": platform, "user_email": user_email,
+                "charged": charged, "status": "queued",
+            }).execute().data[0]["id"]
+        return {"success": True, "status": "queued", "job_id": job_id, "platform": platform,
+                "credit_charged": charged, "message": "Searching by photo. Usually 30 to 90 seconds."}
+
     try:
         result = find_suppliers_by_platform(
             product_id=product["id"],
@@ -543,6 +563,28 @@ async def get_suppliers_by_platform(
 async def get_suppliers(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
     """Legacy route. Used to give unlimited free Alibaba searches; now same rules as above."""
     return _supplier_search(product_id, "alibaba", request, True)
+
+
+@app.get("/sourcing/jobs/{job_id}")
+async def get_sourcing_job(job_id: int, request: Request, api_key: str = Security(verify_api_key)):
+    """Frontend polls this every 3s after a photo search was queued."""
+    job = supabase.table("sourcing_jobs").select("*").eq("id", job_id).single().execute().data
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    out = {"job_id": job_id, "status": job["status"], "error": job.get("error")}
+    if job["status"] == "done":
+        product = supabase.table("tiktok_products").select("id, tiktok_price").eq("id", job["product_id"]).single().execute().data
+        res = find_suppliers_by_platform(product_id=product["id"], product_title="", tiktok_price=product["tiktok_price"] or 0,
+                                         platform=job["platform"], use_photo=False)  # served from cache
+        out["suppliers"] = res.get("suppliers", [])
+    if job["status"] in ("done", "no_match", "failed"):
+        email = credits_v2.email_from_request(request)
+        if email:
+            try:
+                out["credits"] = credits_v2.get_balance(email)
+            except credits_v2.CreditError:
+                pass
+    return out
 
 
 # ==============================================================================
