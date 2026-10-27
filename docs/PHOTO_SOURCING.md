@@ -32,4 +32,4 @@ Frontend polls /sourcing/jobs/{id} every 3s ◀── worker (Railway service) �
 | SOURCING_MIN_SIMILARITY | 0.80 | raise to 0.85 if wrong products slip through |
 | SOURCING_CONCURRENCY | 3 | parallel browser sessions |
 | SOURCING_MAX_ATTEMPTS | 3 | fresh IP per attempt |
-| PHOTO_WORKER_ENABLED (API) | true | set false to fall back to the old text search |
+| PHOTO_WORKER_ENABLED (API) | false | set true on the API service once the worker service is running |

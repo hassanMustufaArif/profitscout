@@ -502,7 +502,7 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
         charged = bool(credit.get("charged"))
 
     # Alibaba / AliExpress: real photo search runs in the sourcing worker (Playwright + Oxylabs).
-    if platform in ("alibaba", "aliexpress") and photo and not has_cache and os.getenv("PHOTO_WORKER_ENABLED", "true") == "true":
+    if platform in ("alibaba", "aliexpress") and photo and not has_cache and os.getenv("PHOTO_WORKER_ENABLED", "false") == "true":
         live = (
             supabase.table("sourcing_jobs").select("id")
             .eq("product_id", str(product_id)).eq("platform", platform)
