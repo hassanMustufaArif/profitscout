@@ -1,0 +1,9 @@
+# Railway: New Service → this repo → Settings → Dockerfile path: Dockerfile.worker
+FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+WORKDIR /app
+COPY requirements-worker.txt .
+RUN pip install --no-cache-dir -r requirements-worker.txt
+# Pre-download the CLIP weights at build time so the first job isn't slow
+RUN python -c "import open_clip; open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')"
+COPY sourcing ./sourcing
+CMD ["python", "-m", "sourcing.worker"]
