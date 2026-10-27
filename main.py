@@ -452,7 +452,7 @@ async def search_products(
 # platform = alibaba | aliexpress | amazon
 #
 # Credit rules (see credits.py):
-#   - cached results and products you already unlocked are FREE
+#   - products you already unlocked are FREE (cached results still cost 1 credit the first time)
 #   - otherwise 1 credit is reserved before the search and REFUNDED if nothing usable is found
 #   - the engine never charges; this endpoint is the only place credits move
 # ==============================================================================
@@ -506,8 +506,10 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
             pass
         return out
 
+    # Every first look at a product's suppliers costs 1 credit per user, even when the
+    # suppliers were pre-sourced (cached). Reopening a product you already unlocked is free.
     charged = False
-    if not has_cache and not already:
+    if not already:
         try:
             credit = credits_v2.consume(user_email, product_id, platform, "image" if photo else "text")
         except credits_v2.CreditError as e:
