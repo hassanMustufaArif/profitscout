@@ -76,11 +76,13 @@ def similarities(reference: bytes, candidates: list[bytes | None]) -> list[float
     return [round(max(h, c), 3) for h, c in zip(hash_scores, clip_scores)]
 
 
-def rank(offers: list[dict], scores: list[float], tiktok_price: float, min_sim: float, keep: int) -> list[dict]:
+def rank(offers: list[dict], scores: list[float], tiktok_price: float, min_sim: float, keep: int,
+         max_sim: float | None = None) -> list[dict]:
+    """Candidates with min_sim <= similarity (< max_sim when given), usable price, best first, deduped."""
     rows = []
     for o, s in zip(offers, scores):
         o = dict(o, similarity=s)
-        if s < min_sim or o.get("welcome_deal"):
+        if s < min_sim or (max_sim is not None and s >= max_sim) or o.get("welcome_deal"):
             continue
         if tiktok_price and o["price_min"] >= tiktok_price * 0.7:   # no realistic margin left
             continue

@@ -18,6 +18,9 @@ MAX_ATTEMPTS = int(os.getenv("SOURCING_MAX_ATTEMPTS", "3"))
 PAGE_TIMEOUT_MS = int(os.getenv("SOURCING_PAGE_TIMEOUT_MS", "45000"))
 MIN_SIMILARITY = float(os.getenv("SOURCING_MIN_SIMILARITY", "0.80"))   # 0-1
 KEEP_TOP = int(os.getenv("SOURCING_KEEP_TOP", "5"))
+# Near-misses at or above this go to the admin review queue (same product, different bottle/label/angle).
+REVIEW_MIN_SIMILARITY = float(os.getenv("SOURCING_REVIEW_MIN_SIMILARITY", "0.60"))
+REVIEW_KEEP = int(os.getenv("SOURCING_REVIEW_KEEP", "8"))
 POLL_SECONDS = int(os.getenv("SOURCING_POLL_SECONDS", "3"))
 CONCURRENCY = int(os.getenv("SOURCING_CONCURRENCY", "3"))
 DEBUG_DIR = os.getenv("SOURCING_DEBUG_DIR", "/tmp/sourcing_debug")   # screenshots + HTML on failure

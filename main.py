@@ -489,11 +489,17 @@ def verified_suppliers(product: dict, platform: str, keep: int = 5) -> list[dict
     rows = (
         supabase.table("suppliers").select("*")
         .eq("tiktok_product_id", product["id"]).eq("platform", platform)
-        .gte("similarity", MIN_SIMILARITY)
+        .or_(f"similarity.gte.{MIN_SIMILARITY},match_method.eq.manual")   # auto-verified or hand-approved
+        .not_.is_("hidden", "true")
         .execute().data or []
     )
+
+    def score(r):  # a hand-approved row ranks as a verified match
+        sim = float(r.get("similarity") or 0)
+        return max(sim, MIN_SIMILARITY) if r.get("match_method") == "manual" else sim
+
     seen, out = set(), []
-    for r in sorted(rows, key=lambda r: (-round(float(r.get("similarity") or 0), 2), float(r.get("unit_cost_min") or 1e9))):
+    for r in sorted(rows, key=lambda r: (-round(score(r), 2), float(r.get("unit_cost_min") or 1e9))):
         k = _dedupe_key(r)
         if k in seen:
             continue
@@ -1423,3 +1429,211 @@ async def run_autopilot(request: Request):
         return {"status": "started", "message": "Autopilot running in background"}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ==============================================================================
+# ADMIN — supplier review queue
+# Admins are the signed-in emails listed in ADMIN_EMAILS (comma separated).
+#   Pending   = near-miss photo matches (default 0.60-0.79): same product, different bottle/label/angle
+#   Live      = what users see (auto-verified >= 0.80, or hand-approved)
+#   Rejected  = never queued again for that product
+# ==============================================================================
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+
+
+def require_admin_user(request: Request) -> str:
+    email = (credits_v2.email_from_request(request) or "").lower()
+    if not email:
+        raise HTTPException(status_code=401, detail="Sign in required")
+    if email not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Admins only")
+    return email
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@app.get("/admin/me")
+async def admin_me(request: Request, api_key: str = Security(verify_api_key)):
+    email = (credits_v2.email_from_request(request) or "").lower()
+    return {"admin": bool(email and email in ADMIN_EMAILS)}
+
+
+@app.get("/admin/review/queue")
+async def admin_review_queue(
+    request: Request,
+    view: str = Query(default="pending", pattern="^(pending|no_match|live)$"),
+    platform: Optional[str] = Query(default=None, pattern="^(alibaba|aliexpress)$"),
+    limit: int = Query(default=50, ge=1, le=200),
+    api_key: str = Security(verify_api_key),
+):
+    """Products to look at. pending: has near-misses waiting. no_match: last sourcing found nothing
+    verified. live: has suppliers users can see (to spot wrong auto-matches)."""
+    require_admin_user(request)
+    counts: dict = {}
+
+    def bump(pid, plat, key):
+        c = counts.setdefault((str(pid), plat), {"pending": 0, "live": 0, "status": None})
+        c[key] = c.get(key, 0) + 1
+
+    if view in ("pending", "no_match"):
+        q = supabase.table("supplier_candidates").select("tiktok_product_id, platform").eq("status", "pending")
+        if platform:
+            q = q.eq("platform", platform)
+        for r in q.limit(5000).execute().data or []:
+            bump(r["tiktok_product_id"], r["platform"], "pending")
+    if view in ("no_match", "live"):
+        q = supabase.table("sourcing_jobs").select("product_id, platform, status, error, id").in_("status", ["done", "no_match"])
+        if platform:
+            q = q.eq("platform", platform)
+        last = {}
+        for r in q.order("id", desc=True).limit(20000).execute().data or []:
+            last.setdefault((str(r["product_id"]), r["platform"]), r)
+        for key, r in last.items():
+            if (view == "no_match" and r["status"] == "no_match") or (view == "live" and r["status"] == "done"):
+                c = counts.setdefault(key, {"pending": 0, "live": 0, "status": None})
+                c["status"], c["note"] = r["status"], (r.get("error") or "")[:200]
+        if view == "no_match":
+            counts = {k: v for k, v in counts.items() if v["status"] == "no_match"}
+    if view == "live":
+        counts = {k: v for k, v in counts.items() if v["status"] == "done"}
+
+    ids = list({pid for pid, _ in counts})[:1000]
+    products = {}
+    for i in range(0, len(ids), 200):
+        for p in supabase.table("tiktok_products").select(
+            "id, product_name, tiktok_price, thumbnail_url, image_storage_url, virality_score"
+        ).in_("id", ids[i:i + 200]).execute().data or []:
+            products[str(p["id"])] = p
+    items = [
+        {**products[pid], "platform": plat, **c}
+        for (pid, plat), c in counts.items() if pid in products
+    ]
+    items.sort(key=lambda x: (-(x.get("pending") or 0), -(x.get("virality_score") or 0)))
+    return {"view": view, "count": len(items), "items": items[:limit]}
+
+
+@app.get("/admin/review/products/{product_id}")
+async def admin_review_product(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
+    """Everything about one product's sourcing: live suppliers, near-misses, rejected, last runs."""
+    require_admin_user(request)
+    product = (supabase.table("tiktok_products").select(
+        "id, product_name, tiktok_price, thumbnail_url, image_storage_url, category, virality_score"
+    ).eq("id", product_id).single().execute().data)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    suppliers = (supabase.table("suppliers").select("*").eq("tiktok_product_id", product_id)
+                 .order("similarity", desc=True, nullsfirst=False).execute().data or [])
+    for s in suppliers:
+        s["visible"] = (not s.get("hidden")) and (
+            s.get("match_method") == "manual" or float(s.get("similarity") or 0) >= MIN_SIMILARITY)
+    candidates = (supabase.table("supplier_candidates").select("*").eq("tiktok_product_id", product_id)
+                  .in_("status", ["pending", "rejected"]).order("similarity", desc=True).execute().data or [])
+    jobs = (supabase.table("sourcing_jobs").select("platform, status, error, result_count, finished_at")
+            .eq("product_id", product_id).order("id", desc=True).limit(6).execute().data or [])
+    return {"product": product, "suppliers": suppliers, "candidates": candidates, "jobs": jobs,
+            "min_similarity": MIN_SIMILARITY}
+
+
+@app.post("/admin/candidates/{candidate_id}/approve")
+async def admin_approve_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+    admin = require_admin_user(request)
+    c = supabase.table("supplier_candidates").select("*").eq("id", candidate_id).single().execute().data
+    if not c:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if c["status"] == "approved":
+        return {"success": True, "supplier_id": c.get("supplier_id")}
+    row = {
+        "tiktok_product_id": c["tiktok_product_id"], "platform": c["platform"],
+        "supplier_name": c.get("supplier_name"), "product_title": c.get("product_title"),
+        "unit_cost_min": c.get("unit_cost_min"), "unit_cost_max": c.get("unit_cost_max"),
+        "moq": c.get("moq"), "supplier_url": c.get("supplier_url"), "image_url": c.get("image_url"),
+        "similarity": c.get("similarity"), "match_method": "manual",
+        "external_product_id": c.get("external_product_id"), "orders": c.get("orders"),
+        "rating": c.get("rating"), "years_on_platform": c.get("years_on_platform"),
+        "supplier_trust_score": min((c.get("years_on_platform") or 0) / 2, 5.0),
+        "verified_supplier": c.get("verified_supplier"),
+        "shipping_estimate_days": 20 if c["platform"] == "alibaba" else 10,
+        "whitelabel_available": c["platform"] == "alibaba",
+        "sourced_at": _now(), "reviewed_by": admin, "reviewed_at": _now(), "hidden": False,
+    }
+    saved = supabase.table("suppliers").insert(row).execute().data
+    sid = saved[0]["id"] if saved else None
+    supabase.table("supplier_candidates").update(
+        {"status": "approved", "reviewed_by": admin, "reviewed_at": _now(), "supplier_id": sid}
+    ).eq("id", candidate_id).execute()
+    return {"success": True, "supplier_id": sid}
+
+
+@app.post("/admin/candidates/{candidate_id}/reject")
+async def admin_reject_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+    admin = require_admin_user(request)
+    supabase.table("supplier_candidates").update(
+        {"status": "rejected", "reviewed_by": admin, "reviewed_at": _now()}
+    ).eq("id", candidate_id).execute()
+    return {"success": True}
+
+
+@app.post("/admin/candidates/{candidate_id}/reopen")
+async def admin_reopen_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+    """Undo a reject (or an approve: the supplier row it created is hidden)."""
+    admin = require_admin_user(request)
+    c = supabase.table("supplier_candidates").select("status, supplier_id").eq("id", candidate_id).single().execute().data
+    if not c:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if c.get("supplier_id"):
+        supabase.table("suppliers").update({"hidden": True, "reviewed_by": admin, "reviewed_at": _now()}).eq("id", c["supplier_id"]).execute()
+    supabase.table("supplier_candidates").update(
+        {"status": "pending", "reviewed_by": None, "reviewed_at": None, "supplier_id": None}
+    ).eq("id", candidate_id).execute()
+    return {"success": True}
+
+
+class SupplierVisibility(BaseModel):
+    hidden: bool
+
+
+@app.post("/admin/suppliers/{supplier_id}/visibility")
+async def admin_supplier_visibility(supplier_id: int, body: SupplierVisibility, request: Request,
+                                    api_key: str = Security(verify_api_key)):
+    """Hide a wrong auto-match from users (or show it again). Re-sourcing keeps it hidden."""
+    admin = require_admin_user(request)
+    supabase.table("suppliers").update(
+        {"hidden": body.hidden, "reviewed_by": admin, "reviewed_at": _now()}
+    ).eq("id", supplier_id).execute()
+    return {"success": True}
+
+
+class ManualSupplier(BaseModel):
+    product_id:    str
+    platform:      str
+    supplier_url:  str
+    supplier_name: str
+    unit_cost_min: float
+    unit_cost_max: Optional[float] = None
+    moq:           Optional[int] = None
+    image_url:     Optional[str] = None
+    product_title: Optional[str] = None
+
+
+@app.post("/admin/suppliers")
+async def admin_add_supplier(body: ManualSupplier, request: Request, api_key: str = Security(verify_api_key)):
+    """Add a supplier the search missed (paste the listing link)."""
+    admin = require_admin_user(request)
+    if body.platform not in ("alibaba", "aliexpress", "amazon"):
+        raise HTTPException(status_code=400, detail="Platform must be alibaba, aliexpress or amazon")
+    if not body.supplier_url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="Paste the full https:// link")
+    row = {
+        "tiktok_product_id": body.product_id, "platform": body.platform,
+        "supplier_name": body.supplier_name.strip(), "product_title": body.product_title,
+        "unit_cost_min": body.unit_cost_min, "unit_cost_max": body.unit_cost_max or body.unit_cost_min,
+        "moq": body.moq, "supplier_url": body.supplier_url.strip(), "image_url": body.image_url,
+        "similarity": None, "match_method": "manual", "hidden": False,
+        "shipping_estimate_days": 20 if body.platform == "alibaba" else 10,
+        "whitelabel_available": body.platform == "alibaba",
+        "sourced_at": _now(), "reviewed_by": admin, "reviewed_at": _now(),
+    }
+    saved = supabase.table("suppliers").insert(row).execute().data
+    return {"success": True, "supplier": saved[0] if saved else row}
