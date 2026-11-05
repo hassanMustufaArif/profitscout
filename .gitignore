@@ -1,4 +1,20 @@
-venv/
-__pycache__/
+# secrets — never commit
 .env
+.env.*
+*.key
+*API*keys*.txt
+*APIs*.txt
+*sendgrid*.txt
+credentials.json
+
+# python
+venv/
+.venv/
+__pycache__/
 *.pyc
+
+# local working files
+*.docx
+Correction/
+Extras/
+/data/*/

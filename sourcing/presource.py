@@ -103,7 +103,8 @@ def _targets(new: bool, stale_days: int | None, limit: int, platforms: tuple) ->
         .select("id, product_name, tiktok_price, thumbnail_url, image_storage_url, virality_score")
         .eq("is_active", True).order("virality_score", desc=True).limit(5000).execute().data
     )
-    since = (datetime.now(timezone.utc) - timedelta(days=stale_days)).isoformat() if stale_days else None
+    # NB: --stale-days 0 means "redo everything", so test for None, not falsiness.
+    since = (datetime.now(timezone.utc) - timedelta(days=stale_days)).isoformat() if stale_days is not None else None
     out = []
     for platform in platforms:
         q = sb.table("sourcing_jobs").select("product_id, finished_at").eq("platform", platform).in_("status", ["done", "no_match"])
@@ -139,7 +140,7 @@ def main() -> None:
         p = (sb.table("tiktok_products").select("id, product_name, tiktok_price, thumbnail_url, image_storage_url")
              .eq("id", a.product).single().execute().data)
         targets = [(p, pl) for pl in platforms]
-    elif a.new or a.stale_days:
+    elif a.new or a.stale_days is not None:
         targets = _targets(a.new, a.stale_days, a.limit, platforms)
     else:
         ap.error("use --new, --stale-days N, or --product ID")

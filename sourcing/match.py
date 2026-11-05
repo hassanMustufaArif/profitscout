@@ -85,5 +85,14 @@ def rank(offers: list[dict], scores: list[float], tiktok_price: float, min_sim: 
         if tiktok_price and o["price_min"] >= tiktok_price * 0.7:   # no realistic margin left
             continue
         rows.append(o)
-    rows.sort(key=lambda o: (-round(o["similarity"], 1), o["price_min"], -(o.get("supplier_years") or 0)))
-    return rows[:keep]
+    rows.sort(key=lambda o: (-round(o["similarity"], 2), o["price_min"], -(o.get("supplier_years") or 0)))
+    # Same listing (or same supplier at the same price) often comes back twice: keep the best one.
+    seen, out = set(), []
+    for o in rows:
+        key = ("id", str(o["product_id"])) if o.get("product_id") else \
+              ("name", (o.get("supplier_name") or "").strip().lower(), round(float(o["price_min"] or 0), 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(o)
+    return out[:keep]

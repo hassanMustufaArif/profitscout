@@ -37,7 +37,7 @@ import math
 import os
 import re
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -252,7 +252,7 @@ def growth_from_history(sb: Client, pid: str, end: str, days: int):
     return prev
 
 
-def import_products(paths, dry_run=False, rehost=False):
+def import_products(paths, dry_run=False, rehost=False, deactivate=False):
     rows = load_rows(paths)
     print(f"{len(rows)} rows from {len(paths)} file pattern(s)")
     parsed, problems = {}, []
@@ -310,6 +310,14 @@ def import_products(paths, dry_run=False, rehost=False):
 
     # 3) cached suppliers were matched against the old title/price: keep them, the
     #    profit is recalculated live from tiktok_price on every request.
+
+    # 4) retire stale rows: v1 rows (no data_end_date) and anything not seen for 3+ weeks
+    if deactivate:
+        newest = max(parse_date(p["data_end_date"]) for p, _ in items)
+        cutoff = str(newest - timedelta(days=21))
+        sb.table("tiktok_products").update({"is_active": False}).is_("data_end_date", "null").execute()
+        sb.table("tiktok_products").update({"is_active": False}).lt("data_end_date", cutoff).execute()
+        print(f"  retired v1 rows and products last seen before {cutoff}")
     print("Done.")
 
 
@@ -323,6 +331,15 @@ CREATOR_MAP = {
     "engagement_rate": ["Engagement Rate", "Avg. Engagement Rate"],
     "category": ["Category", "Main Category"],
     "profile_url": ["TikTokUrl", "TikTok URL", "Profile URL"],
+    "video_gmv": ["Video Revenue($)", "Video GMV($)"],
+    "live_gmv": ["Live Revenue($)", "Live GMV($)"],
+    "product_count": ["Product Number", "Products", "Product Count"],
+    "conversion_rate": ["Conversion Rate", "Creator Conversion Ratio", "CVR"],
+    "item_sold": ["Item Sold", "Items Sold", "Units Sold"],
+    "avg_unit_price": ["Avg. Unit Price($)", "Average Unit Price($)"],
+    "new_followers": ["New Followers", "Follower Growth"],
+    "debut_date": ["Debut Date", "First Video Date"],
+    "contact_email": ["Email", "Contact Email", "Business Email"],
 }
 
 
@@ -338,16 +355,24 @@ def import_creators(paths, dry_run=False):
         rec = {}
         for field, names in CREATOR_MAP.items():
             v = col(r, *names)
-            if field in ("followers", "avg_views"):
-                v = int(num(v) or 0)
-            elif field in ("gmv_total", "engagement_rate"):
+            if field in ("followers", "avg_views", "product_count", "item_sold", "new_followers"):
+                v = int(num(v) or 0) if v not in (None, "") else None
+            elif field in ("gmv_total", "engagement_rate", "video_gmv", "live_gmv", "conversion_rate", "avg_unit_price"):
                 v = num(v)
+            elif field == "debut_date":
+                d = parse_date(v) if v else None
+                v = str(d) if d else None
             rec[field] = v
         handle = (rec.get("tiktok_handle") or "").strip().lstrip("@")
         if not handle:
             continue
         rec["tiktok_handle"] = handle
         rec["profile_url"] = rec.get("profile_url") or f"https://www.tiktok.com/@{handle}"
+        # columns the app reads (Products page > Creators tab)
+        rec["username"] = handle
+        rec["tiktok_url"] = rec["profile_url"]
+        rec["niche"] = rec.get("category")
+        rec["products_promoted"] = rec.get("product_count")
         _, end, _ = date_range(col(r, "Date Range"))
         rec["data_end_date"] = str(end) if end else None
         records[handle] = {k: v for k, v in rec.items() if v is not None}
@@ -361,14 +386,79 @@ def import_creators(paths, dry_run=False):
     print("Done.")
 
 
+
+# ─── shops ───────────────────────────────────────────────────────────────────
+SHOP_MAP = {   # field names = what the app reads (Products page > New shops tab)
+    "shop_name": ["Shop Name", "Shop", "Store Name", "Seller Name"],
+    "gmv_total": ["Revenue($)", "GMV($)", "Revenue", "Sales($)"],
+    "gmv_growth_pct": ["Revenue Growth Rate", "Growth Rate", "Revenue Growth"],
+    "item_sold": ["Item Sold", "Items Sold", "Units Sold"],
+    "product_count": ["Product Number", "Products", "Product Count"],
+    "avg_unit_price": ["Avg. Unit Price($)", "Average Unit Price($)"],
+    "live_revenue": ["Live Revenue($)"],
+    "video_revenue": ["Video Revenue($)"],
+    "product_card_revenue": ["Shopping Mall Revenue($)", "Product Card Revenue($)"],
+    "affiliate_revenue": ["Affiliate Revenue($)", "Creator Revenue($)"],
+    "self_operated_revenue": ["Self-operated Revenue($)", "Self Operated Revenue($)", "Official Account Revenue($)"],
+    "seller_type": ["Seller Type", "Shop Type"],
+    "follower_count": ["Followers", "Shop Followers"],
+    "category": ["Category", "Main Category"],
+    "shop_created_at": ["Shop Launch Date", "Launch Date", "Opening Date", "Created"],
+    "shop_url": ["TikTokUrl", "TikTok URL", "Shop URL"],
+}
+
+
+def import_shops(paths, dry_run=False):
+    rows = load_rows(paths)
+    if rows:
+        known = {n for names in SHOP_MAP.values() for n in names} | {"_file", "Date Range", "KalodataUrl", "img_url"}
+        unmapped = [c for c in rows[0].keys() if c not in known]
+        if unmapped:
+            print(f"Columns not imported (tell Hark if you need them): {unmapped}")
+    records = {}
+    for r in rows:
+        rec = {}
+        for field, names in SHOP_MAP.items():
+            v = col(r, *names)
+            if field in ("item_sold", "product_count", "follower_count"):
+                v = int(num(v) or 0) if v not in (None, "") else None
+            elif field in ("gmv_total", "gmv_growth_pct", "avg_unit_price", "live_revenue", "video_revenue",
+                           "product_card_revenue", "affiliate_revenue", "self_operated_revenue"):
+                v = num(v)
+            elif field == "shop_created_at":
+                d = parse_date(v) if v else None
+                v = str(d) if d else None
+            rec[field] = v
+        name = (rec.get("shop_name") or "").strip()
+        if not name:
+            continue
+        rec["shop_name"] = name
+        rec["image_url"] = col(r, "img_url", "Logo")
+        _, end, _ = date_range(col(r, "Date Range"))
+        rec["data_end_date"] = str(end) if end else None
+        records[name.lower()] = {k: v for k, v in rec.items() if v is not None}
+    print(f"{len(records)} shops parsed")
+    if dry_run or not records:
+        return
+    sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+    vals = list(records.values())
+    for i in range(0, len(vals), BATCH):
+        sb.table("shops").upsert(vals[i:i + BATCH], on_conflict="shop_name").execute()
+    print("Done.")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["products", "creators"])
+    ap.add_argument("kind", choices=["products", "creators", "shops"])
     ap.add_argument("files", nargs="+")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rehost", action="store_true", help="copy product images to Supabase Storage bucket 'product-images'")
+    ap.add_argument("--deactivate", action="store_true",
+                    help="after a FULL weekly import: hide v1 rows and products not seen for 3+ weeks")
     a = ap.parse_args()
     if a.kind == "products":
-        import_products(a.files, a.dry_run, a.rehost)
+        import_products(a.files, a.dry_run, a.rehost, a.deactivate)
+    elif a.kind == "shops":
+        import_shops(a.files, a.dry_run)
     else:
         import_creators(a.files, a.dry_run)

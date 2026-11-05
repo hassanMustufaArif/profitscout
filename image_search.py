@@ -35,7 +35,7 @@ from typing import Optional
 import httpx
 from openai import OpenAI
 
-_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
 
 AE_APP_KEY = os.getenv("ALIEXPRESS_APP_KEY")
