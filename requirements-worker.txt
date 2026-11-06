@@ -6,4 +6,4 @@ Pillow>=10.4
 imagehash==4.3.1
 open_clip_torch==2.26.1
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.4.1
+torch==2.8.0   # >=2.6 for CVE-2025-32434; works with open_clip_torch 2.26.1 (torch>=1.9)
