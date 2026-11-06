@@ -24,6 +24,8 @@ from typing import Optional
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
+from security import normalize_email, normalize_plan
+
 load_dotenv()
 
 _supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
@@ -89,25 +91,53 @@ def refund(user_email: str, product_id: str, platform: str) -> None:
         print(f"refund failed (non-fatal): {e}")
 
 
-def email_from_request(request) -> Optional[str]:
-    """Return the signed-in user's email from the Supabase JWT, or None."""
+class AuthUser:
+    """The signed-in Supabase user behind a request (verified server-side by GoTrue)."""
+
+    __slots__ = ("id", "email", "email_confirmed")
+
+    def __init__(self, id: str, email: str, email_confirmed: bool):
+        self.id = id
+        self.email = email
+        self.email_confirmed = email_confirmed
+
+
+def _confirmed(user) -> bool:
+    # Google OAuth users have email_confirmed_at set. A missing field counts as NOT confirmed.
+    return bool(getattr(user, "email_confirmed_at", None) or getattr(user, "confirmed_at", None))
+
+
+def user_from_request(request) -> Optional[AuthUser]:
+    """Verified user for this request, or None. Cached on request.state so one request makes at
+    most one GoTrue call (the rate limiter, auth checks and handlers all share it)."""
+    state = getattr(request, "state", None)
+    if state is not None and hasattr(state, "auth_user"):
+        return state.auth_user
+    out = None
     auth = request.headers.get("Authorization") or ""
-    if not auth.startswith("Bearer "):
-        return None
-    try:
-        user = _supabase.auth.get_user(auth[7:]).user
-        return user.email if user else None
-    except Exception:
-        return None
+    if auth.startswith("Bearer ") and len(auth) > 7:
+        try:
+            user = _supabase.auth.get_user(auth[7:]).user
+            if user and user.email:
+                out = AuthUser(str(user.id), normalize_email(user.email), _confirmed(user))
+        except Exception:
+            out = None
+    if state is not None:
+        state.auth_user = out
+    return out
+
+
+def email_from_request(request) -> Optional[str]:
+    """Return the signed-in user's email (lowercased) from the Supabase JWT, or None."""
+    u = user_from_request(request)
+    return u.email if u else None
 
 
 def plan_for(user_email: Optional[str]) -> str:
     if not user_email:
         return "free"
     try:
-        res = _supabase.table("users").select("plan").eq("user_email", user_email).limit(1).execute()
-        raw = (res.data[0].get("plan") if res.data else "free") or "free"
-        raw = raw.lower()
-        return raw if raw in ("pro", "ultimate") else "free"
+        res = _supabase.table("users").select("plan").eq("user_email", normalize_email(user_email)).limit(1).execute()
+        return normalize_plan(res.data[0].get("plan") if res.data else "free")
     except Exception:
         return "free"
