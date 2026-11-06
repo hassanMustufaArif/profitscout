@@ -33,3 +33,14 @@ That runs, in order:
 - Never show the Kalodata URL in the app.
 - The UI shows "Sales data to <data_end_date>".
 - Week 1 after the switch: growth is blank and stages show Emerging/Unknown (no history yet). From week 2 they're real.
+
+## Weekly update without a PC (admin page)
+1. Sign in with an `ADMIN_EMAILS` email and open **tikprofitpro.shop/admin/upload**.
+2. Drop the Kalodata CSVs (products, creators, shops). Click **Check files**, read the counts, then **Import**.
+3. Click **Find suppliers** (New products only). It runs `.github/workflows/presource.yml` on GitHub Actions.
+4. Review near-misses at **/admin/review**.
+
+One-time setup:
+- GitHub repo `sodewala45/profitscout` > Settings > Secrets and variables > Actions > New repository secret:
+  `SUPABASE_URL`, `SUPABASE_KEY` (service_role), `OXYLABS_USER`, `OXYLABS_PASS`.
+- A fine-grained GitHub token (repo: profitscout only, permission Actions: Read and write) saved on Render as `GITHUB_ACTIONS_TOKEN`.
