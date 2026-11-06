@@ -8,7 +8,7 @@ from agents import enable_verbose_stdout_logging
 from crawlbase import CrawlingAPI
 enable_verbose_stdout_logging()
 
-OPENAI_API_KEY  = "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"           # your OpenAI key
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")           # your OpenAI key
 CRAWLBASE_TOKEN = "ZydHLLIg5Wv8HvjV-WJpSA"   # your Crawlbase JS token
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY

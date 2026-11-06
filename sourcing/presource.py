@@ -33,7 +33,7 @@ from supabase import create_client
 from . import config, match
 from .http_sources import aliexpress_by_image, aliexpress_by_text, alibaba_by_image, alibaba_by_text, keyword_from_title
 from .oxylabs import Budget, OxylabsError
-from .store import save_suppliers
+from .store import save_candidates, save_suppliers
 
 load_dotenv()
 sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
@@ -53,12 +53,13 @@ def _download(client: httpx.Client, url: str | None) -> bytes | None:
     return None
 
 
-def _check(offers: list[dict], ref: bytes, price: float, client: httpx.Client) -> tuple[list[dict], float]:
+def _check(offers: list[dict], ref: bytes, price: float, client: httpx.Client) -> tuple[list[dict], list[dict], float]:
     offers = offers[:40]
     imgs = [_download(client, o.get("image_url")) for o in offers]
     scores = match.similarities(ref, imgs)
     best = match.rank(offers, scores, price, config.MIN_SIMILARITY, config.KEEP_TOP)
-    return best, (max(scores) if scores else 0.0)
+    near = match.rank(offers, scores, price, config.REVIEW_MIN_SIMILARITY, config.REVIEW_KEEP, max_sim=config.MIN_SIMILARITY)
+    return best, near, (max(scores) if scores else 0.0)
 
 
 def source_one(product: dict, platform: str, budget: Budget, client: httpx.Client) -> dict:
@@ -67,7 +68,7 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
         return {"status": "failed", "error": "product photo missing or expired (import with --rehost)"}
     price = product.get("tiktok_price") or 0
     kw = keyword_from_title(product.get("product_name") or "")
-    tried, top = [], 0.0
+    tried, top, near_all = [], 0.0, []
 
     steps = [("photo", lambda: alibaba_by_image(ref, budget)), ("text", lambda: alibaba_by_text(kw, budget))] \
         if platform == "alibaba" else [("photo", lambda: aliexpress_by_image(ref, budget)), ("text", lambda: aliexpress_by_text(kw, budget))]
@@ -80,13 +81,23 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
         except Exception as e:
             tried.append(f"{method}: {type(e).__name__}: {e}"[:160])
             continue
-        best, s = _check(offers, ref, price, client)
+        best, near, s = _check(offers, ref, price, client)
+        near_all += [dict(o, _method=method) for o in near]
         top = max(top, s)
         tried.append(f"{method}: {len(offers)} results, best look-alike {s:.2f}")
         if best:
             save_suppliers(sb, product["id"], platform, best, method)
-            return {"status": "done", "method": method, "count": len(best), "tried": tried}
-    return {"status": "no_match", "error": "; ".join(tried) or "no results", "best": round(top, 2)}
+            _save_review(product["id"], platform, near_all)
+            return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": len(near_all)}
+    _save_review(product["id"], platform, near_all)
+    return {"status": "no_match", "error": "; ".join(tried) or "no results", "best": round(top, 2), "review": len(near_all)}
+
+
+def _save_review(product_id, platform: str, near: list[dict]) -> None:
+    try:
+        save_candidates(sb, product_id, platform, near)
+    except Exception as e:                      # the review queue must never break sourcing
+        print(f"  review queue not saved: {e}")
 
 
 def _record(product_id: str, platform: str, res: dict) -> None:
@@ -103,7 +114,8 @@ def _targets(new: bool, stale_days: int | None, limit: int, platforms: tuple) ->
         .select("id, product_name, tiktok_price, thumbnail_url, image_storage_url, virality_score")
         .eq("is_active", True).order("virality_score", desc=True).limit(5000).execute().data
     )
-    since = (datetime.now(timezone.utc) - timedelta(days=stale_days)).isoformat() if stale_days else None
+    # NB: --stale-days 0 means "redo everything", so test for None, not falsiness.
+    since = (datetime.now(timezone.utc) - timedelta(days=stale_days)).isoformat() if stale_days is not None else None
     out = []
     for platform in platforms:
         q = sb.table("sourcing_jobs").select("product_id, finished_at").eq("platform", platform).in_("status", ["done", "no_match"])
@@ -139,7 +151,7 @@ def main() -> None:
         p = (sb.table("tiktok_products").select("id, product_name, tiktok_price, thumbnail_url, image_storage_url")
              .eq("id", a.product).single().execute().data)
         targets = [(p, pl) for pl in platforms]
-    elif a.new or a.stale_days:
+    elif a.new or a.stale_days is not None:
         targets = _targets(a.new, a.stale_days, a.limit, platforms)
     else:
         ap.error("use --new, --stale-days N, or --product ID")

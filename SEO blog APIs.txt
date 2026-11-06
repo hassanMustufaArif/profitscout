@@ -1,6 +1,0 @@
-Admin API Key:
-69b1e6f30e2043000140543a:63d0fef22ca26095fd310f19b07a7df28adbe09954d6bd80cf9fa8fc16ab7936
-
-Content API Key:79f903827500bd0cff93fe5678
-
-API URL :https://blog.tikprofitpro.shop

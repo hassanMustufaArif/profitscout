@@ -33,7 +33,8 @@ import tempfile
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 ADZUNA_ID  = os.environ.get("ADZUNA_APP_ID", "")
 ADZUNA_KEY = os.environ.get("ADZUNA_APP_KEY", "")
 
@@ -58,20 +59,22 @@ def scheduled_autopilot():
     except Exception as e:
         print(f"❌ Autopilot error: {e}")
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(scheduled_autopilot, 'cron', hour=9, minute=0)
-scheduler.start()
-print("✅ Autopilot scheduler started — runs daily at 9AM UTC")
+# Off by default: with more than one web instance the post would be published twice.
+# Prefer a Render Cron Job running `python autopilot.py`; set RUN_SCHEDULER=true only on ONE instance.
+if os.getenv("RUN_SCHEDULER", "false") == "true":
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(scheduled_autopilot, 'cron', hour=9, minute=0)
+    scheduler.start()
+    print("Autopilot scheduler started — runs daily at 9AM UTC")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://tikprofitpro.shop,https://www.tikprofitpro.shop,http://localhost:8080,http://localhost:5173").split(",") if o.strip()],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 # --- API Key Auth ---
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -82,6 +85,27 @@ async def verify_api_key(request: Request, api_key: str = Security(API_KEY_HEADE
     if not api_key or api_key != os.getenv("API_KEY"):
         raise HTTPException(status_code=403, detail="Forbidden")
     return api_key
+
+
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+
+
+def require_admin(request: Request):
+    """Internal tools (blog, autopilot, job board). Header X-Admin-Secret must match ADMIN_SECRET."""
+    given = request.headers.get("X-Admin-Secret", "")
+    if not ADMIN_SECRET or not hmac.compare_digest(given, ADMIN_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+FREE_PRODUCT_LIMIT = 10
+MIN_SIMILARITY = float(os.getenv("SOURCING_MIN_SIMILARITY", "0.80"))
+
+
+def gate_list(plan: str, limit: int, offset: int) -> tuple[int, int]:
+    """Free (and signed-out) users see the top 10 only, on every list endpoint."""
+    if plan not in ("pro", "ultimate"):
+        return min(limit, FREE_PRODUCT_LIMIT), 0
+    return limit, offset
 
 
 async def get_user_plan(request: Request):
@@ -206,16 +230,7 @@ def get_product(product_id: str, api_key: str = Security(verify_api_key)):
             raise HTTPException(status_code=404, detail="Product not found")
 
         product = product_result.data
-
-        suppliers_result = (
-            supabase.table("suppliers")
-            .select("*")
-            .eq("tiktok_product_id", product_id)
-            .order("supplier_trust_score", desc=True)
-            .execute()
-        )
-
-        product["suppliers"] = suppliers_result.data or []
+        # Suppliers are NOT returned here: they cost a credit via /products/{id}/suppliers/{platform}.
 
         return {
             "success": True,
@@ -232,8 +247,9 @@ def get_product(product_id: str, api_key: str = Security(verify_api_key)):
 # ENDPOINT 4 — Get Products by Virality Tier
 # ==============================================================================
 @app.get("/products/tier/{tier}")
-def get_products_by_tier(
+async def get_products_by_tier(
     tier:    str,
+    request: Request,
     limit:   int = Query(default=20, ge=1, le=100),
     offset:  int = Query(default=0,  ge=0),
     api_key: str = Security(verify_api_key),
@@ -252,6 +268,7 @@ def get_products_by_tier(
         )
 
     min_score, max_score = tier_ranges[tier]
+    limit, offset = gate_list(await get_user_plan(request), limit, offset)
 
     try:
         result = (
@@ -418,11 +435,13 @@ def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)
 # ==============================================================================
 @app.get("/search")
 async def search_products(
+    request: Request,
     q:       str = Query(..., min_length=2, description="Search keyword"),
     limit:   int = Query(default=20, ge=1, le=100),
     offset:  int = Query(default=0,  ge=0),
     api_key: str = Security(verify_api_key),
 ):
+    limit, offset = gate_list(await get_user_plan(request), limit, offset)
     try:
         result = (
             supabase.table("tiktok_products")
@@ -456,6 +475,72 @@ async def search_products(
 #   - otherwise 1 credit is reserved before the search and REFUNDED if nothing usable is found
 #   - the engine never charges; this endpoint is the only place credits move
 # ==============================================================================
+def _dedupe_key(r: dict):
+    ext = r.get("external_product_id")
+    if ext:
+        return ("ext", str(ext))
+    return ("name", (r.get("supplier_name") or "").strip().lower(), round(float(r.get("unit_cost_min") or 0), 2))
+
+
+def verified_suppliers(product: dict, platform: str, keep: int = 5) -> list[dict]:
+    """Saved suppliers that passed the photo check, best match first, no duplicates.
+    Rows without a similarity score (old keyword-only results) are never shown or charged for."""
+    from supplier_engine import calculate_profit
+    rows = (
+        supabase.table("suppliers").select("*")
+        .eq("tiktok_product_id", product["id"]).eq("platform", platform)
+        .or_(f"similarity.gte.{MIN_SIMILARITY},match_method.eq.manual")   # auto-verified or hand-approved
+        .not_.is_("hidden", "true")
+        .execute().data or []
+    )
+
+    def score(r):  # a hand-approved row ranks as a verified match
+        sim = float(r.get("similarity") or 0)
+        return max(sim, MIN_SIMILARITY) if r.get("match_method") == "manual" else sim
+
+    seen, out = set(), []
+    for r in sorted(rows, key=lambda r: (-round(score(r), 2), float(r.get("unit_cost_min") or 1e9))):
+        k = _dedupe_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        cogs = r.get("unit_cost_min") or r.get("unit_cost_max") or 0
+        r["_profit"] = calculate_profit(sale_price=product.get("tiktok_price") or 0, cogs=cogs)
+        r["_image_url"] = r.get("image_url", "")
+        out.append(r)
+    return out[:keep]
+
+
+def _balance(email: str) -> Optional[dict]:
+    try:
+        return credits_v2.get_balance(email)
+    except credits_v2.CreditError:
+        return None
+
+
+def _charge_or_402(user_email: str, product_id: str, platform: str, mode: str) -> bool:
+    try:
+        credit = credits_v2.consume(user_email, product_id, platform, mode)
+    except credits_v2.CreditError as e:
+        print(f"credit system error: {e}")
+        raise HTTPException(status_code=503, detail="Credits are temporarily unavailable. Please try again in a minute.")
+    if not credit.get("allowed"):
+        raise HTTPException(status_code=402, detail={
+            "code": "no_credits",
+            "message": f"You've used all {credit.get('credits_total', 0)} credits for this period.",
+            "credits": credit,
+        })
+    return bool(credit.get("charged"))
+
+
+# ==============================================================================
+# Supplier lookup — credit rules (credits.py + SQL functions do the accounting):
+#   - Alibaba / AliExpress are PRE-SOURCED in a batch (sourcing/presource.py).
+#   - A user pays 1 credit the first time they open a product+platform that has at least one
+#     photo-verified supplier (similarity >= SOURCING_MIN_SIMILARITY). Reopening is free.
+#   - No verified supplier yet (not sourced, no match, only old unscored rows) -> nothing shown, nothing charged.
+#   - Amazon keeps the legacy live search: charged up front, refunded if nothing usable is found.
+# ==============================================================================
 def _supplier_search(product_id: str, platform: str, request: Request, photo: bool):
     if platform not in ("alibaba", "aliexpress", "amazon"):
         raise HTTPException(status_code=400, detail="Platform must be: alibaba, aliexpress, or amazon")
@@ -464,112 +549,57 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
     if not user_email:
         raise HTTPException(status_code=401, detail="Sign in to search suppliers")
 
-    product_result = (
+    product = (
         supabase.table("tiktok_products")
         .select("id, product_name, tiktok_price, thumbnail_url, image_storage_url")
-        .eq("id", product_id)
-        .single()
-        .execute()
+        .eq("id", product_id).single().execute().data
     )
-    if not product_result.data:
+    if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    product = product_result.data
-    image_url = product.get("image_storage_url") or product.get("thumbnail_url") or ""
 
-    # Free paths first: shared cache, or this user already unlocked it
-    has_cache = bool(
-        supabase.table("suppliers").select("id").eq("tiktok_product_id", product_id)
-        .eq("platform", platform).limit(1).execute().data
-    )
-    already = credits_v2.is_unlocked(user_email, product_id, platform)
+    if platform in ("alibaba", "aliexpress"):
+        rows = verified_suppliers(product, platform)
+        if rows:
+            charged = False
+            if not credits_v2.is_unlocked(user_email, product_id, platform):
+                charged = _charge_or_402(user_email, product_id, platform, "image")
+            return {"success": True, "cached": True, "platform": platform, "match_method": "photo",
+                    "suppliers": rows, "credit_charged": charged, "credits": _balance(user_email)}
 
-    # Pre-sourced mode (default): suppliers are found in a batch after each Kalodata import
-    # (python -m sourcing.presource --new). Users never trigger a live search and are never
-    # charged for a product that has no suppliers yet.
-    if platform in ("alibaba", "aliexpress") and not has_cache and os.getenv("PRESOURCE_ONLY", "true") == "true":
         last = (
-            supabase.table("sourcing_jobs").select("status, finished_at")
+            supabase.table("sourcing_jobs").select("status")
             .eq("product_id", str(product_id)).eq("platform", platform)
             .order("id", desc=True).limit(1).execute().data
         )
         state = last[0]["status"] if last else "pending"
-        msg = (
-            f"No {platform.title()} supplier matched this product's photo."
-            if state == "no_match"
-            else f"{platform.title()} suppliers for this product are being prepared. Check back soon."
-        )
-        out = {"success": False, "status": "not_sourced" if state != "no_match" else "no_match",
-               "platform": platform, "suppliers": [], "credit_charged": False, "message": msg}
-        try:
-            out["credits"] = credits_v2.get_balance(user_email)
-        except credits_v2.CreditError:
-            pass
-        return out
+        msg = (f"No {platform.title()} supplier matched this product's photo closely enough. No credit used."
+               if state == "no_match" else
+               f"{platform.title()} suppliers for this product are being prepared. Check back soon. No credit used.")
+        return {"success": False, "status": "no_match" if state == "no_match" else "not_sourced",
+                "platform": platform, "suppliers": [], "credit_charged": False, "message": msg,
+                "credits": _balance(user_email)}
 
-    # Every first look at a product's suppliers costs 1 credit per user, even when the
-    # suppliers were pre-sourced (cached). Reopening a product you already unlocked is free.
+    # Amazon: legacy live search (Apify). Charge first, refund if nothing usable.
+    image_url = product.get("image_storage_url") or product.get("thumbnail_url") or ""
     charged = False
-    if not already:
-        try:
-            credit = credits_v2.consume(user_email, product_id, platform, "image" if photo else "text")
-        except credits_v2.CreditError as e:
-            print(f"credit system error: {e}")
-            raise HTTPException(status_code=503, detail="Credits are temporarily unavailable. Please try again in a minute.")
-        if not credit.get("allowed"):
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "code": "no_credits",
-                    "message": f"You've used all {credit.get('credits_total', 0)} credits for this period.",
-                    "credits": credit,
-                },
-            )
-        charged = bool(credit.get("charged"))
-
-    # Alibaba / AliExpress: real photo search runs in the sourcing worker (Playwright + Oxylabs).
-    if platform in ("alibaba", "aliexpress") and photo and not has_cache and os.getenv("PHOTO_WORKER_ENABLED", "false") == "true":
-        live = (
-            supabase.table("sourcing_jobs").select("id")
-            .eq("product_id", str(product_id)).eq("platform", platform)
-            .in_("status", ["queued", "running"]).limit(1).execute().data
-        )
-        if live:
-            job_id = live[0]["id"]
-            if charged:  # another user's job already covers this product: don't bill twice
-                credits_v2.refund(user_email, product_id, platform)
-                charged = False
-        else:
-            job_id = supabase.table("sourcing_jobs").insert({
-                "product_id": str(product_id), "platform": platform, "user_email": user_email,
-                "charged": charged, "status": "queued",
-            }).execute().data[0]["id"]
-        return {"success": True, "status": "queued", "job_id": job_id, "platform": platform,
-                "credit_charged": charged, "message": "Searching by photo. Usually 30 to 90 seconds."}
-
+    if not credits_v2.is_unlocked(user_email, product_id, platform):
+        charged = _charge_or_402(user_email, product_id, platform, "image" if photo else "text")
     try:
         result = find_suppliers_by_platform(
-            product_id=product["id"],
-            product_title=product["product_name"],
-            tiktok_price=product["tiktok_price"] or 0,
-            platform=platform,
-            user_email=user_email,
-            product_image_url=image_url,
-            use_photo=photo,
+            product_id=product["id"], product_title=product["product_name"],
+            tiktok_price=product["tiktok_price"] or 0, platform=platform,
+            user_email=user_email, product_image_url=image_url, use_photo=photo,
         )
     except Exception as e:
+        print(f"amazon search error: {e}")
         if charged:
             credits_v2.refund(user_email, product_id, platform)
-        raise HTTPException(status_code=500, detail=f"Supplier search failed. Your credit was not used. ({e})")
-
+        raise HTTPException(status_code=500, detail="Supplier search failed. Your credit was not used.")
     if charged and not result.get("success"):
         credits_v2.refund(user_email, product_id, platform)
         charged = False
-
-    try:
-        result["credits"] = credits_v2.get_balance(user_email)
-    except credits_v2.CreditError:
-        pass
     result["credit_charged"] = charged
+    result["credits"] = _balance(user_email)
     return result
 
 
@@ -592,23 +622,20 @@ async def get_suppliers(product_id: str, request: Request, api_key: str = Securi
 
 @app.get("/sourcing/jobs/{job_id}")
 async def get_sourcing_job(job_id: int, request: Request, api_key: str = Security(verify_api_key)):
-    """Frontend polls this every 3s after a photo search was queued."""
+    """Frontend polls this every 3s after a photo search was queued (worker mode only)."""
+    email = credits_v2.email_from_request(request)
+    if not email:
+        raise HTTPException(status_code=401, detail="Sign in required")
     job = supabase.table("sourcing_jobs").select("*").eq("id", job_id).single().execute().data
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    out = {"job_id": job_id, "status": job["status"], "error": job.get("error")}
-    if job["status"] == "done":
+    out = {"job_id": job_id, "status": job["status"]}
+    # Suppliers only for users who actually unlocked this product+platform.
+    if job["status"] == "done" and credits_v2.is_unlocked(email, job["product_id"], job["platform"]):
         product = supabase.table("tiktok_products").select("id, tiktok_price").eq("id", job["product_id"]).single().execute().data
-        res = find_suppliers_by_platform(product_id=product["id"], product_title="", tiktok_price=product["tiktok_price"] or 0,
-                                         platform=job["platform"], use_photo=False)  # served from cache
-        out["suppliers"] = res.get("suppliers", [])
+        out["suppliers"] = verified_suppliers(product, job["platform"]) if product else []
     if job["status"] in ("done", "no_match", "failed"):
-        email = credits_v2.email_from_request(request)
-        if email:
-            try:
-                out["credits"] = credits_v2.get_balance(email)
-            except credits_v2.CreditError:
-                pass
+        out["credits"] = _balance(email)
     return out
 
 
@@ -635,65 +662,91 @@ PRO_VARIANT_ID = os.getenv("LEMONSQUEEZY_PRODUCT_ID")
 ULTIMATE_VARIANT_ID = os.getenv("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID")
 
 
+# Lemon Squeezy subscription statuses -> do they keep the paid plan?
+#   active, on_trial            paid
+#   cancelled                   paid until ends_at (LS sends subscription_expired when it really ends)
+#   past_due                    paid (grace while LS retries the card)
+#   unpaid, expired, paused     free
+PAID_STATUSES = {"active", "on_trial", "cancelled", "past_due"}
+
+
+def _plan_for_variant(variant_id: str) -> Optional[str]:
+    if variant_id and variant_id == str(ULTIMATE_VARIANT_ID or ""):
+        return "ultimate"
+    if variant_id and variant_id == str(PRO_VARIANT_ID or ""):
+        return "pro"
+    return None
+
+
+def _set_plan(email: str, plan: str, new_period: bool) -> None:
+    res = supabase.table("users").update({"plan": plan}).ilike("user_email", email).execute()
+    if not res.data:
+        print(f"Webhook: no users row for {email}; plan {plan} not applied")
+        return
+    try:
+        if new_period:
+            credits_v2.start_period(email)      # fresh 30-day allowance on each successful payment
+        else:
+            credits_v2.get_balance(email)       # applies the new allowance, keeps usage
+    except credits_v2.CreditError as e:
+        print(f"Webhook credit update failed for {email}: {e}")
+
+
 @app.post("/lemonsqueezy-webhook")
 async def lemonsqueezy_webhook(request: Request):
     body = await request.body()
-    signature = request.headers.get("x-signature")
-
-    if not signature:
+    signature = request.headers.get("x-signature") or ""
+    if not LEMONSQUEEZY_WEBHOOK_SECRET or not signature:
         raise HTTPException(status_code=401, detail="No signature")
-
-    digest = hmac.new(
-        LEMONSQUEEZY_WEBHOOK_SECRET.encode(),
-        body,
-        hashlib.sha256
-    ).hexdigest()
-
+    digest = hmac.new(LEMONSQUEEZY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(digest, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     payload = json.loads(body)
-    event_name = payload.get("meta", {}).get("event_name")
-    custom_data = payload.get("meta", {}).get("custom_data", {})
-    user_email = custom_data.get("email") or custom_data.get("user_email")
+    meta = payload.get("meta", {}) or {}
+    event_name = meta.get("event_name") or ""
+    data = payload.get("data", {}) or {}
+    attrs = data.get("attributes", {}) or {}
 
-    if not user_email:
-        user_email = payload.get("data", {}).get("attributes", {}).get("user_email")
+    # Idempotency: LS retries deliveries; process each (event, object, updated_at) once.
+    event_key = f"{event_name}:{data.get('type')}:{data.get('id')}:{attrs.get('updated_at') or attrs.get('created_at')}"
+    try:
+        supabase.table("webhook_events").insert({"id": event_key, "event_name": event_name}).execute()
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "23505" in str(e):
+            return {"status": "ok", "duplicate": True}
+        print(f"webhook_events insert failed (continuing): {e}")
 
-    if not user_email:
+    custom = meta.get("custom_data", {}) or {}
+    email = (custom.get("email") or custom.get("user_email") or attrs.get("user_email") or "").strip().lower()
+    if not email:
         print(f"Webhook {event_name}: no email found")
         return {"status": "ok"}
 
-    # Determine plan from variant ID
-    variant_id = str(payload.get("data", {}).get("attributes", {}).get("variant_id") or "")
+    if event_name.startswith("subscription_payment_"):
+        # Payment events carry an invoice; only a success starts a new credit period.
+        if event_name == "subscription_payment_success":
+            plan = (supabase.table("users").select("plan").ilike("user_email", email).limit(1).execute().data or [{}])[0].get("plan")
+            if plan in ("pro", "ultimate"):
+                credits_v2.start_period(email)
+        return {"status": "ok"}
 
-    if variant_id == ULTIMATE_VARIANT_ID:
-        plan = "ultimate"
-    elif variant_id == PRO_VARIANT_ID:
-        plan = "pro"
+    if not event_name.startswith("subscription_"):
+        return {"status": "ok"}
+
+    variant_id = str(attrs.get("variant_id") or "")
+    plan = _plan_for_variant(variant_id)
+    if plan is None:
+        print(f"Webhook {event_name}: unknown variant {variant_id} for {email}; ignored")
+        return {"status": "ok"}
+
+    status = (attrs.get("status") or "").lower()
+    if event_name == "subscription_expired" or status not in PAID_STATUSES:
+        _set_plan(email, "free", new_period=False)
+        print(f"{email} -> free ({event_name}, status={status})")
     else:
-        plan = "pro"
-
-    if event_name == "subscription_created":
-        supabase.table("users").update({"plan": plan}).eq("user_email", user_email).execute()
-        initialize_credits(user_email, plan)
-        print(f"Upgraded {user_email} to {plan}")
-
-    elif event_name in ["subscription_cancelled", "subscription_expired"]:
-        supabase.table("users").update({"plan": "free"}).eq("user_email", user_email).execute()
-        initialize_credits(user_email, "free")
-        print(f"Downgraded {user_email} to free")
-
-    elif event_name == "subscription_updated":
-        status = payload.get("data", {}).get("attributes", {}).get("status")
-        if status == "active":
-            supabase.table("users").update({"plan": plan}).eq("user_email", user_email).execute()
-            initialize_credits(user_email, plan)
-        elif status in ["cancelled", "expired", "past_due"]:
-            supabase.table("users").update({"plan": "free"}).eq("user_email", user_email).execute()
-            initialize_credits(user_email, "free")
-        print(f"Updated {user_email}: status={status}, plan={plan}")
-
+        _set_plan(email, plan, new_period=(event_name == "subscription_created"))
+        print(f"{email} -> {plan} ({event_name}, status={status})")
     return {"status": "ok"}
 
 
@@ -706,7 +759,13 @@ class CheckoutRequest(BaseModel):
 
 
 @app.post("/create-checkout")
-async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Security(verify_api_key)):
+async def create_checkout(checkout_data: CheckoutRequest, request: Request, api_key: str = Security(verify_api_key)):
+    signed_in = credits_v2.email_from_request(request)
+    if not signed_in:
+        raise HTTPException(status_code=401, detail="Sign in to subscribe")
+    checkout_data.email = signed_in.lower()   # never trust the email in the body
+    if checkout_data.plan not in ("pro", "ultimate"):
+        raise HTTPException(status_code=400, detail="Unknown plan")
     if checkout_data.plan == "ultimate":
         variant_id = os.getenv("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID")
     else:
@@ -716,7 +775,6 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
     print(f"Checkout: plan={checkout_data.plan}, email={checkout_data.email}")
     print(f"Variant ID: {variant_id}")
     print(f"Store ID: {os.getenv('LEMONSQUEEZY_STORE_ID')}")
-    print(f"API Key exists: {bool(os.getenv('LEMONSQUEEZY_API_KEY'))}")
 
     headers = {
         "Authorization": f"Bearer {os.getenv('LEMONSQUEEZY_API_KEY')}",
@@ -761,7 +819,8 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
 
     # Print full LemonSqueezy response for debugging
     print(f"LemonSqueezy status: {response.status_code}")
-    print(f"LemonSqueezy response: {response.text}")
+    if response.status_code not in (200, 201):
+        print(f"LemonSqueezy response: {response.text[:500]}")
 
     if response.status_code != 200 and response.status_code != 201:
         raise HTTPException(status_code=400, detail="Checkout creation failed")
@@ -776,6 +835,7 @@ async def create_checkout(checkout_data: CheckoutRequest, api_key: str = Securit
 from fastapi import Request
 @app.post("/publish-blog-post")
 async def publish_blog_post(request: Request):
+    require_admin(request)
     import httpx, jwt, time, os, json
 
     try:
@@ -854,7 +914,9 @@ async def publish_blog_post(request: Request):
 # ─── Blog Post Generator via OpenAI ──────────────────────────────
 # ─── Blog Post Generator via Groq ──────────────────────────────
 @app.post("/generate-blog-post")
-async def generate_blog_post(request: dict):
+async def generate_blog_post(raw: Request):
+    require_admin(raw)
+    request = await raw.json()
     import httpx, os
     api_key = os.environ.get("GROQ_API_KEY", "")
     prompt  = request.get("prompt", "")
@@ -890,7 +952,8 @@ async def generate_blog_post(request: dict):
 
 
 @app.get("/get-image")
-async def get_image(query: str = "ecommerce"):
+async def get_image(request: Request, query: str = "ecommerce"):
+    require_admin(request)
     import httpx, os
 
     access_key = os.environ.get("UNSPLASH_ACCESS_KEY", "")
@@ -961,10 +1024,13 @@ async def generate_listing(req: GenerateListingRequest, request: Request):
     - respects TikTok Shop rules: no medical claims, no "best/#1", no competitor brands
     Requires a signed-in user (it spends OpenAI money).
     """
-    if not credits_v2.email_from_request(request):
+    email = credits_v2.email_from_request(request)
+    if not email:
         raise HTTPException(status_code=401, detail="Sign in to generate listings")
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    if credits_v2.plan_for(email) not in ("pro", "ultimate"):
+        raise HTTPException(status_code=402, detail="The listing generator is a Pro feature")
+    if not (GROQ_API_KEY or openai_client):
+        raise HTTPException(status_code=503, detail="Listing generator is not configured")
 
     image_part = []
     if req.image_url:
@@ -993,65 +1059,99 @@ Respond ONLY with JSON:
 Selling price: ${req.price}
 Category hint: {req.category}"""
 
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": [{"type": "text", "text": user_text}] + image_part},
+    ]
     try:
-        resp = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            max_tokens=700,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": [{"type": "text", "text": user_text}] + image_part},
-            ],
-        )
-        return json.loads(resp.choices[0].message.content or "{}")
+        if GROQ_API_KEY:
+            # Groq (OpenAI-compatible, much cheaper). Llama 4 Scout reads images.
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={"model": os.getenv("LISTING_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
+                          "temperature": 0.3, "max_tokens": 700,
+                          "response_format": {"type": "json_object"}, "messages": messages},
+                )
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"]
+        else:
+            resp = await openai_client.chat.completions.create(
+                model="gpt-4o-mini", temperature=0.3, max_tokens=700,
+                response_format={"type": "json_object"}, messages=messages,
+            )
+            content = resp.choices[0].message.content
+        return json.loads(content or "{}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"generate-listing error: {e}")
+        raise HTTPException(status_code=502, detail="The listing generator couldn't finish. Try again in a minute.")
 
 
 # ─── Get Shops ───────────────────────────────────────────────────
 @app.get("/shops")
 async def get_shops(
-    limit: int = 50,
-    offset: int = 0,
-    sort_by: str = "gmv_total"
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    sort_by: str = "gmv_total",
+    api_key: str = Security(verify_api_key),
 ):
+    limit, offset = gate_list(await get_user_plan(request), limit, offset)
     try:
         # Valid sort columns
         allowed_sorts = ["gmv_total", "gmv_growth_pct", "created_at", "follower_count"]
         order_col = sort_by if sort_by in allowed_sorts else "gmv_total"
 
         res = supabase.table("shops")\
-                .select("*")\
+                .select("*", count="exact")\
                 .order(order_col, desc=True)\
                 .range(offset, offset + limit - 1)\
                 .execute()
         return {
             "shops": res.data,
-            "total": 4502,
+            "total": res.count,
             "limit": limit,
             "offset": offset
         }
     except Exception as e:
-        return {"shops": [], "error": str(e)}
+        print(f"shops error: {e}")
+        return {"shops": [], "error": "Shops are temporarily unavailable"}
 
 # ─── Get Creators ─────────────────────────────────────────────────
 @app.get("/creators")
-async def get_creators(creator_type: str = None, limit: int = 50):
+async def get_creators(
+    request: Request,
+    creator_type: str = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    sort_by: str = "gmv_total",
+    api_key: str = Security(verify_api_key),
+):
+    plan = await get_user_plan(request)
+    limit, offset = gate_list(plan, limit, offset)
+    order_col = sort_by if sort_by in ("gmv_total", "followers", "engagement_rate", "video_gmv", "live_gmv") else "gmv_total"
     try:
-        query = supabase.table("creators").select("*").limit(limit)
+        query = supabase.table("creators").select("*")
         if creator_type:
             query = query.eq("creator_type", creator_type)
-        res = query.order("followers", desc=True).execute()
-        return {"creators": res.data}
+        res = query.order(order_col, desc=True, nullsfirst=False).range(offset, offset + limit - 1).execute()
+        rows = res.data or []
+        if plan not in ("pro", "ultimate"):
+            for r in rows:                      # contact details are a paid feature
+                r.pop("contact_email", None)
+                r["contact_locked"] = True
+        return {"creators": rows, "plan": plan}
     except Exception as e:
-        return {"creators": [], "error": str(e)}
+        print(f"creators error: {e}")
+        return {"creators": [], "error": "Creators are temporarily unavailable"}
     
 # ================================================================
 # /api/jobs — real jobs from Remotive + Adzuna
 # ================================================================
 @app.get("/api/jobs")
-async def get_jobs(niches: str = "", location: str = "remote", job_type: str = "Any"):
+async def get_jobs(request: Request, niches: str = "", location: str = "remote", job_type: str = "Any"):
+    require_admin(request)
     niche_list = [n.strip().lower() for n in niches.split(",") if n.strip()]
     all_jobs = []
  
@@ -1158,7 +1258,8 @@ async def get_jobs(niches: str = "", location: str = "remote", job_type: str = "
 # /api/parse-cv — upload PDF, GPT extracts structured profile
 # ================================================================
 @app.post("/api/parse-cv")
-async def parse_cv(file: UploadFile = File(...)):
+async def parse_cv(request: Request, file: UploadFile = File(...)):
+    require_admin(request)
     if not file.filename.lower().endswith(".pdf"):
         return JSONResponse({"error": "Only PDF files supported"}, status_code=400)
  
@@ -1211,7 +1312,12 @@ CV:
 # /api/extract-email — fetch job page, GPT extracts apply email
 # ================================================================
 @app.get("/api/extract-email")
-async def extract_email(url: str = ""):
+async def extract_email(request: Request, url: str = ""):
+    require_admin(request)
+    if openai_client is None:
+        return JSONResponse({"email": "", "error": "AI not configured"})
+    if not url.startswith(("http://", "https://")):
+        return JSONResponse({"email": ""})
     """
     Fetches the job posting page and uses GPT to extract
     any apply/contact email address from the HTML content.
@@ -1278,6 +1384,9 @@ Page text (first 2000 chars):
 # ================================================================
 @app.post("/api/ai-proxy")
 async def ai_proxy(request: Request, api_key: str = Security(verify_api_key)):
+    require_admin(request)
+    if openai_client is None:
+        return JSONResponse({"error": "AI not configured"}, status_code=503)
     # Was open to the whole internet: anyone could spend the OpenAI balance.
     try:
         body = await request.json()
@@ -1296,7 +1405,8 @@ async def ai_proxy(request: Request, api_key: str = Security(verify_api_key)):
 # /jobs — serves job_hunt.html
 # ================================================================
 @app.get("/jobs", response_class=HTMLResponse)
-async def job_hunt_ui():
+async def job_hunt_ui(request: Request):
+    require_admin(request)
     path = r"F:\profitscout\job_hunt.html"
     if not os.path.exists(path):
         return HTMLResponse(f"<h2>job_hunt.html not found at {path}</h2>", status_code=404)
@@ -1306,9 +1416,11 @@ async def job_hunt_ui():
 
  # ─── Daily Blog Autopilot Endpoint ───────────────────────────────
 @app.post("/run-autopilot")
-async def run_autopilot(secret: str = ""):
-    if secret != os.environ.get("AUTOPILOT_SECRET") or object():
-        return {"error": "unauthorized"}
+async def run_autopilot(request: Request):
+    expected = os.environ.get("AUTOPILOT_SECRET", "")
+    given = request.headers.get("X-Autopilot-Secret", "")
+    if not expected or not hmac.compare_digest(given, expected):
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         from autopilot import run
         import threading
@@ -1317,3 +1429,211 @@ async def run_autopilot(secret: str = ""):
         return {"status": "started", "message": "Autopilot running in background"}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ==============================================================================
+# ADMIN — supplier review queue
+# Admins are the signed-in emails listed in ADMIN_EMAILS (comma separated).
+#   Pending   = near-miss photo matches (default 0.60-0.79): same product, different bottle/label/angle
+#   Live      = what users see (auto-verified >= 0.80, or hand-approved)
+#   Rejected  = never queued again for that product
+# ==============================================================================
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+
+
+def require_admin_user(request: Request) -> str:
+    email = (credits_v2.email_from_request(request) or "").lower()
+    if not email:
+        raise HTTPException(status_code=401, detail="Sign in required")
+    if email not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Admins only")
+    return email
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@app.get("/admin/me")
+async def admin_me(request: Request, api_key: str = Security(verify_api_key)):
+    email = (credits_v2.email_from_request(request) or "").lower()
+    return {"admin": bool(email and email in ADMIN_EMAILS)}
+
+
+@app.get("/admin/review/queue")
+async def admin_review_queue(
+    request: Request,
+    view: str = Query(default="pending", pattern="^(pending|no_match|live)$"),
+    platform: Optional[str] = Query(default=None, pattern="^(alibaba|aliexpress)$"),
+    limit: int = Query(default=50, ge=1, le=200),
+    api_key: str = Security(verify_api_key),
+):
+    """Products to look at. pending: has near-misses waiting. no_match: last sourcing found nothing
+    verified. live: has suppliers users can see (to spot wrong auto-matches)."""
+    require_admin_user(request)
+    counts: dict = {}
+
+    def bump(pid, plat, key):
+        c = counts.setdefault((str(pid), plat), {"pending": 0, "live": 0, "status": None})
+        c[key] = c.get(key, 0) + 1
+
+    if view in ("pending", "no_match"):
+        q = supabase.table("supplier_candidates").select("tiktok_product_id, platform").eq("status", "pending")
+        if platform:
+            q = q.eq("platform", platform)
+        for r in q.limit(5000).execute().data or []:
+            bump(r["tiktok_product_id"], r["platform"], "pending")
+    if view in ("no_match", "live"):
+        q = supabase.table("sourcing_jobs").select("product_id, platform, status, error, id").in_("status", ["done", "no_match"])
+        if platform:
+            q = q.eq("platform", platform)
+        last = {}
+        for r in q.order("id", desc=True).limit(20000).execute().data or []:
+            last.setdefault((str(r["product_id"]), r["platform"]), r)
+        for key, r in last.items():
+            if (view == "no_match" and r["status"] == "no_match") or (view == "live" and r["status"] == "done"):
+                c = counts.setdefault(key, {"pending": 0, "live": 0, "status": None})
+                c["status"], c["note"] = r["status"], (r.get("error") or "")[:200]
+        if view == "no_match":
+            counts = {k: v for k, v in counts.items() if v["status"] == "no_match"}
+    if view == "live":
+        counts = {k: v for k, v in counts.items() if v["status"] == "done"}
+
+    ids = list({pid for pid, _ in counts})[:1000]
+    products = {}
+    for i in range(0, len(ids), 200):
+        for p in supabase.table("tiktok_products").select(
+            "id, product_name, tiktok_price, thumbnail_url, image_storage_url, virality_score"
+        ).in_("id", ids[i:i + 200]).execute().data or []:
+            products[str(p["id"])] = p
+    items = [
+        {**products[pid], "platform": plat, **c}
+        for (pid, plat), c in counts.items() if pid in products
+    ]
+    items.sort(key=lambda x: (-(x.get("pending") or 0), -(x.get("virality_score") or 0)))
+    return {"view": view, "count": len(items), "items": items[:limit]}
+
+
+@app.get("/admin/review/products/{product_id}")
+async def admin_review_product(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
+    """Everything about one product's sourcing: live suppliers, near-misses, rejected, last runs."""
+    require_admin_user(request)
+    product = (supabase.table("tiktok_products").select(
+        "id, product_name, tiktok_price, thumbnail_url, image_storage_url, category, virality_score"
+    ).eq("id", product_id).single().execute().data)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    suppliers = (supabase.table("suppliers").select("*").eq("tiktok_product_id", product_id)
+                 .order("similarity", desc=True, nullsfirst=False).execute().data or [])
+    for s in suppliers:
+        s["visible"] = (not s.get("hidden")) and (
+            s.get("match_method") == "manual" or float(s.get("similarity") or 0) >= MIN_SIMILARITY)
+    candidates = (supabase.table("supplier_candidates").select("*").eq("tiktok_product_id", product_id)
+                  .in_("status", ["pending", "rejected"]).order("similarity", desc=True).execute().data or [])
+    jobs = (supabase.table("sourcing_jobs").select("platform, status, error, result_count, finished_at")
+            .eq("product_id", product_id).order("id", desc=True).limit(6).execute().data or [])
+    return {"product": product, "suppliers": suppliers, "candidates": candidates, "jobs": jobs,
+            "min_similarity": MIN_SIMILARITY}
+
+
+@app.post("/admin/candidates/{candidate_id}/approve")
+async def admin_approve_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+    admin = require_admin_user(request)
+    c = supabase.table("supplier_candidates").select("*").eq("id", candidate_id).single().execute().data
+    if not c:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if c["status"] == "approved":
+        return {"success": True, "supplier_id": c.get("supplier_id")}
+    row = {
+        "tiktok_product_id": c["tiktok_product_id"], "platform": c["platform"],
+        "supplier_name": c.get("supplier_name"), "product_title": c.get("product_title"),
+        "unit_cost_min": c.get("unit_cost_min"), "unit_cost_max": c.get("unit_cost_max"),
+        "moq": c.get("moq"), "supplier_url": c.get("supplier_url"), "image_url": c.get("image_url"),
+        "similarity": c.get("similarity"), "match_method": "manual",
+        "external_product_id": c.get("external_product_id"), "orders": c.get("orders"),
+        "rating": c.get("rating"), "years_on_platform": c.get("years_on_platform"),
+        "supplier_trust_score": min((c.get("years_on_platform") or 0) / 2, 5.0),
+        "verified_supplier": c.get("verified_supplier"),
+        "shipping_estimate_days": 20 if c["platform"] == "alibaba" else 10,
+        "whitelabel_available": c["platform"] == "alibaba",
+        "sourced_at": _now(), "reviewed_by": admin, "reviewed_at": _now(), "hidden": False,
+    }
+    saved = supabase.table("suppliers").insert(row).execute().data
+    sid = saved[0]["id"] if saved else None
+    supabase.table("supplier_candidates").update(
+        {"status": "approved", "reviewed_by": admin, "reviewed_at": _now(), "supplier_id": sid}
+    ).eq("id", candidate_id).execute()
+    return {"success": True, "supplier_id": sid}
+
+
+@app.post("/admin/candidates/{candidate_id}/reject")
+async def admin_reject_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+    admin = require_admin_user(request)
+    supabase.table("supplier_candidates").update(
+        {"status": "rejected", "reviewed_by": admin, "reviewed_at": _now()}
+    ).eq("id", candidate_id).execute()
+    return {"success": True}
+
+
+@app.post("/admin/candidates/{candidate_id}/reopen")
+async def admin_reopen_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+    """Undo a reject (or an approve: the supplier row it created is hidden)."""
+    admin = require_admin_user(request)
+    c = supabase.table("supplier_candidates").select("status, supplier_id").eq("id", candidate_id).single().execute().data
+    if not c:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if c.get("supplier_id"):
+        supabase.table("suppliers").update({"hidden": True, "reviewed_by": admin, "reviewed_at": _now()}).eq("id", c["supplier_id"]).execute()
+    supabase.table("supplier_candidates").update(
+        {"status": "pending", "reviewed_by": None, "reviewed_at": None, "supplier_id": None}
+    ).eq("id", candidate_id).execute()
+    return {"success": True}
+
+
+class SupplierVisibility(BaseModel):
+    hidden: bool
+
+
+@app.post("/admin/suppliers/{supplier_id}/visibility")
+async def admin_supplier_visibility(supplier_id: int, body: SupplierVisibility, request: Request,
+                                    api_key: str = Security(verify_api_key)):
+    """Hide a wrong auto-match from users (or show it again). Re-sourcing keeps it hidden."""
+    admin = require_admin_user(request)
+    supabase.table("suppliers").update(
+        {"hidden": body.hidden, "reviewed_by": admin, "reviewed_at": _now()}
+    ).eq("id", supplier_id).execute()
+    return {"success": True}
+
+
+class ManualSupplier(BaseModel):
+    product_id:    str
+    platform:      str
+    supplier_url:  str
+    supplier_name: str
+    unit_cost_min: float
+    unit_cost_max: Optional[float] = None
+    moq:           Optional[int] = None
+    image_url:     Optional[str] = None
+    product_title: Optional[str] = None
+
+
+@app.post("/admin/suppliers")
+async def admin_add_supplier(body: ManualSupplier, request: Request, api_key: str = Security(verify_api_key)):
+    """Add a supplier the search missed (paste the listing link)."""
+    admin = require_admin_user(request)
+    if body.platform not in ("alibaba", "aliexpress", "amazon"):
+        raise HTTPException(status_code=400, detail="Platform must be alibaba, aliexpress or amazon")
+    if not body.supplier_url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="Paste the full https:// link")
+    row = {
+        "tiktok_product_id": body.product_id, "platform": body.platform,
+        "supplier_name": body.supplier_name.strip(), "product_title": body.product_title,
+        "unit_cost_min": body.unit_cost_min, "unit_cost_max": body.unit_cost_max or body.unit_cost_min,
+        "moq": body.moq, "supplier_url": body.supplier_url.strip(), "image_url": body.image_url,
+        "similarity": None, "match_method": "manual", "hidden": False,
+        "shipping_estimate_days": 20 if body.platform == "alibaba" else 10,
+        "whitelabel_available": body.platform == "alibaba",
+        "sourced_at": _now(), "reviewed_by": admin, "reviewed_at": _now(),
+    }
+    saved = supabase.table("suppliers").insert(row).execute().data
+    return {"success": True, "supplier": saved[0] if saved else row}

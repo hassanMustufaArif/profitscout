@@ -6,7 +6,8 @@ One place for all credit logic. The rules:
 - Allowance per 30-day period: Free 5, Pro 50, Ultimate 120 (see plan_allowance() in SQL).
 - Plan is read from users.plan only. user_credits.plan just mirrors it.
 - When a period ends, credits reset to the plan allowance. Free resets to 5, never 0.
-- A search costs 1 credit only when it returns usable suppliers.
+- Opening a product+platform costs 1 credit only when it has photo-verified suppliers.
+- A new period starts on every successful subscription payment (Lemon Squeezy webhook).
 - Reopening a product+platform you already unlocked is free.
 - Cached results are free.
 - If the database is down we fail CLOSED (no free unlimited searches).
@@ -73,6 +74,12 @@ def consume(user_email: str, product_id: str, platform: str, mode: str = "text")
     if not isinstance(data, dict):
         raise CreditError("consume_credit returned no data")
     return data
+
+
+def start_period(user_email: str) -> dict:
+    """New 30-day period at the plan allowance (called on each successful subscription payment)."""
+    data = _rpc("start_credit_period", {"p_email": user_email})
+    return data if isinstance(data, dict) else {}
 
 
 def refund(user_email: str, product_id: str, platform: str) -> None:

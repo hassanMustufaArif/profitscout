@@ -30,7 +30,7 @@ load_dotenv()
 
 # ─── CLIENTS ──────────────────────────────────────────────────────────────────
 apify    = ApifyClient(os.getenv("APIFY_API_TOKEN"))
-openai   = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai   = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
