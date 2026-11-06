@@ -252,9 +252,9 @@ def growth_from_history(sb: Client, pid: str, end: str, days: int):
     return prev
 
 
-def import_products(paths, dry_run=False, rehost=False, deactivate=False):
+def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=print):
     rows = load_rows(paths)
-    print(f"{len(rows)} rows from {len(paths)} file pattern(s)")
+    log(f"{len(rows)} rows from {len(paths)} file pattern(s)")
     parsed, problems = {}, []
     for r in rows:
         out, err = parse_product(r)
@@ -268,13 +268,18 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False):
         parsed[p["tiktok_product_id"]] = (p, snap)
 
     flagged = [(p["product_name"][:60], quality_flags(p)) for p, _ in parsed.values() if quality_flags(p)]
-    print(f"{len(parsed)} unique products, {len(problems)} skipped, {len(flagged)} with quality flags")
+    log(f"{len(parsed)} unique products, {len(problems)} skipped, {len(flagged)} with quality flags")
     for name, f in flagged[:25]:
-        print(f"  ⚠ {name}: {', '.join(f)}")
+        log(f"  ⚠ {name}: {', '.join(f)}")
+    for err in problems[:5]:
+        log(f"  {err}")
 
+    if not parsed:
+        log("No products found in these files. Is this a Kalodata product export?")
+        return {"products": 0, "skipped": len(problems), "flagged": 0}
     if dry_run:
-        print("Dry run: nothing written.")
-        return
+        log("Dry run: nothing written.")
+        return {"products": len(parsed), "skipped": len(problems), "flagged": len(flagged)}
 
     sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     items = list(parsed.values())
@@ -306,7 +311,7 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False):
 
     for i in range(0, len(records), BATCH):
         sb.table("tiktok_products").upsert(records[i:i + BATCH], on_conflict="tiktok_product_id").execute()
-        print(f"  upserted {min(i + BATCH, len(records))}/{len(records)}")
+        log(f"  upserted {min(i + BATCH, len(records))}/{len(records)}")
 
     # 3) cached suppliers were matched against the old title/price: keep them, the
     #    profit is recalculated live from tiktok_price on every request.
@@ -317,8 +322,23 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False):
         cutoff = str(newest - timedelta(days=21))
         sb.table("tiktok_products").update({"is_active": False}).is_("data_end_date", "null").execute()
         sb.table("tiktok_products").update({"is_active": False}).lt("data_end_date", cutoff).execute()
-        print(f"  retired v1 rows and products last seen before {cutoff}")
-    print("Done.")
+        log(f"  retired v1 rows and products last seen before {cutoff}")
+    log("Done.")
+
+
+def detect_kind(path: str) -> str | None:
+    """products / creators / shops from the CSV header (Kalodata exports), else None."""
+    rows = load_rows([path])
+    if not rows:
+        return None
+    cols = set(rows[0].keys())
+    if cols & set(CREATOR_MAP["tiktok_handle"]) and not cols & {"Product Name"}:
+        return "creators"
+    if "Product Name" in cols and "Date Range" in cols:
+        return "products"
+    if cols & set(SHOP_MAP["shop_name"]):
+        return "shops"
+    return None
 
 
 # ─── creators ────────────────────────────────────────────────────────────────
@@ -343,13 +363,13 @@ CREATOR_MAP = {
 }
 
 
-def import_creators(paths, dry_run=False):
+def import_creators(paths, dry_run=False, log=print):
     rows = load_rows(paths)
     if rows:
         known = {n for names in CREATOR_MAP.values() for n in names} | {"_file", "Date Range", "KalodataUrl"}
         unmapped = [c for c in rows[0].keys() if c not in known]
         if unmapped:
-            print(f"Columns not imported (tell Hark if you need them): {unmapped}")
+            log(f"Columns not imported (tell Hark if you need them): {unmapped}")
     records = {}
     for r in rows:
         rec = {}
@@ -376,14 +396,14 @@ def import_creators(paths, dry_run=False):
         _, end, _ = date_range(col(r, "Date Range"))
         rec["data_end_date"] = str(end) if end else None
         records[handle] = {k: v for k, v in rec.items() if v is not None}
-    print(f"{len(records)} creators parsed")
+    log(f"{len(records)} creators parsed")
     if dry_run or not records:
         return
     sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     vals = list(records.values())
     for i in range(0, len(vals), BATCH):
         sb.table("creators").upsert(vals[i:i + BATCH], on_conflict="tiktok_handle").execute()
-    print("Done.")
+    log("Done.")
 
 
 
@@ -408,13 +428,13 @@ SHOP_MAP = {   # field names = what the app reads (Products page > New shops tab
 }
 
 
-def import_shops(paths, dry_run=False):
+def import_shops(paths, dry_run=False, log=print):
     rows = load_rows(paths)
     if rows:
         known = {n for names in SHOP_MAP.values() for n in names} | {"_file", "Date Range", "KalodataUrl", "img_url"}
         unmapped = [c for c in rows[0].keys() if c not in known]
         if unmapped:
-            print(f"Columns not imported (tell Hark if you need them): {unmapped}")
+            log(f"Columns not imported (tell Hark if you need them): {unmapped}")
     records = {}
     for r in rows:
         rec = {}
@@ -437,14 +457,14 @@ def import_shops(paths, dry_run=False):
         _, end, _ = date_range(col(r, "Date Range"))
         rec["data_end_date"] = str(end) if end else None
         records[name.lower()] = {k: v for k, v in rec.items() if v is not None}
-    print(f"{len(records)} shops parsed")
+    log(f"{len(records)} shops parsed")
     if dry_run or not records:
         return
     sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     vals = list(records.values())
     for i in range(0, len(vals), BATCH):
         sb.table("shops").upsert(vals[i:i + BATCH], on_conflict="shop_name").execute()
-    print("Done.")
+    log("Done.")
 
 
 if __name__ == "__main__":

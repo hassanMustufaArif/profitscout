@@ -1,0 +1,85 @@
+# "Find suppliers" button on tikprofitpro.shop/admin/upload starts this.
+# You can also start it by hand: GitHub > Actions > Find suppliers > Run workflow.
+# Repo secrets needed (Settings > Secrets and variables > Actions):
+#   SUPABASE_URL, SUPABASE_KEY (service_role), OXYLABS_USER, OXYLABS_PASS
+name: Find suppliers
+run-name: Find suppliers (${{ inputs.mode }}, max ${{ inputs.max_requests }}) ${{ inputs.started_by }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "new = products never sourced, all = redo every active product"
+        type: choice
+        options: [new, all]
+        default: new
+      max_requests:
+        description: "Max paid Oxylabs results this run"
+        default: "1500"
+      limit:
+        description: "Max products (0 = no limit)"
+        default: "0"
+      started_by:
+        description: "Who started it"
+        default: ""
+
+concurrency:
+  group: presource
+  cancel-in-progress: false
+
+jobs:
+  presource:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      OXYLABS_USER: ${{ secrets.OXYLABS_USER }}
+      OXYLABS_PASS: ${{ secrets.OXYLABS_PASS }}
+      SOURCING_MIN_SIMILARITY: ${{ vars.SOURCING_MIN_SIMILARITY || '0.80' }}
+      SOURCING_REVIEW_MIN_SIMILARITY: ${{ vars.SOURCING_REVIEW_MIN_SIMILARITY || '0.60' }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            sourcing
+            requirements-presource.txt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-presource.txt
+
+      - name: Cache image model
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/clip
+            ~/.cache/torch
+          key: clip-vit-b-32-v1
+
+      - name: Install
+        run: pip install -r requirements-presource.txt
+
+      - name: Check secrets
+        run: |
+          for v in SUPABASE_URL SUPABASE_KEY OXYLABS_USER OXYLABS_PASS; do
+            if [ -z "${!v}" ]; then echo "::error::Repo secret $v is missing"; exit 1; fi
+          done
+
+      - name: Find suppliers
+        run: |
+          ARGS="--max-requests ${{ inputs.max_requests }}"
+          if [ "${{ inputs.mode }}" = "all" ]; then ARGS="$ARGS --stale-days 0"; else ARGS="$ARGS --new"; fi
+          if [ "${{ inputs.limit }}" != "0" ]; then ARGS="$ARGS --limit ${{ inputs.limit }}"; fi
+          echo "python -m sourcing.presource $ARGS"
+          python -m sourcing.presource $ARGS | tee presource.log
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Find suppliers" >> $GITHUB_STEP_SUMMARY
+          tail -n 3 presource.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "No log" >> $GITHUB_STEP_SUMMARY

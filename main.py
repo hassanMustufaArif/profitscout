@@ -1637,3 +1637,178 @@ async def admin_add_supplier(body: ManualSupplier, request: Request, api_key: st
     }
     saved = supabase.table("suppliers").insert(row).execute().data
     return {"success": True, "supplier": saved[0] if saved else row}
+
+
+# ==============================================================================
+# ADMIN: weekly data upload + supplier sourcing (no PC needed)
+#   /admin/upload page in the app uses these.
+#   1) POST /admin/import          upload Kalodata CSVs; dry_run=true previews, false imports (background)
+#   2) GET  /admin/import/{job}    progress + log of an import
+#   3) POST /admin/sourcing/run    starts the "Find suppliers" GitHub Actions workflow
+#   4) GET  /admin/sourcing/runs   last runs of that workflow
+# Render env for 3/4: GITHUB_ACTIONS_TOKEN (fine-grained token, Actions: read and write on the
+# backend repo), optional GITHUB_REPO (default sodewala45/profitscout), GITHUB_REF (default main).
+# ==============================================================================
+import threading as _threading
+import uuid as _uuid
+import shutil as _shutil
+from typing import List as _List
+from fastapi import Form
+
+import import_kalodata as _kalo
+
+_IMPORT_JOBS: dict = {}
+_IMPORT_LOCK = _threading.Lock()
+_MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+_GH_REPO = os.getenv("GITHUB_REPO", "sodewala45/profitscout")
+_GH_REF = os.getenv("GITHUB_REF", "main")
+_GH_WORKFLOW = os.getenv("GITHUB_SOURCING_WORKFLOW", "presource.yml")
+
+
+def _run_import(job: dict, files: list, dry_run: bool, rehost: bool, deactivate: bool):
+    def log(msg=""):
+        job["log"].append(str(msg))
+        job["log"] = job["log"][-400:]
+    try:
+        groups = {"products": [], "creators": [], "shops": []}
+        for f in files:
+            if f["kind"] in groups:
+                groups[f["kind"]].append(f["path"])
+        summary = {}
+        if groups["products"]:
+            log(f"== Products ({len(groups['products'])} file(s))")
+            summary["products"] = _kalo.import_products(groups["products"], dry_run, rehost, deactivate, log=log)
+        if groups["creators"]:
+            log(f"== Creators ({len(groups['creators'])} file(s))")
+            _kalo.import_creators(groups["creators"], dry_run, log=log)
+        if groups["shops"]:
+            log(f"== Shops ({len(groups['shops'])} file(s))")
+            _kalo.import_shops(groups["shops"], dry_run, log=log)
+        job["summary"] = summary
+        job["status"] = "done"
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = type(e).__name__
+        log(f"Stopped: {type(e).__name__}: {str(e)[:300]}")
+    finally:
+        job["finished_at"] = _now()
+        _shutil.rmtree(job["dir"], ignore_errors=True)
+        if not dry_run and _IMPORT_LOCK.locked():
+            _IMPORT_LOCK.release()
+
+
+@app.post("/admin/import")
+async def admin_import(
+    request: Request,
+    files: _List[UploadFile] = File(...),
+    dry_run: bool = Form(True),
+    deactivate: bool = Form(True),
+    rehost: bool = Form(True),
+    api_key: str = Security(verify_api_key),
+):
+    """Upload Kalodata CSV exports. Each file's type (products / creators / shops) is read from its columns."""
+    admin = require_admin_user(request)
+    if not files:
+        raise HTTPException(status_code=400, detail="Add at least one CSV file")
+    folder = tempfile.mkdtemp(prefix="kalo_")
+    saved, total = [], 0
+    for up in files:
+        name = os.path.basename(up.filename or "file.csv")
+        if not name.lower().endswith(".csv"):
+            _shutil.rmtree(folder, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=f"{name} is not a .csv file")
+        data = await up.read()
+        total += len(data)
+        if total > _MAX_UPLOAD_BYTES:
+            _shutil.rmtree(folder, ignore_errors=True)
+            raise HTTPException(status_code=413, detail="Files are larger than 30 MB in total")
+        path = os.path.join(folder, f"{len(saved)}_{name}")
+        with open(path, "wb") as fh:
+            fh.write(data)
+        saved.append({"name": name, "path": path, "kind": _kalo.detect_kind(path), "bytes": len(data)})
+
+    unknown = [f["name"] for f in saved if not f["kind"]]
+    job = {"id": _uuid.uuid4().hex[:12], "status": "running", "dry_run": dry_run, "by": admin,
+           "started_at": _now(), "finished_at": None, "log": [], "dir": folder,
+           "files": [{k: f[k] for k in ("name", "kind", "bytes")} for f in saved]}
+    if unknown:
+        job["log"].append(f"Not recognised as a Kalodata export, skipped: {', '.join(unknown)}")
+    if not any(f["kind"] for f in saved):
+        _shutil.rmtree(folder, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="None of these files look like Kalodata product, creator or shop exports")
+
+    if dry_run:  # fast, writes nothing: run it now and answer with the preview
+        _run_import(job, saved, True, False, False)
+        return {k: v for k, v in job.items() if k != "dir"}
+
+    if not _IMPORT_LOCK.acquire(blocking=False):
+        _shutil.rmtree(folder, ignore_errors=True)
+        raise HTTPException(status_code=409, detail="An import is already running. Wait for it to finish.")
+    _IMPORT_JOBS[job["id"]] = job
+    for old in sorted(_IMPORT_JOBS, key=lambda j: _IMPORT_JOBS[j]["started_at"])[:-10]:
+        _IMPORT_JOBS.pop(old, None)
+    _threading.Thread(target=_run_import, args=(job, saved, False, rehost, deactivate), daemon=True).start()
+    return {k: v for k, v in job.items() if k != "dir"}
+
+
+@app.get("/admin/import/{job_id}")
+async def admin_import_status(job_id: str, request: Request, api_key: str = Security(verify_api_key)):
+    require_admin_user(request)
+    job = _IMPORT_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Import not found (the server may have restarted). Run it again; it's safe to repeat.")
+    return {k: v for k, v in job.items() if k != "dir"}
+
+
+@app.get("/admin/import")
+async def admin_import_list(request: Request, api_key: str = Security(verify_api_key)):
+    require_admin_user(request)
+    jobs = sorted(_IMPORT_JOBS.values(), key=lambda j: j["started_at"], reverse=True)
+    return {"imports": [{k: v for k, v in j.items() if k not in ("dir", "log")} for j in jobs]}
+
+
+def _gh_headers():
+    token = os.getenv("GITHUB_ACTIONS_TOKEN", "")
+    if not token:
+        raise HTTPException(status_code=503, detail="Supplier search isn't set up yet: add GITHUB_ACTIONS_TOKEN on Render")
+    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"}
+
+
+class SourcingRun(BaseModel):
+    mode: str = "new"          # new = products never sourced; all = every active product again
+    max_requests: int = 1500   # cap on paid Oxylabs results this run
+    limit: int = 0             # 0 = no limit
+
+
+@app.post("/admin/sourcing/run")
+async def admin_sourcing_run(body: SourcingRun, request: Request, api_key: str = Security(verify_api_key)):
+    admin = require_admin_user(request)
+    if body.mode not in ("new", "all"):
+        raise HTTPException(status_code=400, detail="mode must be new or all")
+    max_req = max(10, min(int(body.max_requests), 5000))
+    url = f"https://api.github.com/repos/{_GH_REPO}/actions/workflows/{_GH_WORKFLOW}/dispatches"
+    payload = {"ref": _GH_REF, "inputs": {"mode": body.mode, "max_requests": str(max_req),
+                                          "limit": str(max(0, int(body.limit))), "started_by": admin}}
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(url, headers=_gh_headers(), json=payload)
+    if r.status_code != 204:
+        msg = {401: "GitHub token is wrong or expired", 403: "GitHub token can't run Actions on this repo",
+               404: "Workflow not found: check GITHUB_REPO and that .github/workflows/presource.yml is on main",
+               422: "GitHub refused the inputs"}.get(r.status_code, f"GitHub error {r.status_code}")
+        raise HTTPException(status_code=502, detail=msg)
+    return {"success": True, "message": "Supplier search started. It takes about 1 to 3 hours for a full run."}
+
+
+@app.get("/admin/sourcing/runs")
+async def admin_sourcing_runs(request: Request, api_key: str = Security(verify_api_key)):
+    require_admin_user(request)
+    url = f"https://api.github.com/repos/{_GH_REPO}/actions/workflows/{_GH_WORKFLOW}/runs?per_page=5"
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(url, headers=_gh_headers())
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"GitHub error {r.status_code}")
+    runs = [{"id": x["id"], "status": x["status"], "conclusion": x.get("conclusion"),
+             "created_at": x["created_at"], "updated_at": x["updated_at"], "url": x["html_url"],
+             "title": x.get("display_title")} for x in r.json().get("workflow_runs", [])]
+    return {"runs": runs}
