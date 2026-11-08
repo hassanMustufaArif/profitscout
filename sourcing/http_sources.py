@@ -92,7 +92,8 @@ def _as_jpeg(photo: bytes) -> bytes:
 def alibaba_by_image(photo: bytes, budget: Budget) -> list[dict]:
     """Alibaba's own image-search JSON API (the one its results page calls). Free; Oxylabs only if blocked."""
     key = alibaba_upload(_as_jpeg(photo))
-    params = {"appName": "magellan", "appKey": "a5m1ismomeptugvfmkkjnwwqnwyrhpb1", "imageType": "oss",
+    # appKey below is Alibaba's PUBLIC web client id (sent by every browser on alibaba.com), not a secret.
+    params = {"appName": "magellan", "appKey": "a5m1ismomeptugvfmkkjnwwqnwyrhpb1", "imageType": "oss",  # gitleaks:allow
               "imageAddress": "/" + key, "beginPage": 1, "pageSize": 40, "language": "en_US"}
     data = None
     try:

@@ -93,6 +93,24 @@ def date_range(v):
     return s, e, (e - s).days + 1
 
 
+def latest_allowed_date() -> date:
+    """A Kalodata export can't end in the future. Anything after tomorrow (UTC) is a bad row:
+    trusting it would make --deactivate retire the whole catalogue."""
+    return datetime.now(timezone.utc).date() + timedelta(days=1)
+
+
+def http_url(v):
+    """Keep only absolute http(s) links (drops javascript:, data:, relative junk) so nothing
+    the CSV says ends up as a dangerous href/src in the app or is fetched server-side."""
+    if not v:
+        return None
+    v = str(v).strip()
+    if any(c in v for c in (" ", "\n", "\r", "\t")):
+        return None
+    m = re.match(r"^(https?)://([^/?#]+)", v, re.I)
+    return v if m and "@" not in m.group(2) else None
+
+
 def tiktok_id(row):
     for key in ("TikTokUrl", "KalodataUrl"):
         url = row.get(key) or ""
@@ -148,7 +166,9 @@ def momentum_score(rev_per_day, growth_pct, creators, conv_pct, rating):
 def load_rows(paths):
     rows = []
     for p in paths:
-        for f in glob.glob(p):
+        # Uploaded files are passed as exact paths; only fall back to glob for CLI patterns, so
+        # [ ] * ? in an uploaded filename can't skip the file or match its neighbours.
+        for f in ([p] if os.path.exists(p) else glob.glob(p)):
             try:
                 with open(f, newline="", encoding="utf-8-sig") as fh:
                     rows += [dict(r, _file=os.path.basename(f)) for r in csv.DictReader(fh)]
@@ -164,6 +184,8 @@ def parse_product(row):
     start, end, days = date_range(col(row, "Date Range"))
     if not pid or not name or not end:
         return None, f"skipped (missing id/name/date range): {name[:50]}"
+    if end > latest_allowed_date():
+        return None, f"skipped (date range ends in the future, {end}): {name[:50]}"
     pmin, pmax = price_range(col(row, "Price($)"))
     avg_price = num(col(row, "Avg. Unit Price($)")) or pmin
     revenue = num(col(row, "Revenue($)"))
@@ -191,7 +213,7 @@ def parse_product(row):
         "live_revenue": num(col(row, "Live Revenue($)")),
         "video_revenue": num(col(row, "Video Revenue($)")),
         "tiktok_product_url": f"https://www.tiktok.com/shop/pdp/{pid}",
-        "thumbnail_url": col(row, "img_url") or "",
+        "thumbnail_url": http_url(col(row, "img_url")) or "",
         "scraped_at": datetime.now(timezone.utc).isoformat(),
         "is_active": True,
     }
@@ -318,7 +340,7 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
 
     # 4) retire stale rows: v1 rows (no data_end_date) and anything not seen for 3+ weeks
     if deactivate:
-        newest = max(parse_date(p["data_end_date"]) for p, _ in items)
+        newest = min(max(parse_date(p["data_end_date"]) for p, _ in items), latest_allowed_date())
         cutoff = str(newest - timedelta(days=21))
         sb.table("tiktok_products").update({"is_active": False}).is_("data_end_date", "null").execute()
         sb.table("tiktok_products").update({"is_active": False}).lt("data_end_date", cutoff).execute()
@@ -387,14 +409,14 @@ def import_creators(paths, dry_run=False, log=print):
         if not handle:
             continue
         rec["tiktok_handle"] = handle
-        rec["profile_url"] = rec.get("profile_url") or f"https://www.tiktok.com/@{handle}"
+        rec["profile_url"] = http_url(rec.get("profile_url")) or f"https://www.tiktok.com/@{handle}"
         # columns the app reads (Products page > Creators tab)
         rec["username"] = handle
         rec["tiktok_url"] = rec["profile_url"]
         rec["niche"] = rec.get("category")
         rec["products_promoted"] = rec.get("product_count")
         _, end, _ = date_range(col(r, "Date Range"))
-        rec["data_end_date"] = str(end) if end else None
+        rec["data_end_date"] = str(end) if end and end <= latest_allowed_date() else None
         records[handle] = {k: v for k, v in rec.items() if v is not None}
     log(f"{len(records)} creators parsed")
     if dry_run or not records:
@@ -453,9 +475,10 @@ def import_shops(paths, dry_run=False, log=print):
         if not name:
             continue
         rec["shop_name"] = name
-        rec["image_url"] = col(r, "img_url", "Logo")
+        rec["image_url"] = http_url(col(r, "img_url", "Logo"))
+        rec["shop_url"] = http_url(rec.get("shop_url"))
         _, end, _ = date_range(col(r, "Date Range"))
-        rec["data_end_date"] = str(end) if end else None
+        rec["data_end_date"] = str(end) if end and end <= latest_allowed_date() else None
         records[name.lower()] = {k: v for k, v in rec.items() if v is not None}
     log(f"{len(records)} shops parsed")
     if dry_run or not records:
