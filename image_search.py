@@ -50,17 +50,14 @@ _UA = {"User-Agent": "Mozilla/5.0 (TikProfitPro image fetch)"}
 # helpers
 # ---------------------------------------------------------------------------
 def fetch_image_bytes(url: str, max_bytes: int = 4_000_000) -> Optional[bytes]:
-    """Download an image. TikTok CDN links expire, so this can return None."""
+    """Download an image. TikTok CDN links expire, so this can return None.
+    Uses security.safe_fetch: http(s) only, no private/internal addresses (checked on every
+    redirect), streamed with a byte cap. Images larger than max_bytes are refused, not truncated."""
     if not url:
         return None
-    try:
-        with httpx.Client(timeout=15, follow_redirects=True, headers=_UA) as c:
-            r = c.get(url)
-        if r.status_code != 200 or not r.headers.get("content-type", "").startswith("image"):
-            return None
-        return r.content[:max_bytes]
-    except Exception:
-        return None
+    from security import safe_fetch
+    r = safe_fetch(url, max_bytes=max_bytes, timeout=15, content_type_prefix="image", headers=_UA)
+    return r.content if r else None
 
 
 def _data_url(img: bytes) -> str:

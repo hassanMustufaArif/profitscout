@@ -2,7 +2,7 @@
 ProfitScout — FastAPI Backend
 =============================
 Run with:  uvicorn main:app --reload
-API Docs:  http://127.0.0.1:8000/docs
+API Docs:  http://127.0.0.1:8000/docs  (only when ENABLE_DOCS=true)
 """
 from fastapi.responses import PlainTextResponse
 import os
@@ -27,13 +27,26 @@ from typing import Optional
 import hmac
 import hashlib
 import json
-import pdfplumber
+import logging
 import tempfile
+import threading
+from fastapi import Depends
+from fastapi.concurrency import run_in_threadpool
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from limits import parse as _parse_limit
+from limits.storage import MemoryStorage
+from limits.strategies import MovingWindowRateLimiter
+from security import (normalize_plan, is_paid, normalize_email, email_hash, parse_uuid,
+                      client_ip, safe_fetch, is_http_url)
+from supplier_engine import SUPPLIER_PUBLIC_COLUMNS, public_supplier
 
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+from openai import OpenAI as _SyncOpenAI
+openai_sync_client = _SyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 ADZUNA_ID  = os.environ.get("ADZUNA_APP_ID", "")
 ADZUNA_KEY = os.environ.get("ADZUNA_APP_KEY", "")
@@ -42,14 +55,98 @@ class GenerateListingRequest(BaseModel):
     product_name: str
     price: float
     category: str = ""
-    image_url: str = ""
+    product_id: Optional[str] = None   # preferred: the server looks up the product's own image
+    image_url: str = ""                # legacy: ignored when product_id is given
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-app = FastAPI()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("tikprofitpro")
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Interactive docs map every admin/legacy route: off unless ENABLE_DOCS=true.
+ENABLE_DOCS = _env_flag("ENABLE_DOCS")
+# Old blog / job-board / CV / AI-proxy / autopilot routes: 404 unless ENABLE_LEGACY_ENDPOINTS=true.
+ENABLE_LEGACY_ENDPOINTS = _env_flag("ENABLE_LEGACY_ENDPOINTS")
+
+app = FastAPI(
+    docs_url="/docs" if ENABLE_DOCS else None,
+    redoc_url="/redoc" if ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_DOCS else None,
+)
+
+GENERIC_ERROR = "Something went wrong on our side. Please try again in a minute."
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error(request: Request, exc: Exception):
+    # Never send exception text to clients (it leaks schema / upstream details). Log it instead.
+    logger.exception("unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse({"detail": GENERIC_ERROR}, status_code=500)
+
+
+def server_error(where: str) -> HTTPException:
+    """Log the current exception server-side and return a generic 500 for the client."""
+    logger.exception("%s failed", where)
+    return HTTPException(status_code=500, detail=GENERIC_ERROR)
+
+
+def require_legacy():
+    """Dependency: legacy routes answer 404 unless ENABLE_LEGACY_ENDPOINTS=true. Runs before auth."""
+    if not ENABLE_LEGACY_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+# ------------------------------------------------------------------------------
+# Rate limiting (in-memory, per process). Keyed by signed-in user id, else client IP.
+# ------------------------------------------------------------------------------
+def resolve_user(request: Request):
+    """Dependency (sync, so it runs in the threadpool): verifies the bearer token once and caches
+    the user on request.state for the limiter key, auth checks and the handler."""
+    return credits_v2.user_from_request(request)
+
+
+def user_or_ip_key(request: Request) -> str:
+    u = getattr(request.state, "auth_user", None)
+    return f"user:{u.id}" if u else f"ip:{client_ip(request)}"
+
+
+def ip_key(request: Request) -> str:
+    return f"ip:{client_ip(request)}"
+
+
+limiter = Limiter(key_func=user_or_ip_key, storage_uri="memory://", headers_enabled=False)
+app.state.limiter = limiter
+
+LIST_LIMIT = os.getenv("RATE_LIMIT_LIST", "60/minute")
+SUPPLIER_LIMIT = os.getenv("RATE_LIMIT_SUPPLIER", "10/minute")
+AMAZON_LIMIT = os.getenv("RATE_LIMIT_AMAZON", "3/minute")
+LISTING_LIMIT = os.getenv("RATE_LIMIT_LISTING", "20/day")
+CHECKOUT_LIMIT = os.getenv("RATE_LIMIT_CHECKOUT", "5/minute")
+ADMIN_LIMIT = os.getenv("RATE_LIMIT_ADMIN", "30/minute")
+POLL_LIMIT = os.getenv("RATE_LIMIT_POLL", "60/minute")
+
+# For limits checked inside a handler (Amazon is one platform of a shared route).
+_manual_limits = MovingWindowRateLimiter(MemoryStorage())
+
+
+def check_limit(limit: str, scope: str, key: str) -> None:
+    if not _manual_limits.hit(_parse_limit(limit), scope, key):
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute and try again.")
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limited(request: Request, exc: RateLimitExceeded):
+    return JSONResponse({"detail": "Too many requests. Please wait a minute and try again.",
+                         "code": "rate_limited"}, status_code=429)
+
 
 def scheduled_autopilot():
     try:
@@ -82,7 +179,9 @@ API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 async def verify_api_key(request: Request, api_key: str = Security(API_KEY_HEADER)):
     if request.method == "OPTIONS":
         return None
-    if not api_key or api_key != os.getenv("API_KEY"):
+    # Note: this key ships in the public JS bundle. It identifies the app, it is NOT auth.
+    expected = os.getenv("API_KEY") or ""
+    if not api_key or not expected or not hmac.compare_digest(api_key.encode(), expected.encode()):
         raise HTTPException(status_code=403, detail="Forbidden")
     return api_key
 
@@ -98,55 +197,105 @@ def require_admin(request: Request):
 
 
 FREE_PRODUCT_LIMIT = 10
+FREE_CACHE_SECONDS = 300
 MIN_SIMILARITY = float(os.getenv("SOURCING_MIN_SIMILARITY", "0.80"))
+UPGRADE_MESSAGE = "This product is part of the Pro catalogue. Upgrade to Pro to see it."
 
 
 def gate_list(plan: str, limit: int, offset: int) -> tuple[int, int]:
-    """Free (and signed-out) users see the top 10 only, on every list endpoint."""
-    if plan not in ("pro", "ultimate"):
+    """Kept for compatibility. Unpaid callers no longer reach a filtered query at all (see free_top_*)."""
+    if not is_paid(plan):
         return min(limit, FREE_PRODUCT_LIMIT), 0
     return limit, offset
 
 
-async def get_user_plan(request: Request):
-    """Extract user email from Supabase auth token and return their plan."""
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        print("get_user_plan: No auth header found")
+def get_user_plan(request: Request) -> str:
+    """Plan of the signed-in caller: 'free' (also for signed-out), 'pro' or 'ultimate'. Sync on purpose:
+    callers are plain `def` routes, so the GoTrue + DB round-trips run in the threadpool."""
+    user = credits_v2.user_from_request(request)
+    if not user:
         return "free"
-
-    token = auth_header.replace("Bearer ", "")
     try:
-        user_response = supabase.auth.get_user(token)
-        email = user_response.user.email
-        print(f"get_user_plan: email={email}")
-        result = supabase.table("users").select("plan").eq("user_email", email).execute()
-        print(f"get_user_plan: result={result.data}")
-        plan = result.data[0].get("plan", "free") if result.data else "free"
-        ensure_user_credits(email, plan)  # Auto-create credits if not exist
-        return plan
-    except Exception as e:
-        print(f"get_user_plan ERROR: {e}")
+        result = supabase.table("users").select("plan").eq("user_email", user.email).limit(1).execute()
+        plan = normalize_plan(result.data[0].get("plan") if result.data else None)
+    except Exception:
+        logger.exception("get_user_plan failed")
         return "free"
+    ensure_user_credits(user.email, plan)  # Auto-create credits if not exist
+    return plan
+
 
 def ensure_user_credits(user_email: str, plan: str):
     """Create/roll over the credit row. Plan comes from users.plan inside the DB function."""
     try:
         credits_v2.get_balance(user_email)
-    except Exception as e:
-        print(f"ensure_user_credits error: {e}")
+    except Exception:
+        logger.warning("ensure_user_credits failed for user %s", email_hash(user_email))
+
+
+# ------------------------------------------------------------------------------
+# Free tier: ONE fixed top-10 per list, whatever filters / sort / offset / q the caller sends.
+# Otherwise sliding filter windows enumerate the whole paid catalogue (audit H2).
+# ------------------------------------------------------------------------------
+_free_cache: dict = {}
+_free_cache_lock = threading.Lock()
+
+
+def _cached_top(name: str, loader) -> list:
+    now = time.time()
+    with _free_cache_lock:
+        hit = _free_cache.get(name)
+        if hit and now - hit[0] < FREE_CACHE_SECONDS:
+            return [dict(r) for r in hit[1]]
+    rows = loader() or []
+    with _free_cache_lock:
+        _free_cache[name] = (now, rows)
+    return [dict(r) for r in rows]
+
+
+def free_top_products() -> list:
+    return _cached_top("products", lambda: (
+        supabase.table("tiktok_products").select("*")
+        .eq("is_active", True)
+        .order("virality_score", desc=True).order("id")
+        .limit(FREE_PRODUCT_LIMIT).execute().data))
+
+
+def free_top_product_ids() -> set:
+    return {str(p.get("id")) for p in free_top_products()}
+
+
+def free_top_creators() -> list:
+    rows = _cached_top("creators", lambda: (
+        supabase.table("creators").select("*")
+        .order("gmv_total", desc=True, nullsfirst=False).order("tiktok_handle")
+        .limit(FREE_PRODUCT_LIMIT).execute().data))
+    for r in rows:                      # contact details are a paid feature
+        r.pop("contact_email", None)
+        r["contact_locked"] = True
+    return rows
+
+
+def free_top_shops() -> tuple[list, Optional[int]]:
+    rows = _cached_top("shops", lambda: (
+        supabase.table("shops").select("*")
+        .order("gmv_total", desc=True, nullsfirst=False).order("shop_name")
+        .limit(FREE_PRODUCT_LIMIT).execute().data))
+    return rows, None
 
 # ==============================================================================
 # ENDPOINT 1 — Health Check
 # ==============================================================================
 @app.get("/")
 def root():
-    return {
+    out = {
         "status": "running",
         "app": "ProfitScout API",
         "version": "2.0.0",
-        "docs": "/docs"
     }
+    if ENABLE_DOCS:
+        out["docs"] = "/docs"
+    return out
 
 
 @app.get("/ping")
@@ -158,7 +307,8 @@ def ping():
 # ENDPOINT 2 — Get All Products (with filters + plan gating)
 # ==============================================================================
 @app.get("/products")
-async def get_products(
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def get_products(
     request:     Request,
     min_score:   int            = Query(default=0,   ge=0, le=100),
     max_score:   int            = Query(default=100, ge=0, le=100),
@@ -170,13 +320,12 @@ async def get_products(
     offset:      int            = Query(default=0,   ge=0),
     api_key:     str            = Security(verify_api_key),
 ):
+    plan = get_user_plan(request)
     try:
-        plan = await get_user_plan(request)
-
-        # Free users: max 10 products, no offset
-        if plan == "free":
-            limit = min(limit, 10)
-            offset = 0
+        if not is_paid(plan):
+            rows = free_top_products()
+            return {"success": True, "count": len(rows), "offset": 0, "limit": FREE_PRODUCT_LIMIT,
+                    "plan": plan, "products": rows}
 
         query = (
             supabase.table("tiktok_products")
@@ -208,46 +357,50 @@ async def get_products(
             "products": result.data
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise server_error("/products")
 
 
 # ==============================================================================
 # ENDPOINT 3 — Get Single Product Detail
 # ==============================================================================
 @app.get("/products/{product_id}")
-def get_product(product_id: str, api_key: str = Security(verify_api_key)):
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def get_product(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
+    pid = parse_uuid(product_id)
+    if not pid:
+        raise HTTPException(status_code=404, detail="Product not found")
+    plan = get_user_plan(request)
     try:
-        product_result = (
+        if not is_paid(plan) and pid not in free_top_product_ids():
+            raise HTTPException(status_code=403, detail=UPGRADE_MESSAGE)
+        rows = (
             supabase.table("tiktok_products")
             .select("*")
-            .eq("id", product_id)
-            .single()
+            .eq("id", pid)
+            .limit(1)
             .execute()
-        )
-
-        if not product_result.data:
+        ).data
+        if not rows:
             raise HTTPException(status_code=404, detail="Product not found")
-
-        product = product_result.data
         # Suppliers are NOT returned here: they cost a credit via /products/{id}/suppliers/{platform}.
-
         return {
             "success": True,
-            "product": product
+            "product": rows[0]
         }
 
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise server_error("/products/{id}")
 
 
 # ==============================================================================
 # ENDPOINT 4 — Get Products by Virality Tier
 # ==============================================================================
 @app.get("/products/tier/{tier}")
-async def get_products_by_tier(
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def get_products_by_tier(
     tier:    str,
     request: Request,
     limit:   int = Query(default=20, ge=1, le=100),
@@ -264,41 +417,45 @@ async def get_products_by_tier(
     if tier not in tier_ranges:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid tier '{tier}'. Use: hot, rising, watch, or pass"
+            detail="Invalid tier. Use: hot, rising, watch, or pass"
         )
 
     min_score, max_score = tier_ranges[tier]
-    limit, offset = gate_list(await get_user_plan(request), limit, offset)
+    plan = get_user_plan(request)
 
     try:
-        result = (
-            supabase.table("tiktok_products")
-            .select("*")
-            .eq("is_active", True)
-            .gte("virality_score", min_score)
-            .lte("virality_score", max_score)
-            .order("virality_score", desc=True)
-            .range(offset, offset + limit - 1)
-            .execute()
-        )
+        if not is_paid(plan):
+            rows = free_top_products()
+        else:
+            rows = (
+                supabase.table("tiktok_products")
+                .select("*")
+                .eq("is_active", True)
+                .gte("virality_score", min_score)
+                .lte("virality_score", max_score)
+                .order("virality_score", desc=True)
+                .range(offset, offset + limit - 1)
+                .execute()
+            ).data
 
         return {
             "success":  True,
             "tier":     tier,
             "range":    f"{min_score}-{max_score}",
-            "count":    len(result.data),
-            "products": result.data
+            "count":    len(rows),
+            "products": rows
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise server_error("/products/tier")
 
 
 # ==============================================================================
 # ENDPOINT 5 — Dashboard Stats
 # ==============================================================================
 @app.get("/stats")
-def get_stats(api_key: str = Security(verify_api_key)):
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def get_stats(request: Request, api_key: str = Security(verify_api_key)):
     try:
         all_products = (
             supabase.table("tiktok_products")
@@ -331,8 +488,8 @@ def get_stats(api_key: str = Security(verify_api_key)):
             }
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise server_error("/stats")
 
 
 # ==============================================================================
@@ -357,7 +514,8 @@ class ProfitRequest(BaseModel):
 
 
 @app.post("/calculate-profit")
-def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)):
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def calculate_profit(req: ProfitRequest, request: Request, api_key: str = Security(verify_api_key)):
     try:
         # Normalize field names from frontend
         sale_price = req.sale_price or req.selling_price or 0
@@ -426,23 +584,31 @@ def calculate_profit(req: ProfitRequest, api_key: str = Security(verify_api_key)
             "warnings": warnings
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("/calculate-profit failed")
+        raise HTTPException(status_code=400, detail="Could not calculate profit for these numbers.")
 
 
 # ==============================================================================
 # ENDPOINT 7 — Search Products
 # ==============================================================================
 @app.get("/search")
-async def search_products(
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def search_products(
     request: Request,
-    q:       str = Query(..., min_length=2, description="Search keyword"),
+    q:       str = Query(..., min_length=2, max_length=200, description="Search keyword"),
     limit:   int = Query(default=20, ge=1, le=100),
     offset:  int = Query(default=0,  ge=0),
     api_key: str = Security(verify_api_key),
 ):
-    limit, offset = gate_list(await get_user_plan(request), limit, offset)
+    plan = get_user_plan(request)
     try:
+        if not is_paid(plan):
+            # Free / signed-out: the same fixed top 10 as /products. q is ignored on purpose:
+            # searching would let anyone page through the paid catalogue 10 rows at a time.
+            rows = free_top_products()
+            return {"success": True, "query": q, "count": len(rows), "plan": plan, "products": rows}
+
         result = (
             supabase.table("tiktok_products")
             .select("*")
@@ -460,8 +626,8 @@ async def search_products(
             "products": result.data
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise server_error("/search")
 
 
     # ==============================================================================
@@ -487,7 +653,7 @@ def verified_suppliers(product: dict, platform: str, keep: int = 5) -> list[dict
     Rows without a similarity score (old keyword-only results) are never shown or charged for."""
     from supplier_engine import calculate_profit
     rows = (
-        supabase.table("suppliers").select("*")
+        supabase.table("suppliers").select(SUPPLIER_PUBLIC_COLUMNS)
         .eq("tiktok_product_id", product["id"]).eq("platform", platform)
         .or_(f"similarity.gte.{MIN_SIMILARITY},match_method.eq.manual")   # auto-verified or hand-approved
         .not_.is_("hidden", "true")
@@ -521,8 +687,8 @@ def _balance(email: str) -> Optional[dict]:
 def _charge_or_402(user_email: str, product_id: str, platform: str, mode: str) -> bool:
     try:
         credit = credits_v2.consume(user_email, product_id, platform, mode)
-    except credits_v2.CreditError as e:
-        print(f"credit system error: {e}")
+    except credits_v2.CreditError:
+        logger.exception("credit system error")
         raise HTTPException(status_code=503, detail="Credits are temporarily unavailable. Please try again in a minute.")
     if not credit.get("allowed"):
         raise HTTPException(status_code=402, detail={
@@ -541,30 +707,50 @@ def _charge_or_402(user_email: str, product_id: str, platform: str, mode: str) -
 #   - No verified supplier yet (not sourced, no match, only old unscored rows) -> nothing shown, nothing charged.
 #   - Amazon keeps the legacy live search: charged up front, refunded if nothing usable is found.
 # ==============================================================================
+CONFIRM_EMAIL_MESSAGE = "Confirm your email to use credits. Check your inbox for the confirmation link."
+
+# One live Amazon search per user at a time (per process). Each one runs Apify + GPT for minutes.
+_amazon_inflight: set = set()
+_amazon_inflight_lock = threading.Lock()
+
+
 def _supplier_search(product_id: str, platform: str, request: Request, photo: bool):
     if platform not in ("alibaba", "aliexpress", "amazon"):
         raise HTTPException(status_code=400, detail="Platform must be: alibaba, aliexpress, or amazon")
 
-    user_email = credits_v2.email_from_request(request)
-    if not user_email:
+    user = credits_v2.user_from_request(request)
+    if not user:
         raise HTTPException(status_code=401, detail="Sign in to search suppliers")
+    user_email = user.email
 
-    product = (
+    pid = parse_uuid(product_id)
+    if not pid:
+        raise HTTPException(status_code=404, detail="Product not found")
+    rows = (
         supabase.table("tiktok_products")
         .select("id, product_name, tiktok_price, thumbnail_url, image_storage_url")
-        .eq("id", product_id).single().execute().data
+        .eq("id", pid).limit(1).execute().data
     )
-    if not product:
+    if not rows:
         raise HTTPException(status_code=404, detail="Product not found")
+    product = rows[0]
+    product_id = pid
+
+    def charge(mode: str) -> bool:
+        # Unconfirmed email = 0 usable credits (stops throwaway-account credit farming, audit H3).
+        if not user.email_confirmed:
+            raise HTTPException(status_code=403, detail={"code": "email_unconfirmed", "message": CONFIRM_EMAIL_MESSAGE})
+        return _charge_or_402(user_email, product_id, platform, mode)
 
     if platform in ("alibaba", "aliexpress"):
         rows = verified_suppliers(product, platform)
         if rows:
             charged = False
             if not credits_v2.is_unlocked(user_email, product_id, platform):
-                charged = _charge_or_402(user_email, product_id, platform, "image")
+                charged = charge("image")
             return {"success": True, "cached": True, "platform": platform, "match_method": "photo",
-                    "suppliers": rows, "credit_charged": charged, "credits": _balance(user_email)}
+                    "suppliers": [public_supplier(r) for r in rows], "credit_charged": charged,
+                    "credits": _balance(user_email)}
 
         last = (
             supabase.table("sourcing_jobs").select("status")
@@ -580,60 +766,79 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
                 "credits": _balance(user_email)}
 
     # Amazon: legacy live search (Apify). Charge first, refund if nothing usable.
-    image_url = product.get("image_storage_url") or product.get("thumbnail_url") or ""
-    charged = False
-    if not credits_v2.is_unlocked(user_email, product_id, platform):
-        charged = _charge_or_402(user_email, product_id, platform, "image" if photo else "text")
+    check_limit(AMAZON_LIMIT, "amazon", f"user:{user.id}")
+    with _amazon_inflight_lock:
+        if user.id in _amazon_inflight:
+            raise HTTPException(status_code=429, detail="An Amazon search is already running for you. Wait for it to finish.")
+        _amazon_inflight.add(user.id)
     try:
-        result = find_suppliers_by_platform(
-            product_id=product["id"], product_title=product["product_name"],
-            tiktok_price=product["tiktok_price"] or 0, platform=platform,
-            user_email=user_email, product_image_url=image_url, use_photo=photo,
-        )
-    except Exception as e:
-        print(f"amazon search error: {e}")
-        if charged:
-            credits_v2.refund(user_email, product_id, platform)
-        raise HTTPException(status_code=500, detail="Supplier search failed. Your credit was not used.")
-    if charged and not result.get("success"):
-        credits_v2.refund(user_email, product_id, platform)
+        image_url = product.get("image_storage_url") or product.get("thumbnail_url") or ""
         charged = False
-    result["credit_charged"] = charged
-    result["credits"] = _balance(user_email)
-    return result
+        if not credits_v2.is_unlocked(user_email, product_id, platform):
+            charged = charge("image" if photo else "text")
+        try:
+            result = find_suppliers_by_platform(
+                product_id=product["id"], product_title=product["product_name"],
+                tiktok_price=product["tiktok_price"] or 0, platform=platform,
+                user_email=user_email, product_image_url=image_url, use_photo=photo,
+            )
+        except Exception:
+            logger.exception("amazon search error")
+            if charged:
+                credits_v2.refund(user_email, product_id, platform)
+            raise HTTPException(status_code=500, detail="Supplier search failed. Your credit was not used.")
+        if charged and not result.get("success"):
+            credits_v2.refund(user_email, product_id, platform)
+            charged = False
+        result["suppliers"] = [public_supplier(r) for r in result.get("suppliers") or []]
+        result["credit_charged"] = charged
+        result["credits"] = _balance(user_email)
+        return result
+    finally:
+        with _amazon_inflight_lock:
+            _amazon_inflight.discard(user.id)
 
 
+# Plain `def` routes: FastAPI runs them in its threadpool, so a slow Apify/GPT search no longer
+# freezes the event loop for every other user (audit H1).
 @app.get("/products/{product_id}/suppliers/{platform}")
-async def get_suppliers_by_platform(
+@limiter.limit(SUPPLIER_LIMIT)
+def get_suppliers_by_platform(
     product_id: str,
     platform:   str,
     request:    Request,
     photo:      bool = Query(default=True, description="Use the product photo to match suppliers"),
+    user=Depends(resolve_user),
     api_key:    str = Security(verify_api_key),
 ):
     return _supplier_search(product_id, platform, request, photo)
 
 
 @app.get("/products/{product_id}/suppliers")
-async def get_suppliers(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(SUPPLIER_LIMIT)
+def get_suppliers(product_id: str, request: Request, user=Depends(resolve_user),
+                  api_key: str = Security(verify_api_key)):
     """Legacy route. Used to give unlimited free Alibaba searches; now same rules as above."""
     return _supplier_search(product_id, "alibaba", request, True)
 
 
 @app.get("/sourcing/jobs/{job_id}")
-async def get_sourcing_job(job_id: int, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(POLL_LIMIT)
+def get_sourcing_job(job_id: int, request: Request, user=Depends(resolve_user),
+                     api_key: str = Security(verify_api_key)):
     """Frontend polls this every 3s after a photo search was queued (worker mode only)."""
-    email = credits_v2.email_from_request(request)
+    email = user.email if user else None
     if not email:
         raise HTTPException(status_code=401, detail="Sign in required")
-    job = supabase.table("sourcing_jobs").select("*").eq("id", job_id).single().execute().data
+    jobs = supabase.table("sourcing_jobs").select("*").eq("id", job_id).limit(1).execute().data
+    job = jobs[0] if jobs else None
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     out = {"job_id": job_id, "status": job["status"]}
     # Suppliers only for users who actually unlocked this product+platform.
     if job["status"] == "done" and credits_v2.is_unlocked(email, job["product_id"], job["platform"]):
-        product = supabase.table("tiktok_products").select("id, tiktok_price").eq("id", job["product_id"]).single().execute().data
-        out["suppliers"] = verified_suppliers(product, job["platform"]) if product else []
+        prows = supabase.table("tiktok_products").select("id, tiktok_price").eq("id", job["product_id"]).limit(1).execute().data
+        out["suppliers"] = [public_supplier(r) for r in verified_suppliers(prows[0], job["platform"])] if prows else []
     if job["status"] in ("done", "no_match", "failed"):
         out["credits"] = _balance(email)
     return out
@@ -643,15 +848,19 @@ async def get_sourcing_job(job_id: int, request: Request, api_key: str = Securit
 # ENDPOINT 10 — Get User Credits (single source of truth for the UI)
 # ==============================================================================
 @app.get("/credits")
-async def get_credits(request: Request, api_key: str = Security(verify_api_key)):
-    user_email = credits_v2.email_from_request(request)
-    if not user_email:
+@limiter.limit(POLL_LIMIT)
+def get_credits(request: Request, user=Depends(resolve_user), api_key: str = Security(verify_api_key)):
+    if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
-        return {"success": True, "credits": credits_v2.get_balance(user_email)}
-    except credits_v2.CreditError as e:
-        print(f"credit system error: {e}")
+        out = {"success": True, "credits": credits_v2.get_balance(user.email)}
+    except credits_v2.CreditError:
+        logger.exception("credit system error")
         raise HTTPException(status_code=503, detail="Credits are temporarily unavailable")
+    if not user.email_confirmed:
+        out["email_confirmed"] = False
+        out["message"] = CONFIRM_EMAIL_MESSAGE
+    return out
 
 
 # ==============================================================================
@@ -678,31 +887,115 @@ def _plan_for_variant(variant_id: str) -> Optional[str]:
     return None
 
 
+_PLAN_RANK = {"free": 0, "pro": 1, "ultimate": 2}
+
+
+def _checkout_signing_key() -> bytes:
+    return (os.getenv("CHECKOUT_SIGNING_SECRET") or LEMONSQUEEZY_WEBHOOK_SECRET or "").encode()
+
+
+def _checkout_sig(user_id: str) -> str:
+    """Signs the user id we put in checkout custom data. Lemon Squeezy hosted buy links let anyone
+    add their own custom data, so an unsigned user_id is never trusted."""
+    key = _checkout_signing_key()
+    if not key:
+        return ""
+    return hmac.new(key, f"tpp-checkout:{user_id}".encode(), hashlib.sha256).hexdigest()[:40]
+
+
+def _clean_email(raw) -> str:
+    email = normalize_email(raw)
+    if not email or "@" not in email or any(c.isspace() for c in email) or len(email) > 320:
+        return ""
+    return email
+
+
+def _resolve_webhook_user(meta: dict, attrs: dict) -> tuple[str, Optional[str]]:
+    """(email, user_id) the event belongs to, or ("", None).
+    1. custom_data.user_id (signed by /create-checkout): the Supabase user with that id, and only if
+       its email matches attrs.user_email or custom_data.email when those are present.
+    2. otherwise the exact (lowercased) email. Never a pattern match."""
+    custom = meta.get("custom_data") or {}
+    if not isinstance(custom, dict):
+        custom = {}
+    attrs_email = _clean_email(attrs.get("user_email"))
+    custom_email = _clean_email(custom.get("email") or custom.get("user_email"))
+    uid = parse_uuid(custom.get("user_id"))
+    if uid:
+        sig = str(custom.get("sig") or "")
+        expected = _checkout_sig(uid)
+        if expected and hmac.compare_digest(sig, expected):
+            try:
+                auth_user = supabase.auth.admin.get_user_by_id(uid).user
+            except Exception:
+                logger.exception("webhook: user lookup by id failed")
+                auth_user = None
+            if auth_user and auth_user.email:
+                auth_email = normalize_email(auth_user.email)
+                claimed = {e for e in (attrs_email, custom_email) if e}
+                if claimed and auth_email not in claimed:
+                    logger.warning("webhook: user_id %s email does not match the order email; event ignored", uid)
+                    return "", None
+                return auth_email, uid
+            logger.warning("webhook: user_id %s not found; falling back to exact email", uid)
+        else:
+            logger.warning("webhook: unsigned or badly signed custom user_id; falling back to exact email")
+    return (custom_email or attrs_email), None
+
+
+def _record_subscription(sub_id: str, email: str, user_id: Optional[str], variant_id: str,
+                         status: str, updated_at: Optional[str]) -> Optional[bool]:
+    """Upsert the subscription row unless we already hold a NEWER state for it (LS can deliver
+    out of order). True = applied, False = stale event ignored, None = table unavailable."""
+    try:
+        res = supabase.rpc("upsert_subscription", {
+            "p_id": sub_id, "p_user_email": email, "p_user_id": user_id, "p_variant_id": variant_id,
+            "p_status": status, "p_updated_at": updated_at,
+        }).execute()
+        return bool(res.data)
+    except Exception:
+        logger.exception("webhook: upsert_subscription failed (run migration 20261107_security_fixes.sql)")
+        return None
+
+
+def _effective_plan(email: str, user_id: Optional[str], fallback: str) -> str:
+    """Best plan over all of this user's subscriptions that still pay. One lapsed subscription no
+    longer downgrades someone who holds another active one (audit M4)."""
+    try:
+        rows = (supabase.table("subscriptions").select("variant_id, status")
+                .eq("user_email", email).execute().data or [])
+        if user_id:
+            rows += (supabase.table("subscriptions").select("variant_id, status")
+                     .eq("user_id", user_id).execute().data or [])
+    except Exception:
+        logger.exception("webhook: subscriptions read failed; using this event's plan")
+        return fallback
+    best = "free"
+    for r in rows:
+        if (r.get("status") or "").lower() in PAID_STATUSES:
+            p = _plan_for_variant(str(r.get("variant_id") or "")) or "free"
+            if _PLAN_RANK[p] > _PLAN_RANK[best]:
+                best = p
+    return best
+
+
 def _set_plan(email: str, plan: str, new_period: bool) -> None:
-    res = supabase.table("users").update({"plan": plan}).ilike("user_email", email).execute()
+    email = normalize_email(email)
+    res = supabase.table("users").update({"plan": plan}).eq("user_email", email).execute()
     if not res.data:
-        print(f"Webhook: no users row for {email}; plan {plan} not applied")
+        logger.error("Webhook: no users row for user %s; plan %s NOT applied (needs a manual fix)",
+                     email_hash(email), plan)
         return
     try:
         if new_period:
             credits_v2.start_period(email)      # fresh 30-day allowance on each successful payment
         else:
             credits_v2.get_balance(email)       # applies the new allowance, keeps usage
-    except credits_v2.CreditError as e:
-        print(f"Webhook credit update failed for {email}: {e}")
+    except credits_v2.CreditError:
+        logger.exception("Webhook credit update failed for user %s", email_hash(email))
 
 
-@app.post("/lemonsqueezy-webhook")
-async def lemonsqueezy_webhook(request: Request):
-    body = await request.body()
-    signature = request.headers.get("x-signature") or ""
-    if not LEMONSQUEEZY_WEBHOOK_SECRET or not signature:
-        raise HTTPException(status_code=401, detail="No signature")
-    digest = hmac.new(LEMONSQUEEZY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(digest, signature):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    payload = json.loads(body)
+def _handle_webhook(payload: dict) -> dict:
     meta = payload.get("meta", {}) or {}
     event_name = meta.get("event_name") or ""
     data = payload.get("data", {}) or {}
@@ -715,19 +1008,18 @@ async def lemonsqueezy_webhook(request: Request):
     except Exception as e:
         if "duplicate" in str(e).lower() or "23505" in str(e):
             return {"status": "ok", "duplicate": True}
-        print(f"webhook_events insert failed (continuing): {e}")
+        logger.exception("webhook_events insert failed (continuing)")
 
-    custom = meta.get("custom_data", {}) or {}
-    email = (custom.get("email") or custom.get("user_email") or attrs.get("user_email") or "").strip().lower()
+    email, user_id = _resolve_webhook_user(meta, attrs)
     if not email:
-        print(f"Webhook {event_name}: no email found")
+        logger.warning("Webhook %s: no usable user", event_name)
         return {"status": "ok"}
 
     if event_name.startswith("subscription_payment_"):
         # Payment events carry an invoice; only a success starts a new credit period.
         if event_name == "subscription_payment_success":
-            plan = (supabase.table("users").select("plan").ilike("user_email", email).limit(1).execute().data or [{}])[0].get("plan")
-            if plan in ("pro", "ultimate"):
+            rows = supabase.table("users").select("plan").eq("user_email", email).limit(1).execute().data or []
+            if rows and is_paid(rows[0].get("plan")):
                 credits_v2.start_period(email)
         return {"status": "ok"}
 
@@ -737,33 +1029,55 @@ async def lemonsqueezy_webhook(request: Request):
     variant_id = str(attrs.get("variant_id") or "")
     plan = _plan_for_variant(variant_id)
     if plan is None:
-        print(f"Webhook {event_name}: unknown variant {variant_id} for {email}; ignored")
+        logger.info("Webhook %s: unknown variant %s; ignored", event_name, variant_id)
         return {"status": "ok"}
 
-    status = (attrs.get("status") or "").lower()
-    if event_name == "subscription_expired" or status not in PAID_STATUSES:
-        _set_plan(email, "free", new_period=False)
-        print(f"{email} -> free ({event_name}, status={status})")
-    else:
-        _set_plan(email, plan, new_period=(event_name == "subscription_created"))
-        print(f"{email} -> {plan} ({event_name}, status={status})")
+    status = "expired" if event_name == "subscription_expired" else (attrs.get("status") or "").lower()
+    applied = _record_subscription(str(data.get("id") or ""), email, user_id, variant_id, status,
+                                   attrs.get("updated_at") or attrs.get("created_at"))
+    if applied is False:
+        logger.info("Webhook %s for subscription %s is older than what we hold; ignored", event_name, data.get("id"))
+        return {"status": "ok", "stale": True}
+
+    event_plan = plan if status in PAID_STATUSES else "free"
+    new_plan = event_plan if applied is None else _effective_plan(email, user_id, event_plan)
+    _set_plan(email, new_plan, new_period=(event_name == "subscription_created" and new_plan != "free"))
+    logger.info("user %s -> %s (%s, status=%s)", email_hash(email), new_plan, event_name, status)
     return {"status": "ok"}
+
+
+@app.post("/lemonsqueezy-webhook")
+async def lemonsqueezy_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("x-signature") or ""
+    if not LEMONSQUEEZY_WEBHOOK_SECRET or not signature:
+        raise HTTPException(status_code=401, detail="No signature")
+    digest = hmac.new(LEMONSQUEEZY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(digest, signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    # DB + GoTrue calls are synchronous: keep them off the event loop.
+    return await run_in_threadpool(_handle_webhook, payload)
 
 
 # ==============================================================================
 # ENDPOINT 12 — Create Checkout (supports Pro + Ultimate)
 # ==============================================================================
 class CheckoutRequest(BaseModel):
-    email: str
+    email: str = ""          # ignored: the signed-in user's email is used
     plan:  str = "pro"
 
 
 @app.post("/create-checkout")
-async def create_checkout(checkout_data: CheckoutRequest, request: Request, api_key: str = Security(verify_api_key)):
-    signed_in = credits_v2.email_from_request(request)
-    if not signed_in:
+@limiter.limit(CHECKOUT_LIMIT)
+def create_checkout(checkout_data: CheckoutRequest, request: Request, user=Depends(resolve_user),
+                    api_key: str = Security(verify_api_key)):
+    if not user:
         raise HTTPException(status_code=401, detail="Sign in to subscribe")
-    checkout_data.email = signed_in.lower()   # never trust the email in the body
+    checkout_data.email = user.email   # never trust the email in the body
     if checkout_data.plan not in ("pro", "ultimate"):
         raise HTTPException(status_code=400, detail="Unknown plan")
     if checkout_data.plan == "ultimate":
@@ -771,10 +1085,7 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request, api_
     else:
         variant_id = os.getenv("LEMONSQUEEZY_PRODUCT_ID")
 
-    # Debug — print what we're sending
-    print(f"Checkout: plan={checkout_data.plan}, email={checkout_data.email}")
-    print(f"Variant ID: {variant_id}")
-    print(f"Store ID: {os.getenv('LEMONSQUEEZY_STORE_ID')}")
+    logger.info("checkout: plan=%s user=%s", checkout_data.plan, user.id)
 
     headers = {
         "Authorization": f"Bearer {os.getenv('LEMONSQUEEZY_API_KEY')}",
@@ -789,7 +1100,9 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request, api_
                 "checkout_data": {
                     "email": checkout_data.email,
                     "custom": {
-                        "email": checkout_data.email
+                        "user_id": user.id,
+                        "email": checkout_data.email,
+                        "sig": _checkout_sig(user.id),
                     }
                 }
             },
@@ -810,19 +1123,19 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request, api_
         }
     }
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.lemonsqueezy.com/v1/checkouts",
-            json=payload,
-            headers=headers
-        )
+    try:
+        with httpx.Client(timeout=20) as client:
+            response = client.post(
+                "https://api.lemonsqueezy.com/v1/checkouts",
+                json=payload,
+                headers=headers
+            )
+    except httpx.HTTPError:
+        logger.exception("LemonSqueezy checkout request failed")
+        raise HTTPException(status_code=502, detail="Checkout creation failed")
 
-    # Print full LemonSqueezy response for debugging
-    print(f"LemonSqueezy status: {response.status_code}")
     if response.status_code not in (200, 201):
-        print(f"LemonSqueezy response: {response.text[:500]}")
-
-    if response.status_code != 200 and response.status_code != 201:
+        logger.error("LemonSqueezy checkout failed with HTTP %s", response.status_code)
         raise HTTPException(status_code=400, detail="Checkout creation failed")
 
     data = response.json()
@@ -830,10 +1143,10 @@ async def create_checkout(checkout_data: CheckoutRequest, request: Request, api_
     return {"success": True, "checkout_url": checkout_url}
 
 # ==============================================================================
-# ENDPOINT 13 — Create Checkout (supports Pro + Ultimate)
+# LEGACY (blog tooling, job board, CV parser, AI proxy, autopilot).
+# All of these answer 404 unless ENABLE_LEGACY_ENDPOINTS=true, on top of their own secret header.
 # ==============================================================================
-from fastapi import Request
-@app.post("/publish-blog-post")
+@app.post("/publish-blog-post", dependencies=[Depends(require_legacy)])
 async def publish_blog_post(request: Request):
     require_admin(request)
     import httpx, jwt, time, os, json
@@ -900,20 +1213,24 @@ async def publish_blog_post(request: Request):
             timeout=30.0,
         )
 
-    data = res.json()
+    try:
+        data = res.json()
+    except ValueError:
+        logger.error("Ghost publish returned HTTP %s with a non-JSON body", res.status_code)
+        return JSONResponse({"errors": [{"message": "Blog publish failed"}]}, status_code=502)
 
     # ── Auto-ping Google & Bing after successful publish ──
     if data.get("posts"):
         published_slug = data["posts"][0].get("slug", slug)
         published_url  = f"https://blog.tikprofitpro.shop/{published_slug}/"
         await ping_google(published_url)
-        print(f"✅ Published and pinged: {published_url}")
+        logger.info("Published and pinged: %s", published_url)
 
     return data
 
 # ─── Blog Post Generator via OpenAI ──────────────────────────────
 # ─── Blog Post Generator via Groq ──────────────────────────────
-@app.post("/generate-blog-post")
+@app.post("/generate-blog-post", dependencies=[Depends(require_legacy)])
 async def generate_blog_post(raw: Request):
     require_admin(raw)
     request = await raw.json()
@@ -942,16 +1259,18 @@ async def generate_blog_post(raw: Request):
         data = res.json()
 
         if "choices" not in data:
-            return {"content": None, "error": f"Groq error: {data}"}
+            logger.error("Groq blog generation returned no choices (HTTP %s)", res.status_code)
+            return {"content": None, "error": "The AI provider returned an error"}
 
         content = data["choices"][0]["message"]["content"]
         return data
-        
-    except Exception as e:
-        return {"content": None, "error": str(e)}
+
+    except Exception:
+        logger.exception("generate-blog-post failed")
+        return {"content": None, "error": "Blog post generation failed"}
 
 
-@app.get("/get-image")
+@app.get("/get-image", dependencies=[Depends(require_legacy)])
 async def get_image(request: Request, query: str = "ecommerce"):
     require_admin(request)
     import httpx, os
@@ -979,8 +1298,9 @@ async def get_image(request: Request, query: str = "ecommerce"):
                 "description": results[0].get("alt_description", ""),
             }
         return {"url": None, "error": f"No results from Unsplash. Total: {data.get('total', 0)}"}
-    except Exception as e:
-        return {"url": None, "error": str(e)}
+    except Exception:
+        logger.exception("get-image failed")
+        return {"url": None, "error": "Image search failed"}
     
     # ─── Google Search Console Auto-Ping ─────────────────────────────
 async def ping_google(url: str):
@@ -1006,7 +1326,7 @@ async def ping_google(url: str):
                 timeout=10.0,
             )
     except Exception as e:
-        print(f"Ping error (non-fatal): {e}")
+        logger.warning("Ping error (non-fatal): %s", type(e).__name__)
 
 
 @app.get("/indexnow")
@@ -1015,27 +1335,41 @@ async def indexnow_verify():
     return PlainTextResponse(indexnow_key)
 
 @app.post("/generate-listing")
-async def generate_listing(req: GenerateListingRequest, request: Request):
+@limiter.limit(LISTING_LIMIT)
+def generate_listing(req: GenerateListingRequest, request: Request, user=Depends(resolve_user)):
     """
     Draft a TikTok Shop listing. Rewritten to stop generic "AI slop":
     - looks at the product photo, so it describes the real item
     - banned-word list (no "elevate", "game-changer", "must-have", emojis...)
     - concrete specs only; unknown facts become [fill in] placeholders instead of invented claims
     - respects TikTok Shop rules: no medical claims, no "best/#1", no competitor brands
-    Requires a signed-in user (it spends OpenAI money).
+    Requires a signed-in user (it spends OpenAI money). Plain `def`: runs in the threadpool.
+    Image: looked up server-side from product_id. A client-sent image_url is only used when no
+    product_id is given, and then only through safe_fetch (public hosts only, no internal network).
     """
-    email = credits_v2.email_from_request(request)
-    if not email:
+    if not user:
         raise HTTPException(status_code=401, detail="Sign in to generate listings")
-    if credits_v2.plan_for(email) not in ("pro", "ultimate"):
+    email = user.email
+    if not is_paid(credits_v2.plan_for(email)):
         raise HTTPException(status_code=402, detail="The listing generator is a Pro feature")
-    if not (GROQ_API_KEY or openai_client):
+    if not (GROQ_API_KEY or openai_sync_client):
         raise HTTPException(status_code=503, detail="Listing generator is not configured")
 
+    image_url = ""
+    if req.product_id:
+        pid = parse_uuid(req.product_id)
+        rows = (supabase.table("tiktok_products").select("image_storage_url, thumbnail_url")
+                .eq("id", pid).limit(1).execute().data) if pid else []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Product not found")
+        image_url = rows[0].get("image_storage_url") or rows[0].get("thumbnail_url") or ""
+    elif req.image_url:
+        image_url = req.image_url
+
     image_part = []
-    if req.image_url:
+    if image_url:
         from image_search import fetch_image_bytes, _data_url
-        img = fetch_image_bytes(req.image_url)
+        img = fetch_image_bytes(image_url)   # safe_fetch inside
         if img:
             image_part = [{"type": "image_url", "image_url": {"url": _data_url(img), "detail": "low"}}]
 
@@ -1066,8 +1400,8 @@ Category hint: {req.category}"""
     try:
         if GROQ_API_KEY:
             # Groq (OpenAI-compatible, much cheaper). Llama 4 Scout reads images.
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.post(
+            with httpx.Client(timeout=60) as client:
+                r = client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                     json={"model": os.getenv("LISTING_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
@@ -1077,28 +1411,33 @@ Category hint: {req.category}"""
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
         else:
-            resp = await openai_client.chat.completions.create(
+            resp = openai_sync_client.chat.completions.create(
                 model="gpt-4o-mini", temperature=0.3, max_tokens=700,
                 response_format={"type": "json_object"}, messages=messages,
             )
             content = resp.choices[0].message.content
         return json.loads(content or "{}")
-    except Exception as e:
-        print(f"generate-listing error: {e}")
+    except Exception:
+        logger.exception("generate-listing failed")
         raise HTTPException(status_code=502, detail="The listing generator couldn't finish. Try again in a minute.")
 
 
 # ─── Get Shops ───────────────────────────────────────────────────
 @app.get("/shops")
-async def get_shops(
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def get_shops(
     request: Request,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     sort_by: str = "gmv_total",
     api_key: str = Security(verify_api_key),
 ):
-    limit, offset = gate_list(await get_user_plan(request), limit, offset)
+    plan = get_user_plan(request)
     try:
+        if not is_paid(plan):
+            rows, _ = free_top_shops()
+            return {"shops": rows, "total": len(rows), "limit": FREE_PRODUCT_LIMIT, "offset": 0, "plan": plan}
+
         # Valid sort columns
         allowed_sorts = ["gmv_total", "gmv_growth_pct", "created_at", "follower_count"]
         order_col = sort_by if sort_by in allowed_sorts else "gmv_total"
@@ -1114,13 +1453,14 @@ async def get_shops(
             "limit": limit,
             "offset": offset
         }
-    except Exception as e:
-        print(f"shops error: {e}")
+    except Exception:
+        logger.exception("/shops failed")
         return {"shops": [], "error": "Shops are temporarily unavailable"}
 
 # ─── Get Creators ─────────────────────────────────────────────────
 @app.get("/creators")
-async def get_creators(
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def get_creators(
     request: Request,
     creator_type: str = None,
     limit: int = Query(default=50, ge=1, le=100),
@@ -1128,28 +1468,25 @@ async def get_creators(
     sort_by: str = "gmv_total",
     api_key: str = Security(verify_api_key),
 ):
-    plan = await get_user_plan(request)
-    limit, offset = gate_list(plan, limit, offset)
-    order_col = sort_by if sort_by in ("gmv_total", "followers", "engagement_rate", "video_gmv", "live_gmv") else "gmv_total"
+    plan = get_user_plan(request)
     try:
+        if not is_paid(plan):
+            # Fixed top 10: creator_type / sort_by / offset are ignored for unpaid callers.
+            return {"creators": free_top_creators(), "plan": plan}
+        order_col = sort_by if sort_by in ("gmv_total", "followers", "engagement_rate", "video_gmv", "live_gmv") else "gmv_total"
         query = supabase.table("creators").select("*")
         if creator_type:
             query = query.eq("creator_type", creator_type)
         res = query.order(order_col, desc=True, nullsfirst=False).range(offset, offset + limit - 1).execute()
-        rows = res.data or []
-        if plan not in ("pro", "ultimate"):
-            for r in rows:                      # contact details are a paid feature
-                r.pop("contact_email", None)
-                r["contact_locked"] = True
-        return {"creators": rows, "plan": plan}
-    except Exception as e:
-        print(f"creators error: {e}")
+        return {"creators": res.data or [], "plan": plan}
+    except Exception:
+        logger.exception("/creators failed")
         return {"creators": [], "error": "Creators are temporarily unavailable"}
-    
+
 # ================================================================
 # /api/jobs — real jobs from Remotive + Adzuna
 # ================================================================
-@app.get("/api/jobs")
+@app.get("/api/jobs", dependencies=[Depends(require_legacy)])
 async def get_jobs(request: Request, niches: str = "", location: str = "remote", job_type: str = "Any"):
     require_admin(request)
     niche_list = [n.strip().lower() for n in niches.split(",") if n.strip()]
@@ -1257,25 +1594,44 @@ async def get_jobs(request: Request, niches: str = "", location: str = "remote",
 # ================================================================
 # /api/parse-cv — upload PDF, GPT extracts structured profile
 # ================================================================
-@app.post("/api/parse-cv")
-async def parse_cv(request: Request, file: UploadFile = File(...)):
+@app.post("/api/parse-cv", dependencies=[Depends(require_legacy)])
+async def parse_cv(request: Request):
+    # Auth + size checks run BEFORE the body is read (no File() param, so FastAPI doesn't parse it).
     require_admin(request)
-    if not file.filename.lower().endswith(".pdf"):
-        return JSONResponse({"error": "Only PDF files supported"}, status_code=400)
- 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
- 
+    _require_content_length(request, _MAX_UPLOAD_BYTES)
+    form = await request.form(max_files=1, max_fields=5)
+    tmp_path = None
     try:
-        text = ""
-        with pdfplumber.open(tmp_path) as pdf:
-            for page in pdf.pages:
-                text += (page.extract_text() or "") + "\n"
-        os.unlink(tmp_path)
-    except Exception as e:
-        return JSONResponse({"error": f"PDF read error: {str(e)}"}, status_code=500)
- 
+        file = form.get("file")
+        if not file or not hasattr(file, "read"):
+            return JSONResponse({"error": "Upload a PDF as 'file'"}, status_code=400)
+        if not (file.filename or "").lower().endswith(".pdf"):
+            return JSONResponse({"error": "Only PDF files supported"}, status_code=400)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+            await _copy_upload(file, tmp, _MAX_UPLOAD_BYTES)
+
+        def _extract(path: str) -> str:
+            import pdfplumber
+            out = ""
+            with pdfplumber.open(path) as pdf:
+                for page in pdf.pages:
+                    out += (page.extract_text() or "") + "\n"
+            return out
+
+        try:
+            text = await run_in_threadpool(_extract, tmp_path)
+        except Exception:
+            logger.exception("parse-cv: PDF read error")
+            return JSONResponse({"error": "Could not read this PDF"}, status_code=400)
+    finally:
+        await form.close()
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
     if not text.strip():
         return JSONResponse({"error": "Could not extract text from PDF"}, status_code=400)
  
@@ -1304,14 +1660,15 @@ CV:
         raw = resp.choices[0].message.content or ""
         s, e = raw.find("{"), raw.rfind("}")
         return JSONResponse({"profile": json.loads(raw[s:e+1]), "cv_text": text[:2000]})
-    except Exception as ex:
-        return JSONResponse({"error": f"Parse error: {str(ex)}"}, status_code=500)
+    except Exception:
+        logger.exception("parse-cv: AI parse failed")
+        return JSONResponse({"error": "Could not parse this CV"}, status_code=500)
  
  
 # ================================================================
 # /api/extract-email — fetch job page, GPT extracts apply email
 # ================================================================
-@app.get("/api/extract-email")
+@app.get("/api/extract-email", dependencies=[Depends(require_legacy)])
 async def extract_email(request: Request, url: str = ""):
     require_admin(request)
     if openai_client is None:
@@ -1326,18 +1683,12 @@ async def extract_email(request: Request, url: str = ""):
     if not url:
         return JSONResponse({"email": ""})
  
-    # Fetch the job page
-    try:
-        async with httpx.AsyncClient(
-            timeout=12,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        ) as client:
-            r = await client.get(url)
-            html = r.text
-    except Exception as e:
-        print(f"[extract-email fetch error] {e}")
-        return JSONResponse({"email": "", "error": str(e)})
+    # Fetch the job page (SSRF-safe: public hosts only, redirects re-checked, 2 MB cap)
+    r = await run_in_threadpool(safe_fetch, url, 2_000_000, 12.0, 3, None,
+                                {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    if r is None:
+        return JSONResponse({"email": "", "error": "Could not fetch that page"})
+    html = r.text
  
     # Strip HTML tags — keep only visible text
     import re
@@ -1375,14 +1726,19 @@ Page text (first 2000 chars):
         result = json.loads(raw[s:e+1])
         result["method"] = "gpt"
         return JSONResponse(result)
-    except Exception as ex:
-        return JSONResponse({"email": "", "error": str(ex)})
+    except Exception:
+        logger.exception("extract-email: AI step failed")
+        return JSONResponse({"email": "", "error": "Could not read an email from that page"})
  
  
 # ================================================================
 # /api/ai-proxy — cover email + CV summary generation (unchanged)
 # ================================================================
-@app.post("/api/ai-proxy")
+AI_PROXY_MODELS = {m.strip() for m in os.getenv("AI_PROXY_MODELS", "gpt-4o-mini").split(",") if m.strip()}
+AI_PROXY_MAX_TOKENS = 2000
+
+
+@app.post("/api/ai-proxy", dependencies=[Depends(require_legacy)])
 async def ai_proxy(request: Request, api_key: str = Security(verify_api_key)):
     require_admin(request)
     if openai_client is None:
@@ -1390,32 +1746,50 @@ async def ai_proxy(request: Request, api_key: str = Security(verify_api_key)):
     # Was open to the whole internet: anyone could spend the OpenAI balance.
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Send a JSON object"}, status_code=400)
+        model = body.get("model") or "gpt-4o-mini"
+        if model not in AI_PROXY_MODELS:          # caller can't pick an expensive model
+            model = "gpt-4o-mini" if "gpt-4o-mini" in AI_PROXY_MODELS or not AI_PROXY_MODELS else sorted(AI_PROXY_MODELS)[0]
+        try:
+            max_tokens = int(body.get("max_tokens") or AI_PROXY_MAX_TOKENS)
+        except (TypeError, ValueError):
+            max_tokens = AI_PROXY_MAX_TOKENS
+        max_tokens = max(1, min(max_tokens, AI_PROXY_MAX_TOKENS))
+        try:
+            temperature = float(body.get("temperature", 0.7))
+        except (TypeError, ValueError):
+            temperature = 0.7
+        messages = body.get("messages", [])
+        if not isinstance(messages, list):
+            return JSONResponse({"error": "messages must be a list"}, status_code=400)
         resp = await openai_client.chat.completions.create(
-            model       = body.get("model", "gpt-4o-mini"),
-            messages    = body.get("messages", []),
-            max_tokens  = body.get("max_tokens", 2000),
-            temperature = body.get("temperature", 0.7),
+            model       = model,
+            messages    = messages,
+            max_tokens  = max_tokens,
+            temperature = max(0.0, min(temperature, 1.5)),
         )
         return JSONResponse({"content": resp.choices[0].message.content or ""})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("ai-proxy failed")
+        return JSONResponse({"error": "AI request failed"}, status_code=500)
  
  
 # ================================================================
 # /jobs — serves job_hunt.html
 # ================================================================
-@app.get("/jobs", response_class=HTMLResponse)
+@app.get("/jobs", response_class=HTMLResponse, dependencies=[Depends(require_legacy)])
 async def job_hunt_ui(request: Request):
     require_admin(request)
-    path = r"F:\profitscout\job_hunt.html"
+    path = os.getenv("JOB_HUNT_HTML", r"F:\profitscout\job_hunt.html")
     if not os.path.exists(path):
-        return HTMLResponse(f"<h2>job_hunt.html not found at {path}</h2>", status_code=404)
+        return HTMLResponse("<h2>job_hunt.html not found</h2>", status_code=404)
     with open(path, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
  
 
  # ─── Daily Blog Autopilot Endpoint ───────────────────────────────
-@app.post("/run-autopilot")
+@app.post("/run-autopilot", dependencies=[Depends(require_legacy)])
 async def run_autopilot(request: Request):
     expected = os.environ.get("AUTOPILOT_SECRET", "")
     given = request.headers.get("X-Autopilot-Secret", "")
@@ -1427,27 +1801,40 @@ async def run_autopilot(request: Request):
         thread = threading.Thread(target=run)
         thread.start()
         return {"status": "started", "message": "Autopilot running in background"}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("run-autopilot failed to start")
+        return {"error": "Autopilot could not start"}
 
 
 # ==============================================================================
 # ADMIN — supplier review queue
-# Admins are the signed-in emails listed in ADMIN_EMAILS (comma separated).
+# Admins: signed-in users whose Supabase user id is in ADMIN_USER_IDS (comma separated UUIDs),
+# or whose email is in ADMIN_EMAILS AND confirmed (email_confirmed_at set). Prefer ids.
 #   Pending   = near-miss photo matches (default 0.60-0.79): same product, different bottle/label/angle
 #   Live      = what users see (auto-verified >= 0.80, or hand-approved)
 #   Rejected  = never queued again for that product
 # ==============================================================================
 ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+ADMIN_USER_IDS = {u for u in (parse_uuid(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()) if u}
+
+
+def is_admin(user) -> bool:
+    if not user:
+        return False
+    if user.id in ADMIN_USER_IDS:
+        return True
+    # Email alone proves nothing while signup auto-confirms; require a confirmed address.
+    return bool(user.email_confirmed and user.email in ADMIN_EMAILS)
 
 
 def require_admin_user(request: Request) -> str:
-    email = (credits_v2.email_from_request(request) or "").lower()
-    if not email:
+    """Returns the admin's email (used for reviewed_by). Uses the user cached on request.state."""
+    user = credits_v2.user_from_request(request)
+    if not user:
         raise HTTPException(status_code=401, detail="Sign in required")
-    if email not in ADMIN_EMAILS:
+    if not is_admin(user):
         raise HTTPException(status_code=403, detail="Admins only")
-    return email
+    return user.email
 
 
 def _now() -> str:
@@ -1455,17 +1842,19 @@ def _now() -> str:
 
 
 @app.get("/admin/me")
-async def admin_me(request: Request, api_key: str = Security(verify_api_key)):
-    email = (credits_v2.email_from_request(request) or "").lower()
-    return {"admin": bool(email and email in ADMIN_EMAILS)}
+@limiter.limit(ADMIN_LIMIT)
+def admin_me(request: Request, user=Depends(resolve_user), api_key: str = Security(verify_api_key)):
+    return {"admin": is_admin(user)}
 
 
 @app.get("/admin/review/queue")
-async def admin_review_queue(
+@limiter.limit(ADMIN_LIMIT)
+def admin_review_queue(
     request: Request,
     view: str = Query(default="pending", pattern="^(pending|no_match|live)$"),
     platform: Optional[str] = Query(default=None, pattern="^(alibaba|aliexpress)$"),
     limit: int = Query(default=50, ge=1, le=200),
+    user=Depends(resolve_user),
     api_key: str = Security(verify_api_key),
 ):
     """Products to look at. pending: has near-misses waiting. no_match: last sourcing found nothing
@@ -1515,14 +1904,18 @@ async def admin_review_queue(
 
 
 @app.get("/admin/review/products/{product_id}")
-async def admin_review_product(product_id: str, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_review_product(product_id: str, request: Request, user=Depends(resolve_user),
+                         api_key: str = Security(verify_api_key)):
     """Everything about one product's sourcing: live suppliers, near-misses, rejected, last runs."""
     require_admin_user(request)
-    product = (supabase.table("tiktok_products").select(
+    pid = parse_uuid(product_id)
+    rows = (supabase.table("tiktok_products").select(
         "id, product_name, tiktok_price, thumbnail_url, image_storage_url, category, virality_score"
-    ).eq("id", product_id).single().execute().data)
-    if not product:
+    ).eq("id", pid).limit(1).execute().data) if pid else []
+    if not rows:
         raise HTTPException(status_code=404, detail="Product not found")
+    product, product_id = rows[0], pid
     suppliers = (supabase.table("suppliers").select("*").eq("tiktok_product_id", product_id)
                  .order("similarity", desc=True, nullsfirst=False).execute().data or [])
     for s in suppliers:
@@ -1537,9 +1930,12 @@ async def admin_review_product(product_id: str, request: Request, api_key: str =
 
 
 @app.post("/admin/candidates/{candidate_id}/approve")
-async def admin_approve_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_approve_candidate(candidate_id: int, request: Request, user=Depends(resolve_user),
+                            api_key: str = Security(verify_api_key)):
     admin = require_admin_user(request)
-    c = supabase.table("supplier_candidates").select("*").eq("id", candidate_id).single().execute().data
+    found = supabase.table("supplier_candidates").select("*").eq("id", candidate_id).limit(1).execute().data
+    c = found[0] if found else None
     if not c:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if c["status"] == "approved":
@@ -1567,7 +1963,9 @@ async def admin_approve_candidate(candidate_id: int, request: Request, api_key: 
 
 
 @app.post("/admin/candidates/{candidate_id}/reject")
-async def admin_reject_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_reject_candidate(candidate_id: int, request: Request, user=Depends(resolve_user),
+                           api_key: str = Security(verify_api_key)):
     admin = require_admin_user(request)
     supabase.table("supplier_candidates").update(
         {"status": "rejected", "reviewed_by": admin, "reviewed_at": _now()}
@@ -1576,10 +1974,13 @@ async def admin_reject_candidate(candidate_id: int, request: Request, api_key: s
 
 
 @app.post("/admin/candidates/{candidate_id}/reopen")
-async def admin_reopen_candidate(candidate_id: int, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_reopen_candidate(candidate_id: int, request: Request, user=Depends(resolve_user),
+                           api_key: str = Security(verify_api_key)):
     """Undo a reject (or an approve: the supplier row it created is hidden)."""
     admin = require_admin_user(request)
-    c = supabase.table("supplier_candidates").select("status, supplier_id").eq("id", candidate_id).single().execute().data
+    found = supabase.table("supplier_candidates").select("status, supplier_id").eq("id", candidate_id).limit(1).execute().data
+    c = found[0] if found else None
     if not c:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if c.get("supplier_id"):
@@ -1595,8 +1996,9 @@ class SupplierVisibility(BaseModel):
 
 
 @app.post("/admin/suppliers/{supplier_id}/visibility")
-async def admin_supplier_visibility(supplier_id: int, body: SupplierVisibility, request: Request,
-                                    api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_supplier_visibility(supplier_id: int, body: SupplierVisibility, request: Request,
+                              user=Depends(resolve_user), api_key: str = Security(verify_api_key)):
     """Hide a wrong auto-match from users (or show it again). Re-sourcing keeps it hidden."""
     admin = require_admin_user(request)
     supabase.table("suppliers").update(
@@ -1618,13 +2020,19 @@ class ManualSupplier(BaseModel):
 
 
 @app.post("/admin/suppliers")
-async def admin_add_supplier(body: ManualSupplier, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_add_supplier(body: ManualSupplier, request: Request, user=Depends(resolve_user),
+                       api_key: str = Security(verify_api_key)):
     """Add a supplier the search missed (paste the listing link)."""
     admin = require_admin_user(request)
     if body.platform not in ("alibaba", "aliexpress", "amazon"):
         raise HTTPException(status_code=400, detail="Platform must be alibaba, aliexpress or amazon")
-    if not body.supplier_url.startswith("https://"):
+    if not body.supplier_url.strip().startswith("https://") or not is_http_url(body.supplier_url.strip()):
         raise HTTPException(status_code=400, detail="Paste the full https:// link")
+    if not parse_uuid(body.product_id):
+        raise HTTPException(status_code=400, detail="Unknown product")
+    if body.image_url and not is_http_url(body.image_url.strip()):
+        raise HTTPException(status_code=400, detail="Image link must start with https://")
     row = {
         "tiktok_product_id": body.product_id, "platform": body.platform,
         "supplier_name": body.supplier_name.strip(), "product_title": body.product_title,
@@ -1652,8 +2060,6 @@ async def admin_add_supplier(body: ManualSupplier, request: Request, api_key: st
 import threading as _threading
 import uuid as _uuid
 import shutil as _shutil
-from typing import List as _List
-from fastapi import Form
 
 import import_kalodata as _kalo
 
@@ -1697,62 +2103,111 @@ def _run_import(job: dict, files: list, dry_run: bool, rehost: bool, deactivate:
             _IMPORT_LOCK.release()
 
 
+_UPLOAD_OVERHEAD = 1024 * 1024   # multipart boundaries + form fields on top of the file bytes
+
+
+def _require_content_length(request: Request, max_bytes: int) -> None:
+    """Reject before reading a single body byte. uvicorn/h11 never deliver more than the declared
+    Content-Length, so checking the header caps the whole body."""
+    raw = request.headers.get("content-length")
+    if raw is None or not raw.isdigit():
+        raise HTTPException(status_code=411, detail="Upload size unknown (Content-Length required)")
+    if int(raw) > max_bytes + _UPLOAD_OVERHEAD:
+        raise HTTPException(status_code=413, detail=f"Files are larger than {max_bytes // (1024 * 1024)} MB in total")
+
+
+async def _copy_upload(up, fh, budget: int) -> int:
+    """Copy an UploadFile to fh in 1 MB chunks; stop with 413 once `budget` bytes are exceeded."""
+    n = 0
+    while True:
+        chunk = await up.read(1024 * 1024)
+        if not chunk:
+            return n
+        n += len(chunk)
+        if n > budget:
+            raise HTTPException(status_code=413, detail=f"Files are larger than {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB in total")
+        fh.write(chunk)
+
+
+def _form_bool(v, default: bool) -> bool:
+    if v is None or isinstance(v, (bytes,)) or hasattr(v, "read"):
+        return default
+    v = str(v).strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 @app.post("/admin/import")
+@limiter.limit(ADMIN_LIMIT)
 async def admin_import(
     request: Request,
-    files: _List[UploadFile] = File(...),
-    dry_run: bool = Form(True),
-    deactivate: bool = Form(True),
-    rehost: bool = Form(True),
+    user=Depends(resolve_user),
     api_key: str = Security(verify_api_key),
 ):
-    """Upload Kalodata CSV exports. Each file's type (products / creators / shops) is read from its columns."""
-    admin = require_admin_user(request)
-    if not files:
-        raise HTTPException(status_code=400, detail="Add at least one CSV file")
+    """Upload Kalodata CSV exports (multipart: files[], dry_run, deactivate, rehost).
+    Each file's type (products / creators / shops) is read from its columns.
+    The admin check and the size check run BEFORE the body is read: this route has no File()/Form()
+    params, so FastAPI doesn't parse the multipart body up front (audit M6)."""
+    admin = require_admin_user(request)          # user already resolved (in the threadpool) by resolve_user
+    _require_content_length(request, _MAX_UPLOAD_BYTES)
+    form = await request.form(max_files=50, max_fields=20)
     folder = tempfile.mkdtemp(prefix="kalo_")
-    saved, total = [], 0
-    for up in files:
-        name = os.path.basename(up.filename or "file.csv")
-        if not name.lower().endswith(".csv"):
-            _shutil.rmtree(folder, ignore_errors=True)
-            raise HTTPException(status_code=400, detail=f"{name} is not a .csv file")
-        data = await up.read()
-        total += len(data)
-        if total > _MAX_UPLOAD_BYTES:
-            _shutil.rmtree(folder, ignore_errors=True)
-            raise HTTPException(status_code=413, detail="Files are larger than 30 MB in total")
-        path = os.path.join(folder, f"{len(saved)}_{name}")
-        with open(path, "wb") as fh:
-            fh.write(data)
-        saved.append({"name": name, "path": path, "kind": _kalo.detect_kind(path), "bytes": len(data)})
+    handed_off = False
+    try:
+        files = [f for f in form.getlist("files") if hasattr(f, "read")]
+        dry_run = _form_bool(form.get("dry_run"), True)
+        deactivate = _form_bool(form.get("deactivate"), True)
+        rehost = _form_bool(form.get("rehost"), True)
+        if not files:
+            raise HTTPException(status_code=400, detail="Add at least one CSV file")
+        saved, total = [], 0
+        for up in files:
+            name = os.path.basename(up.filename or "file.csv")
+            if not name.lower().endswith(".csv"):
+                raise HTTPException(status_code=400, detail=f"{name} is not a .csv file")
+            path = os.path.join(folder, f"{len(saved)}_{name}")
+            with open(path, "wb") as fh:
+                size = await _copy_upload(up, fh, _MAX_UPLOAD_BYTES - total)
+            total += size
+            saved.append({"name": name, "path": path, "kind": None, "bytes": size})
+        for f in saved:
+            f["kind"] = await run_in_threadpool(_kalo.detect_kind, f["path"])
 
-    unknown = [f["name"] for f in saved if not f["kind"]]
-    job = {"id": _uuid.uuid4().hex[:12], "status": "running", "dry_run": dry_run, "by": admin,
-           "started_at": _now(), "finished_at": None, "log": [], "dir": folder,
-           "files": [{k: f[k] for k in ("name", "kind", "bytes")} for f in saved]}
-    if unknown:
-        job["log"].append(f"Not recognised as a Kalodata export, skipped: {', '.join(unknown)}")
-    if not any(f["kind"] for f in saved):
-        _shutil.rmtree(folder, ignore_errors=True)
-        raise HTTPException(status_code=400, detail="None of these files look like Kalodata product, creator or shop exports")
+        unknown = [f["name"] for f in saved if not f["kind"]]
+        job = {"id": _uuid.uuid4().hex[:12], "status": "running", "dry_run": dry_run, "by": admin,
+               "started_at": _now(), "finished_at": None, "log": [], "dir": folder,
+               "files": [{k: f[k] for k in ("name", "kind", "bytes")} for f in saved]}
+        if unknown:
+            job["log"].append(f"Not recognised as a Kalodata export, skipped: {', '.join(unknown)}")
+        if not any(f["kind"] for f in saved):
+            raise HTTPException(status_code=400, detail="None of these files look like Kalodata product, creator or shop exports")
 
-    if dry_run:  # fast, writes nothing: run it now and answer with the preview
-        _run_import(job, saved, True, False, False)
+        if dry_run:  # writes nothing; parsed in the threadpool so big files don't stall the API
+            handed_off = True                    # _run_import removes the folder
+            await run_in_threadpool(_run_import, job, saved, True, False, False)
+            return {k: v for k, v in job.items() if k != "dir"}
+
+        if not _IMPORT_LOCK.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="An import is already running. Wait for it to finish.")
+        _IMPORT_JOBS[job["id"]] = job
+        for old in sorted(_IMPORT_JOBS, key=lambda j: _IMPORT_JOBS[j]["started_at"])[:-10]:
+            _IMPORT_JOBS.pop(old, None)
+        handed_off = True
+        _threading.Thread(target=_run_import, args=(job, saved, False, rehost, deactivate), daemon=True).start()
         return {k: v for k, v in job.items() if k != "dir"}
-
-    if not _IMPORT_LOCK.acquire(blocking=False):
-        _shutil.rmtree(folder, ignore_errors=True)
-        raise HTTPException(status_code=409, detail="An import is already running. Wait for it to finish.")
-    _IMPORT_JOBS[job["id"]] = job
-    for old in sorted(_IMPORT_JOBS, key=lambda j: _IMPORT_JOBS[j]["started_at"])[:-10]:
-        _IMPORT_JOBS.pop(old, None)
-    _threading.Thread(target=_run_import, args=(job, saved, False, rehost, deactivate), daemon=True).start()
-    return {k: v for k, v in job.items() if k != "dir"}
+    finally:
+        await form.close()
+        if not handed_off:
+            _shutil.rmtree(folder, ignore_errors=True)
 
 
 @app.get("/admin/import/{job_id}")
-async def admin_import_status(job_id: str, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_import_status(job_id: str, request: Request, user=Depends(resolve_user),
+                        api_key: str = Security(verify_api_key)):
     require_admin_user(request)
     job = _IMPORT_JOBS.get(job_id)
     if not job:
@@ -1761,7 +2216,8 @@ async def admin_import_status(job_id: str, request: Request, api_key: str = Secu
 
 
 @app.get("/admin/import")
-async def admin_import_list(request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_import_list(request: Request, user=Depends(resolve_user), api_key: str = Security(verify_api_key)):
     require_admin_user(request)
     jobs = sorted(_IMPORT_JOBS.values(), key=lambda j: j["started_at"], reverse=True)
     return {"imports": [{k: v for k, v in j.items() if k not in ("dir", "log")} for j in jobs]}
@@ -1782,7 +2238,9 @@ class SourcingRun(BaseModel):
 
 
 @app.post("/admin/sourcing/run")
-async def admin_sourcing_run(body: SourcingRun, request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_sourcing_run(body: SourcingRun, request: Request, user=Depends(resolve_user),
+                       api_key: str = Security(verify_api_key)):
     admin = require_admin_user(request)
     if body.mode not in ("new", "all"):
         raise HTTPException(status_code=400, detail="mode must be new or all")
@@ -1790,8 +2248,8 @@ async def admin_sourcing_run(body: SourcingRun, request: Request, api_key: str =
     url = f"https://api.github.com/repos/{_GH_REPO}/actions/workflows/{_GH_WORKFLOW}/dispatches"
     payload = {"ref": _GH_REF, "inputs": {"mode": body.mode, "max_requests": str(max_req),
                                           "limit": str(max(0, int(body.limit))), "started_by": admin}}
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.post(url, headers=_gh_headers(), json=payload)
+    with httpx.Client(timeout=20) as c:
+        r = c.post(url, headers=_gh_headers(), json=payload)
     if r.status_code != 204:
         msg = {401: "GitHub token is wrong or expired", 403: "GitHub token can't run Actions on this repo",
                404: "Workflow not found: check GITHUB_REPO and that .github/workflows/presource.yml is on main",
@@ -1801,11 +2259,12 @@ async def admin_sourcing_run(body: SourcingRun, request: Request, api_key: str =
 
 
 @app.get("/admin/sourcing/runs")
-async def admin_sourcing_runs(request: Request, api_key: str = Security(verify_api_key)):
+@limiter.limit(ADMIN_LIMIT)
+def admin_sourcing_runs(request: Request, user=Depends(resolve_user), api_key: str = Security(verify_api_key)):
     require_admin_user(request)
     url = f"https://api.github.com/repos/{_GH_REPO}/actions/workflows/{_GH_WORKFLOW}/runs?per_page=5"
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(url, headers=_gh_headers())
+    with httpx.Client(timeout=20) as c:
+        r = c.get(url, headers=_gh_headers())
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"GitHub error {r.status_code}")
     runs = [{"id": x["id"], "status": x["status"], "conclusion": x.get("conclusion"),

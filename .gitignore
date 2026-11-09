@@ -6,6 +6,9 @@
 *APIs*.txt
 *sendgrid*.txt
 credentials.json
+secrets*.txt
+*.pem
+*service-account*.json
 
 # python
 venv/

@@ -26,7 +26,7 @@ GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
 GHOST_ADMIN_API_KEY = os.getenv("GHOST_ADMIN_API_KEY")
 GHOST_URL           = os.getenv("GHOST_URL", "https://blog.tikprofitpro.shop")
 UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
-INDEXNOW_KEY        = os.getenv("INDEXNOW_KEY", "tikprofitpro2026xK9mN3")
+INDEXNOW_KEY        = os.getenv("INDEXNOW_KEY", "")
 
 KEYWORDS = [
     "how to find trending products on TikTok Shop USA 2026",

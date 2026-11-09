@@ -726,6 +726,22 @@ def save_suppliers(
     return saved
 
 
+# Columns customers may see. Never select("*") for user-facing supplier rows: that leaks
+# reviewed_by (an admin's email), reviewed_at, hidden and other internal fields.
+SUPPLIER_PUBLIC_COLUMNS = (
+    "id, tiktok_product_id, platform, supplier_name, product_title, unit_cost_min, unit_cost_max, moq, "
+    "supplier_url, image_url, similarity, match_method, external_product_id, orders, rating, "
+    "years_on_platform, supplier_trust_score, verified_supplier, shipping_estimate_days, "
+    "shipping_cost_estimate, whitelabel_available, sourced_at"
+)
+SUPPLIER_PUBLIC_FIELDS = {c.strip() for c in SUPPLIER_PUBLIC_COLUMNS.split(",")}
+
+
+def public_supplier(row: dict) -> dict:
+    """Drop internal fields; keep computed ones (_profit, _image_url, _match_method)."""
+    return {k: v for k, v in (row or {}).items() if k in SUPPLIER_PUBLIC_FIELDS or k.startswith("_")}
+
+
 # ==============================================================================
 # MAIN FUNCTION — Called from FastAPI endpoints
 # ==============================================================================
@@ -757,9 +773,10 @@ def find_suppliers_by_platform(
     # Cache: results already found for this product+platform (shared by all users)
     existing = (
         supabase.table("suppliers")
-        .select("*")
+        .select(SUPPLIER_PUBLIC_COLUMNS)
         .eq("tiktok_product_id", product_id)
         .eq("platform", platform)
+        .not_.is_("hidden", "true")          # a supplier an admin hid stays hidden here too
         .execute()
     )
     if existing.data:
