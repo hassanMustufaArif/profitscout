@@ -199,6 +199,9 @@ def require_admin(request: Request):
 FREE_PRODUCT_LIMIT = 10
 FREE_CACHE_SECONDS = 300
 MIN_SIMILARITY = float(os.getenv("SOURCING_MIN_SIMILARITY", "0.80"))
+# Matching off (default since 2026-11-11): unscored "auto" rows from sourcing are shown, top 3.
+SOURCING_MATCHING = os.getenv("SOURCING_MATCHING", "off").strip().lower() == "on"
+SUPPLIER_KEEP = int(os.getenv("SOURCING_KEEP_TOP", "3"))
 UPGRADE_MESSAGE = "This product is part of the Pro catalogue. Upgrade to Pro to see it."
 
 
@@ -648,14 +651,15 @@ def _dedupe_key(r: dict):
     return ("name", (r.get("supplier_name") or "").strip().lower(), round(float(r.get("unit_cost_min") or 0), 2))
 
 
-def verified_suppliers(product: dict, platform: str, keep: int = 5) -> list[dict]:
+def verified_suppliers(product: dict, platform: str, keep: int | None = None) -> list[dict]:
     """Saved suppliers that passed the photo check, best match first, no duplicates.
     Rows without a similarity score (old keyword-only results) are never shown or charged for."""
     from supplier_engine import calculate_profit
     rows = (
         supabase.table("suppliers").select(SUPPLIER_PUBLIC_COLUMNS)
         .eq("tiktok_product_id", product["id"]).eq("platform", platform)
-        .or_(f"similarity.gte.{MIN_SIMILARITY},match_method.eq.manual")   # auto-verified or hand-approved
+        .or_(f"similarity.gte.{MIN_SIMILARITY},match_method.eq.manual"
+             + ("" if SOURCING_MATCHING else ",match_method.eq.auto"))   # verified, hand-approved, or (matching off) auto
         .not_.is_("hidden", "true")
         .execute().data or []
     )
@@ -664,8 +668,14 @@ def verified_suppliers(product: dict, platform: str, keep: int = 5) -> list[dict
         sim = float(r.get("similarity") or 0)
         return max(sim, MIN_SIMILARITY) if r.get("match_method") == "manual" else sim
 
+    def order(r):  # scored rows by match then price; unscored auto rows keep the search order (insert id)
+        if r.get("match_method") == "auto" and r.get("similarity") is None:
+            return (1, 0, int(r.get("id") or 0))
+        return (0, -round(score(r), 2), float(r.get("unit_cost_min") or 1e9))
+
+    keep = keep or SUPPLIER_KEEP
     seen, out = set(), []
-    for r in sorted(rows, key=lambda r: (-round(score(r), 2), float(r.get("unit_cost_min") or 1e9))):
+    for r in sorted(rows, key=order):
         k = _dedupe_key(r)
         if k in seen:
             continue
@@ -758,7 +768,7 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
             .order("id", desc=True).limit(1).execute().data
         )
         state = last[0]["status"] if last else "pending"
-        msg = (f"No {platform.title()} supplier matched this product's photo closely enough. No credit used."
+        msg = (f"No {platform.title()} suppliers found for this product. No credit used."
                if state == "no_match" else
                f"{platform.title()} suppliers for this product are being prepared. Check back soon. No credit used.")
         return {"success": False, "status": "no_match" if state == "no_match" else "not_sourced",
@@ -2166,8 +2176,8 @@ async def admin_import(
         saved, total = [], 0
         for up in files:
             name = os.path.basename(up.filename or "file.csv")
-            if not name.lower().endswith(".csv"):
-                raise HTTPException(status_code=400, detail=f"{name} is not a .csv file")
+            if not name.lower().endswith((".csv", ".xlsx")):
+                raise HTTPException(status_code=400, detail=f"{name} is not a .csv or .xlsx file")
             path = os.path.join(folder, f"{len(saved)}_{name}")
             with open(path, "wb") as fh:
                 size = await _copy_upload(up, fh, _MAX_UPLOAD_BYTES - total)
@@ -2181,9 +2191,9 @@ async def admin_import(
                "started_at": _now(), "finished_at": None, "log": [], "dir": folder,
                "files": [{k: f[k] for k in ("name", "kind", "bytes")} for f in saved]}
         if unknown:
-            job["log"].append(f"Not recognised as a Kalodata export, skipped: {', '.join(unknown)}")
+            job["log"].append(f"Not recognised as a Kalodata or FastMoss product export, skipped: {', '.join(unknown)}")
         if not any(f["kind"] for f in saved):
-            raise HTTPException(status_code=400, detail="None of these files look like Kalodata product, creator or shop exports")
+            raise HTTPException(status_code=400, detail="None of these files look like Kalodata or FastMoss product exports")
 
         if dry_run:  # writes nothing; parsed in the threadpool so big files don't stall the API
             handed_off = True                    # _run_import removes the folder
