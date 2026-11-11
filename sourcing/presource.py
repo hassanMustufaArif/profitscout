@@ -35,6 +35,8 @@ from .http_sources import aliexpress_by_image, aliexpress_by_text, alibaba_by_im
 from .oxylabs import Budget, OxylabsError
 from .store import save_candidates, save_suppliers
 
+from db_paging import fetch_all  # repo root (run as python -m sourcing.presource)
+
 load_dotenv()
 sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 IMG_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
@@ -117,18 +119,23 @@ def _record(product_id: str, platform: str, res: dict) -> None:
 
 
 def _targets(new: bool, stale_days: int | None, limit: int, platforms: tuple) -> list[tuple[dict, str]]:
-    prods = (
+    # Page through everything: PostgREST silently caps one response at max-rows (default 1000),
+    # which made already-sourced products look new and re-sourced them (paid Oxylabs calls).
+    prods = fetch_all(lambda: (
         sb.table("tiktok_products")
         .select("id, product_name, tiktok_price, thumbnail_url, image_storage_url, virality_score")
-        .eq("is_active", True).order("virality_score", desc=True).limit(5000).execute().data
-    )
+        .eq("is_active", True).order("virality_score", desc=True).order("id")
+    ), max_rows=20000)
     # NB: --stale-days 0 means "redo everything", so test for None, not falsiness.
     since = (datetime.now(timezone.utc) - timedelta(days=stale_days)).isoformat() if stale_days is not None else None
     out = []
     for platform in platforms:
-        q = sb.table("sourcing_jobs").select("product_id, finished_at").eq("platform", platform).in_("status", ["done", "no_match"])
+        rows = fetch_all(lambda: (
+            sb.table("sourcing_jobs").select("id, product_id, finished_at")
+            .eq("platform", platform).in_("status", ["done", "no_match"]).order("id")
+        ))
         done = {}
-        for row in q.limit(20000).execute().data:
+        for row in rows:
             done[str(row["product_id"])] = max(done.get(str(row["product_id"]), ""), row.get("finished_at") or "")
         for p in prods:
             last = done.get(str(p["id"]))
