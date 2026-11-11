@@ -219,6 +219,31 @@ def fastmoss_end_date(filename: str) -> date:
 
 FASTMOSS_WINDOW_DAYS = int(os.getenv("FASTMOSS_WINDOW_DAYS", "1"))   # Sales Rank export = 1 day
 
+# If the export carries its own date range, it wins over FASTMOSS_WINDOW_DAYS + the filename date.
+FASTMOSS_DATE_COLUMNS = ("Date Range", "Date range", "Time Range", "Time range", "Data Range",
+                         "Period", "Statistical Period", "Stat Period")
+_DATE_RX = re.compile(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})")
+
+
+def fastmoss_row_window(row):
+    """(start, end, days) from a date-range column like '2026-11-04~2026-11-10' or
+    '2026/11/04 - 2026/11/10' (one date = a 1-day window), else None."""
+    for name in FASTMOSS_DATE_COLUMNS:
+        v = row.get(name)
+        if v in (None, "", "-"):
+            continue
+        found = []
+        for y, m, d in _DATE_RX.findall(str(v)):
+            try:
+                found.append(date(int(y), int(m), int(d)))
+            except ValueError:
+                pass
+        if not found:
+            continue
+        start, end = min(found[:2]), max(found[:2])
+        return start, end, (end - start).days + 1
+    return None
+
 
 def parse_fastmoss_product(row):
     pid = re.search(r"(\d{15,20})", str(row.get("Product ID") or ""))
@@ -226,9 +251,15 @@ def parse_fastmoss_product(row):
     name = (row.get("Product Name") or "").strip()
     if not pid or not name:
         return None, f"skipped (missing id/name): {name[:50]}"
-    days = FASTMOSS_WINDOW_DAYS
-    end = fastmoss_end_date(row.get("_file", ""))
-    start = end - timedelta(days=days - 1)
+    window = fastmoss_row_window(row)
+    if window:
+        start, end, days = window
+        if end > latest_allowed_date():
+            return None, f"skipped (date range ends in the future, {end}): {name[:50]}"
+    else:
+        days = FASTMOSS_WINDOW_DAYS
+        end = fastmoss_end_date(row.get("_file", ""))
+        start = end - timedelta(days=days - 1)
     pmin, pmax = price_range(col(row, "Price"))
     revenue = num(col(row, "Revenue"))
     orders = num(col(row, "Orders"))
@@ -247,7 +278,7 @@ def parse_fastmoss_product(row):
         "rating": None,
         "commission_rate": num(col(row, "Commission Rate")),
         "launch_date": str(launch) if launch else None,
-        "creator_count": 0,
+        "creator_count": None,                   # FastMoss Sales Rank has no creator count: unknown, not 0
         "creator_conversion_pct": None,
         "revenue_window": revenue,
         "units_window": int(orders) if orders else None,
@@ -268,7 +299,7 @@ def parse_fastmoss_product(row):
     snap = {
         "tiktok_product_id": pid, "data_start_date": str(start), "data_end_date": str(end),
         "window_days": days, "revenue": revenue, "units_sold": p["units_window"],
-        "avg_unit_price": avg_price, "creator_count": 0, "video_revenue": None,
+        "avg_unit_price": avg_price, "creator_count": None, "video_revenue": None,
         "live_revenue": None, "mall_revenue": None, "rating": None,
     }
     return (p, snap), None
@@ -448,14 +479,24 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
             p["growth_source"] = "unknown"
         p["gmv_growth_pct"] = growth
         launch = parse_date(p["launch_date"]) if p["launch_date"] else None
-        p["trend_phase"] = stage(growth, launch, p["creator_count"], parse_date(p["data_end_date"]))
-        p["virality_score"] = momentum_score(rev_day, growth, p["creator_count"], p["creator_conversion_pct"], p["rating"])
+        p["trend_phase"] = stage(growth, launch, p["creator_count"] or 0, parse_date(p["data_end_date"]))
+        p["virality_score"] = momentum_score(rev_day, growth, p["creator_count"] or 0, p["creator_conversion_pct"], p["rating"])
         if rehost and p["thumbnail_url"]:
             p["image_storage_url"] = rehost_image(sb, p["tiktok_product_id"], p["thumbnail_url"])
         records.append(p)
 
     for i in range(0, len(records), BATCH):
-        sb.table("tiktok_products").upsert(records[i:i + BATCH], on_conflict="tiktok_product_id").execute()
+        batch = records[i:i + BATCH]
+        try:
+            sb.table("tiktok_products").upsert(batch, on_conflict="tiktok_product_id").execute()
+        except Exception as e:
+            # creator_count still NOT NULL (migration 20261111_launch_day.sql not run): store 0 as before.
+            if "creator_count" in str(e) and ("23502" in str(e) or "null value" in str(e).lower()):
+                log("  creator_count is NOT NULL in the DB; writing 0 (run 20261111_launch_day.sql)")
+                batch = [dict(r, creator_count=r["creator_count"] if r["creator_count"] is not None else 0) for r in batch]
+                sb.table("tiktok_products").upsert(batch, on_conflict="tiktok_product_id").execute()
+            else:
+                raise
         log(f"  upserted {min(i + BATCH, len(records))}/{len(records)}")
 
     # 3) cached suppliers were matched against the old title/price: keep them, the
@@ -469,6 +510,7 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
         sb.table("tiktok_products").update({"is_active": False}).lt("data_end_date", cutoff).execute()
         log(f"  retired v1 rows and products last seen before {cutoff}")
     log("Done.")
+    return {"products": len(records), "skipped": len(problems), "flagged": len(flagged)}
 
 
 def detect_kind(path: str) -> str | None:

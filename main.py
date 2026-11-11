@@ -18,6 +18,7 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from supplier_engine import find_suppliers, find_suppliers_by_platform, initialize_credits
 import credits as credits_v2
+from db_paging import fetch_all, count_exact
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from openai import AsyncOpenAI
@@ -337,6 +338,7 @@ def get_products(
             .gte("virality_score", min_score)
             .lte("virality_score", max_score)
             .order("virality_score", desc=True)
+            .order("id")                      # stable tiebreaker: many products share a score
             .range(offset, offset + limit - 1)
         )
 
@@ -437,6 +439,7 @@ def get_products_by_tier(
                 .gte("virality_score", min_score)
                 .lte("virality_score", max_score)
                 .order("virality_score", desc=True)
+                .order("id")                  # stable tiebreaker for paging
                 .range(offset, offset + limit - 1)
                 .execute()
             ).data
@@ -460,22 +463,26 @@ def get_products_by_tier(
 @limiter.limit(LIST_LIMIT, key_func=ip_key)
 def get_stats(request: Request, api_key: str = Security(verify_api_key)):
     try:
-        all_products = (
-            supabase.table("tiktok_products")
-            .select("virality_score, trend_phase, category")
-            .eq("is_active", True)
-            .execute()
-        )
+        # Exact counts (PostgREST caps a plain select at max-rows, default 1000).
+        def n(lo=None, below=None):
+            def build():
+                q = supabase.table("tiktok_products").select("id", count="exact").eq("is_active", True)
+                if lo is not None:
+                    q = q.gte("virality_score", lo)
+                if below is not None:
+                    q = q.lt("virality_score", below)
+                return q
+            return count_exact(build)
 
-        products = all_products.data or []
+        total  = n()
+        hot    = n(80)
+        rising = n(65, 80)
+        watch  = n(50, 65)
 
-        hot    = len([p for p in products if p["virality_score"] >= 80])
-        rising = len([p for p in products if 65 <= p["virality_score"] < 80])
-        watch  = len([p for p in products if 50 <= p["virality_score"] < 65])
-        total  = len(products)
-
+        rows = fetch_all(lambda: supabase.table("tiktok_products").select("id, category")
+                         .eq("is_active", True).order("id"))
         categories = {}
-        for p in products:
+        for p in rows:
             cat = p.get("category") or "Other"
             categories[cat] = categories.get(cat, 0) + 1
         top_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -618,6 +625,7 @@ def search_products(
             .eq("is_active", True)
             .ilike("product_name", f"%{q}%")
             .order("virality_score", desc=True)
+            .order("id")                      # stable tiebreaker for paging
             .range(offset, offset + limit - 1)
             .execute()
         )
@@ -649,6 +657,20 @@ def _dedupe_key(r: dict):
     if ext:
         return ("ext", str(ext))
     return ("name", (r.get("supplier_name") or "").strip().lower(), round(float(r.get("unit_cost_min") or 0), 2))
+
+
+def supplier_visible(r: dict) -> bool:
+    """Same rule as verified_suppliers' filter: not hidden, and hand-approved, a verified photo
+    match, or (matching off) an unscored 'auto' search-order row. Admin review uses it so auto
+    rows users DO see are listed as live, not 'below threshold' (audit S7)."""
+    if r.get("hidden"):
+        return False
+    method = r.get("match_method")
+    if method == "manual":
+        return True
+    if not SOURCING_MATCHING and method == "auto":
+        return True
+    return r.get("similarity") is not None and float(r.get("similarity") or 0) >= MIN_SIMILARITY
 
 
 def verified_suppliers(product: dict, platform: str, keep: int | None = None) -> list[dict]:
@@ -724,6 +746,24 @@ _amazon_inflight: set = set()
 _amazon_inflight_lock = threading.Lock()
 
 
+def _plan_for_email(email: str) -> str:
+    """users.plan for this email; 'free' when there is no row or the lookup fails (fail closed)."""
+    try:
+        rows = supabase.table("users").select("plan").eq("user_email", normalize_email(email)).limit(1).execute().data
+        return normalize_plan(rows[0].get("plan") if rows else None)
+    except Exception:
+        logger.exception("plan lookup failed")
+        return "free"
+
+
+def _safe_is_unlocked(email: str, product_id: str, platform: str) -> bool:
+    try:
+        return bool(credits_v2.is_unlocked(email, product_id, platform))
+    except Exception:
+        logger.exception("is_unlocked failed")
+        return False
+
+
 def _supplier_search(product_id: str, platform: str, request: Request, photo: bool):
     if platform not in ("alibaba", "aliexpress", "amazon"):
         raise HTTPException(status_code=400, detail="Platform must be: alibaba, aliexpress, or amazon")
@@ -745,6 +785,12 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
         raise HTTPException(status_code=404, detail="Product not found")
     product = rows[0]
     product_id = pid
+
+    # Free plan: suppliers only for the fixed top 10 (audit S3). Checked before any charge.
+    # A product the user already unlocked (e.g. it left the top 10 since) stays free to reopen.
+    if not is_paid(_plan_for_email(user_email)) and pid not in free_top_product_ids():
+        if not _safe_is_unlocked(user_email, product_id, platform):
+            raise HTTPException(status_code=403, detail={"code": "upgrade_required", "message": UPGRADE_MESSAGE})
 
     def charge(mode: str) -> bool:
         # Unconfirmed email = 0 usable credits (stops throwaway-account credit farming, audit H3).
@@ -877,8 +923,25 @@ def get_credits(request: Request, user=Depends(resolve_user), api_key: str = Sec
 # ENDPOINT 11 — LemonSqueezy Webhook
 # ==============================================================================
 LEMONSQUEEZY_WEBHOOK_SECRET = os.getenv("LEMONSQUEEZY_WEBHOOK_SECRET")
-PRO_VARIANT_ID = os.getenv("LEMONSQUEEZY_PRODUCT_ID")
-ULTIMATE_VARIANT_ID = os.getenv("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID")
+def _env_ids(*names: str) -> list[str]:
+    """Comma-separated ids from several env vars, in order, without duplicates or blanks."""
+    out: list[str] = []
+    for n in names:
+        for part in (os.getenv(n) or "").split(","):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def pro_variant_ids() -> list[str]:
+    # LEMON_PRO_VARIANT_IDS: every Pro variant (monthly, yearly, discount...). The old single
+    # LEMONSQUEEZY_PRODUCT_ID (a variant id despite the name) keeps working and comes first.
+    return _env_ids("LEMONSQUEEZY_PRODUCT_ID", "LEMON_PRO_VARIANT_IDS")
+
+
+def ultimate_variant_ids() -> list[str]:
+    return _env_ids("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID", "LEMON_ULTIMATE_VARIANT_IDS")
 
 
 # Lemon Squeezy subscription statuses -> do they keep the paid plan?
@@ -890,9 +953,12 @@ PAID_STATUSES = {"active", "on_trial", "cancelled", "past_due"}
 
 
 def _plan_for_variant(variant_id: str) -> Optional[str]:
-    if variant_id and variant_id == str(ULTIMATE_VARIANT_ID or ""):
+    variant_id = str(variant_id or "").strip()
+    if not variant_id:
+        return None
+    if variant_id in ultimate_variant_ids():
         return "ultimate"
-    if variant_id and variant_id == str(PRO_VARIANT_ID or ""):
+    if variant_id in pro_variant_ids():
         return "pro"
     return None
 
@@ -950,7 +1016,8 @@ def _resolve_webhook_user(meta: dict, attrs: dict) -> tuple[str, Optional[str]]:
             logger.warning("webhook: user_id %s not found; falling back to exact email", uid)
         else:
             logger.warning("webhook: unsigned or badly signed custom user_id; falling back to exact email")
-    return (custom_email or attrs_email), None
+    # Unsigned checkout: the order email (what the buyer paid with) wins over custom data.
+    return (attrs_email or custom_email), None
 
 
 def _record_subscription(sub_id: str, email: str, user_id: Optional[str], variant_id: str,
@@ -989,13 +1056,24 @@ def _effective_plan(email: str, user_id: Optional[str], fallback: str) -> str:
     return best
 
 
+class WebhookRetry(Exception):
+    """Processing failed in a way a Lemon Squeezy retry can fix: answer 500, don't mark processed."""
+
+
 def _set_plan(email: str, plan: str, new_period: bool) -> None:
     email = normalize_email(email)
     res = supabase.table("users").update({"plan": plan}).eq("user_email", email).execute()
     if not res.data:
-        logger.error("Webhook: no users row for user %s; plan %s NOT applied (needs a manual fix)",
-                     email_hash(email), plan)
-        return
+        # No users row (signup trigger missing or late). Create it so the payment isn't lost.
+        logger.error("Webhook: no users row for user %s; creating it with plan %s", email_hash(email), plan)
+        try:
+            supabase.table("users").insert({"user_email": email, "plan": plan}).execute()
+        except Exception as e:
+            if "duplicate" in str(e).lower() or "23505" in str(e):   # created concurrently
+                supabase.table("users").update({"plan": plan}).eq("user_email", email).execute()
+            else:
+                logger.exception("Webhook: could not create users row for user %s", email_hash(email))
+                raise WebhookRetry("users row insert failed")
     try:
         if new_period:
             credits_v2.start_period(email)      # fresh 30-day allowance on each successful payment
@@ -1003,22 +1081,51 @@ def _set_plan(email: str, plan: str, new_period: bool) -> None:
             credits_v2.get_balance(email)       # applies the new allowance, keeps usage
     except credits_v2.CreditError:
         logger.exception("Webhook credit update failed for user %s", email_hash(email))
+        if new_period:
+            raise WebhookRetry("start_credit_period failed")   # the plan is set; retry restarts the period
 
 
-def _handle_webhook(payload: dict) -> dict:
+def _event_key(payload: dict) -> str:
     meta = payload.get("meta", {}) or {}
-    event_name = meta.get("event_name") or ""
     data = payload.get("data", {}) or {}
     attrs = data.get("attributes", {}) or {}
+    return (f"{meta.get('event_name') or ''}:{data.get('type')}:{data.get('id')}:"
+            f"{attrs.get('updated_at') or attrs.get('created_at')}")
 
-    # Idempotency: LS retries deliveries; process each (event, object, updated_at) once.
-    event_key = f"{event_name}:{data.get('type')}:{data.get('id')}:{attrs.get('updated_at') or attrs.get('created_at')}"
+
+def _already_processed(event_key: str) -> bool:
+    try:
+        return bool(supabase.table("webhook_events").select("id").eq("id", event_key).limit(1).execute().data)
+    except Exception:
+        logger.exception("webhook_events read failed (processing anyway; handling is idempotent)")
+        return False
+
+
+def _mark_processed(event_key: str, event_name: str) -> None:
     try:
         supabase.table("webhook_events").insert({"id": event_key, "event_name": event_name}).execute()
     except Exception as e:
         if "duplicate" in str(e).lower() or "23505" in str(e):
-            return {"status": "ok", "duplicate": True}
-        logger.exception("webhook_events insert failed (continuing)")
+            return                               # a concurrent delivery finished first
+        logger.exception("webhook_events insert failed (event was processed)")
+
+
+def _handle_webhook(payload: dict) -> dict:
+    """Idempotency: LS retries deliveries; each (event, object, updated_at) is recorded as processed
+    only AFTER it was handled. A failure raises (-> 500) so LS retries it."""
+    event_key = _event_key(payload)
+    if _already_processed(event_key):
+        return {"status": "ok", "duplicate": True}
+    result = _process_webhook(payload)
+    _mark_processed(event_key, (payload.get("meta", {}) or {}).get("event_name") or "")
+    return result
+
+
+def _process_webhook(payload: dict) -> dict:
+    meta = payload.get("meta", {}) or {}
+    event_name = meta.get("event_name") or ""
+    data = payload.get("data", {}) or {}
+    attrs = data.get("attributes", {}) or {}
 
     email, user_id = _resolve_webhook_user(meta, attrs)
     if not email:
@@ -1030,7 +1137,11 @@ def _handle_webhook(payload: dict) -> dict:
         if event_name == "subscription_payment_success":
             rows = supabase.table("users").select("plan").eq("user_email", email).limit(1).execute().data or []
             if rows and is_paid(rows[0].get("plan")):
-                credits_v2.start_period(email)
+                try:
+                    credits_v2.start_period(email)
+                except credits_v2.CreditError:
+                    logger.exception("Webhook: start_credit_period failed for user %s", email_hash(email))
+                    raise WebhookRetry("start_credit_period failed")
         return {"status": "ok"}
 
     if not event_name.startswith("subscription_"):
@@ -1056,6 +1167,16 @@ def _handle_webhook(payload: dict) -> dict:
     return {"status": "ok"}
 
 
+def _handle_webhook_or_500(payload: dict) -> dict:
+    try:
+        return _handle_webhook(payload)
+    except WebhookRetry as e:
+        logger.error("webhook not processed (%s); answering 500 so Lemon Squeezy retries", e)
+    except Exception:
+        logger.exception("webhook processing failed; answering 500 so Lemon Squeezy retries")
+    raise HTTPException(status_code=500, detail="Webhook not processed; please retry")
+
+
 @app.post("/lemonsqueezy-webhook")
 async def lemonsqueezy_webhook(request: Request):
     body = await request.body()
@@ -1070,7 +1191,9 @@ async def lemonsqueezy_webhook(request: Request):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
     # DB + GoTrue calls are synchronous: keep them off the event loop.
-    return await run_in_threadpool(_handle_webhook, payload)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    return await run_in_threadpool(_handle_webhook_or_500, payload)
 
 
 # ==============================================================================
@@ -1090,10 +1213,12 @@ def create_checkout(checkout_data: CheckoutRequest, request: Request, user=Depen
     checkout_data.email = user.email   # never trust the email in the body
     if checkout_data.plan not in ("pro", "ultimate"):
         raise HTTPException(status_code=400, detail="Unknown plan")
-    if checkout_data.plan == "ultimate":
-        variant_id = os.getenv("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID")
-    else:
-        variant_id = os.getenv("LEMONSQUEEZY_PRODUCT_ID")
+    # Checkout uses the plan's first configured variant (the old single var, else the list's first).
+    ids = ultimate_variant_ids() if checkout_data.plan == "ultimate" else pro_variant_ids()
+    variant_id = ids[0] if ids else None
+    if not variant_id:
+        logger.error("checkout: no variant configured for plan %s", checkout_data.plan)
+        raise HTTPException(status_code=503, detail="Checkout is not available right now. Please try again later.")
 
     logger.info("checkout: plan=%s user=%s", checkout_data.plan, user.id)
 
@@ -1877,17 +2002,19 @@ def admin_review_queue(
         c[key] = c.get(key, 0) + 1
 
     if view in ("pending", "no_match"):
-        q = supabase.table("supplier_candidates").select("tiktok_product_id, platform").eq("status", "pending")
-        if platform:
-            q = q.eq("platform", platform)
-        for r in q.limit(5000).execute().data or []:
+        def cand_q():
+            q = (supabase.table("supplier_candidates").select("id, tiktok_product_id, platform")
+                 .eq("status", "pending"))
+            return (q.eq("platform", platform) if platform else q).order("id")
+        for r in fetch_all(cand_q, max_rows=20000):
             bump(r["tiktok_product_id"], r["platform"], "pending")
     if view in ("no_match", "live"):
-        q = supabase.table("sourcing_jobs").select("product_id, platform, status, error, id").in_("status", ["done", "no_match"])
-        if platform:
-            q = q.eq("platform", platform)
+        def jobs_q():
+            q = (supabase.table("sourcing_jobs").select("product_id, platform, status, error, id")
+                 .in_("status", ["done", "no_match"]))
+            return (q.eq("platform", platform) if platform else q).order("id", desc=True)
         last = {}
-        for r in q.order("id", desc=True).limit(20000).execute().data or []:
+        for r in fetch_all(jobs_q, max_rows=50000):
             last.setdefault((str(r["product_id"]), r["platform"]), r)
         for key, r in last.items():
             if (view == "no_match" and r["status"] == "no_match") or (view == "live" and r["status"] == "done"):
@@ -1929,8 +2056,7 @@ def admin_review_product(product_id: str, request: Request, user=Depends(resolve
     suppliers = (supabase.table("suppliers").select("*").eq("tiktok_product_id", product_id)
                  .order("similarity", desc=True, nullsfirst=False).execute().data or [])
     for s in suppliers:
-        s["visible"] = (not s.get("hidden")) and (
-            s.get("match_method") == "manual" or float(s.get("similarity") or 0) >= MIN_SIMILARITY)
+        s["visible"] = supplier_visible(s)
     candidates = (supabase.table("supplier_candidates").select("*").eq("tiktok_product_id", product_id)
                   .in_("status", ["pending", "rejected"]).order("similarity", desc=True).execute().data or [])
     jobs = (supabase.table("sourcing_jobs").select("platform, status, error, result_count, finished_at")
