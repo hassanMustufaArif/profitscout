@@ -76,6 +76,26 @@ def similarities(reference: bytes, candidates: list[bytes | None]) -> list[float
     return [round(max(h, c), 3) for h, c in zip(hash_scores, clip_scores)]
 
 
+def top_raw(offers: list[dict], tiktok_price: float, keep: int) -> list[dict]:
+    """No photo check: keep the platform's own order (its image search ranks by look-alike),
+    drop welcome-deal prices, prices with no margin left, and duplicate listings."""
+    seen, out = set(), []
+    for o in offers:
+        if o.get("welcome_deal") or not o.get("price_min"):
+            continue
+        if tiktok_price and o["price_min"] >= tiktok_price * 0.7:
+            continue
+        key = ("id", str(o["product_id"])) if o.get("product_id") else \
+              ("name", (o.get("supplier_name") or "").strip().lower(), round(float(o["price_min"] or 0), 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(o, similarity=None))
+        if len(out) >= keep:
+            break
+    return out
+
+
 def rank(offers: list[dict], scores: list[float], tiktok_price: float, min_sim: float, keep: int,
          max_sim: float | None = None) -> list[dict]:
     """Candidates with min_sim <= similarity (< max_sim when given), usable price, best first, deduped."""

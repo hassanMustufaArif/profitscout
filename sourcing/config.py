@@ -17,7 +17,11 @@ COUNTRY = os.getenv("SOURCING_COUNTRY", "US")
 MAX_ATTEMPTS = int(os.getenv("SOURCING_MAX_ATTEMPTS", "3"))
 PAGE_TIMEOUT_MS = int(os.getenv("SOURCING_PAGE_TIMEOUT_MS", "45000"))
 MIN_SIMILARITY = float(os.getenv("SOURCING_MIN_SIMILARITY", "0.80"))   # 0-1
-KEEP_TOP = int(os.getenv("SOURCING_KEEP_TOP", "5"))
+KEEP_TOP = int(os.getenv("SOURCING_KEEP_TOP", "3"))
+# "off" (default since 2026-11-11, owner's call): no photo matching and no review queue.
+# Suppliers are saved in the order Alibaba/AliExpress photo search returns them, top KEEP_TOP.
+# "on": the CLIP + pHash check and the admin review queue, as before.
+MATCHING = os.getenv("SOURCING_MATCHING", "off").strip().lower() == "on"
 # Near-misses at or above this go to the admin review queue (same product, different bottle/label/angle).
 REVIEW_MIN_SIMILARITY = float(os.getenv("SOURCING_REVIEW_MIN_SIMILARITY", "0.60"))
 REVIEW_KEEP = int(os.getenv("SOURCING_REVIEW_KEEP", "8"))

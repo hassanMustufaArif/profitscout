@@ -81,6 +81,13 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
         except Exception as e:
             tried.append(f"{method}: {type(e).__name__}: {e}"[:160])
             continue
+        if not config.MATCHING:
+            best = match.top_raw(offers, price, config.KEEP_TOP)
+            tried.append(f"{method}: {len(offers)} results, kept {len(best)}")
+            if best:
+                save_suppliers(sb, product["id"], platform, best, "auto")
+                return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": 0}
+            continue
         best, near, s = _check(offers, ref, price, client)
         near_all += [dict(o, _method=method) for o in near]
         top = max(top, s)
@@ -89,7 +96,8 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
             save_suppliers(sb, product["id"], platform, best, method)
             _save_review(product["id"], platform, near_all)
             return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": len(near_all)}
-    _save_review(product["id"], platform, near_all)
+    if config.MATCHING:
+        _save_review(product["id"], platform, near_all)
     return {"status": "no_match", "error": "; ".join(tried) or "no results", "best": round(top, 2), "review": len(near_all)}
 
 

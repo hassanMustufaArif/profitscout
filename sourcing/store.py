@@ -39,7 +39,7 @@ def save_suppliers(sb, product_id: str, platform: str, offers: list[dict], metho
             "whitelabel_available": platform == "alibaba",
             "supplier_url": o["url"],
             "image_url": o.get("image_url"),
-            "similarity": o["similarity"],
+            "similarity": o.get("similarity"),
             "match_method": method,
             "external_product_id": o["product_id"],
             "orders": _int(o.get("orders")),

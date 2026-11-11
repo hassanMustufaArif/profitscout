@@ -162,6 +162,118 @@ def momentum_score(rev_per_day, growth_pct, creators, conv_pct, rating):
     return int(round(min(s, 100)))
 
 
+# ─── FastMoss .xlsx exports (no openpyxl needed) ─────────────────────────────
+def _xlsx_dicts(path):
+    import zipfile
+    import xml.etree.ElementTree as ET
+    m = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zipfile.ZipFile(path) as z:
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(f"{m}si"):
+                shared.append("".join(t.text or "" for t in si.iter(f"{m}t")))
+        sheets = sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+        if not sheets:
+            return []
+        table = []
+        for row in ET.fromstring(z.read(sheets[0])).iter(f"{m}row"):
+            cells = {}
+            for c in row.iter(f"{m}c"):
+                letters = re.match(r"([A-Z]+)", c.get("r", "A")).group(1)
+                idx = 0
+                for ch in letters:
+                    idx = idx * 26 + ord(ch) - 64
+                v = c.find(f"{m}v")
+                if c.get("t") == "s" and v is not None:
+                    val = shared[int(v.text)]
+                elif c.get("t") == "inlineStr":
+                    val = "".join(t.text or "" for t in c.iter(f"{m}t"))
+                else:
+                    val = v.text if v is not None else ""
+                cells[idx - 1] = val
+            if cells:
+                table.append([cells.get(i, "") for i in range(max(cells) + 1)])
+    if not table:
+        return []
+    head = [str(h or "").strip() for h in table[0]]
+    return [{h: (r[i] if i < len(r) else "") for i, h in enumerate(head) if h} for r in table[1:]]
+
+
+def is_fastmoss_products(cols) -> bool:
+    return "Product ID" in cols and "Product Name" in cols and ("Total Units Sold" in cols or "FastMoss Product Detail" in cols)
+
+
+def fastmoss_end_date(filename: str) -> date:
+    """FastMoss rank exports cover the last full day before the export date in the filename
+    (..._20261111_051446.xlsx -> 2026-11-10). Falls back to yesterday (UTC)."""
+    m = re.search(r"(20\d{6})_\d{6}", filename or "")
+    d = None
+    if m:
+        try:
+            d = datetime.strptime(m.group(1), "%Y%m%d").date()
+        except ValueError:
+            d = None
+    d = d or datetime.now(timezone.utc).date()
+    return min(d, latest_allowed_date()) - timedelta(days=1)
+
+
+FASTMOSS_WINDOW_DAYS = int(os.getenv("FASTMOSS_WINDOW_DAYS", "1"))   # Sales Rank export = 1 day
+
+
+def parse_fastmoss_product(row):
+    pid = re.search(r"(\d{15,20})", str(row.get("Product ID") or ""))
+    pid = pid.group(1) if pid else None
+    name = (row.get("Product Name") or "").strip()
+    if not pid or not name:
+        return None, f"skipped (missing id/name): {name[:50]}"
+    days = FASTMOSS_WINDOW_DAYS
+    end = fastmoss_end_date(row.get("_file", ""))
+    start = end - timedelta(days=days - 1)
+    pmin, pmax = price_range(col(row, "Price"))
+    revenue = num(col(row, "Revenue"))
+    orders = num(col(row, "Orders"))
+    avg_price = (revenue / orders) if revenue and orders else pmin
+    if avg_price and pmin and pmax and not (pmin * 0.5 <= avg_price <= pmax * 1.5):
+        avg_price = pmin
+    launch = parse_date(col(row, "Estimated Launch date"))
+    growth = num(col(row, "Order Growth Rate"))
+    p = {
+        "tiktok_product_id": pid,
+        "product_name": name[:500],
+        "category": (col(row, "Products Category") or "General").strip(),
+        "tiktok_price": round(avg_price, 2) if avg_price else None,
+        "price_min": pmin,
+        "price_max": pmax,
+        "rating": None,
+        "commission_rate": num(col(row, "Commission Rate")),
+        "launch_date": str(launch) if launch else None,
+        "creator_count": 0,
+        "creator_conversion_pct": None,
+        "revenue_window": revenue,
+        "units_window": int(orders) if orders else None,
+        "data_start_date": str(start),
+        "data_end_date": str(end),
+        "window_days": days,
+        "gmv_7d": round(revenue / days * 7, 2) if revenue else None,
+        "units_sold_7d": int(orders / days * 7) if orders else 0,
+        "live_revenue": None,
+        "video_revenue": None,
+        "tiktok_product_url": http_url(col(row, "TikTok Product Detail")) or f"https://www.tiktok.com/shop/pdp/{pid}",
+        "thumbnail_url": http_url(col(row, "Product Image")) or "",
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "is_active": (str(col(row, "Product Status") or "Available").strip().lower() != "unavailable"),
+        "_fastmoss_growth": growth,
+        "_total_units": num(col(row, "Total Units Sold")),
+    }
+    snap = {
+        "tiktok_product_id": pid, "data_start_date": str(start), "data_end_date": str(end),
+        "window_days": days, "revenue": revenue, "units_sold": p["units_window"],
+        "avg_unit_price": avg_price, "creator_count": 0, "video_revenue": None,
+        "live_revenue": None, "mall_revenue": None, "rating": None,
+    }
+    return (p, snap), None
+
+
 # ─── products ────────────────────────────────────────────────────────────────
 def load_rows(paths):
     rows = []
@@ -169,6 +281,12 @@ def load_rows(paths):
         # Uploaded files are passed as exact paths; only fall back to glob for CLI patterns, so
         # [ ] * ? in an uploaded filename can't skip the file or match its neighbours.
         for f in ([p] if os.path.exists(p) else glob.glob(p)):
+            if f.lower().endswith(".xlsx"):
+                try:
+                    rows += [dict(r, _file=os.path.basename(f)) for r in _xlsx_dicts(f)]
+                except Exception as e:
+                    print(f"could not read {f}: {e}")
+                continue
             try:
                 with open(f, newline="", encoding="utf-8-sig") as fh:
                     rows += [dict(r, _file=os.path.basename(f)) for r in csv.DictReader(fh)]
@@ -279,7 +397,7 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
     log(f"{len(rows)} rows from {len(paths)} file pattern(s)")
     parsed, problems = {}, []
     for r in rows:
-        out, err = parse_product(r)
+        out, err = parse_fastmoss_product(r) if is_fastmoss_products(r.keys()) else parse_product(r)
         if err:
             problems.append(err)
             continue
@@ -297,7 +415,7 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
         log(f"  {err}")
 
     if not parsed:
-        log("No products found in these files. Is this a Kalodata product export?")
+        log("No products found in these files. Is this a Kalodata or FastMoss product export?")
         return {"products": 0, "skipped": len(problems), "flagged": 0}
     if dry_run:
         log("Dry run: nothing written.")
@@ -316,10 +434,15 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
     for p, s in items:
         prev = growth_from_history(sb, p["tiktok_product_id"], p["data_end_date"], p["window_days"])
         rev_day = (p["revenue_window"] or 0) / (p["window_days"] or 1)
+        fm_growth = p.pop("_fastmoss_growth", None)
+        p.pop("_total_units", None)
         if prev and prev["revenue"]:
             prev_day = prev["revenue"] / prev["window_days"]
             growth = round((rev_day - prev_day) / prev_day * 100, 1) if prev_day else None
             p["growth_source"] = "snapshot"
+        elif fm_growth is not None:
+            growth = round(fm_growth, 1)             # FastMoss "Order Growth Rate" vs the previous period
+            p["growth_source"] = "fastmoss"
         else:
             growth = None
             p["growth_source"] = "unknown"
@@ -354,6 +477,10 @@ def detect_kind(path: str) -> str | None:
     if not rows:
         return None
     cols = set(rows[0].keys())
+    if is_fastmoss_products(cols):
+        return "products"
+    if path.lower().endswith(".xlsx"):
+        return None          # FastMoss creator/shop/live/video exports: not imported yet
     if cols & set(CREATOR_MAP["tiktok_handle"]) and not cols & {"Product Name"}:
         return "creators"
     if "Product Name" in cols and "Date Range" in cols:
