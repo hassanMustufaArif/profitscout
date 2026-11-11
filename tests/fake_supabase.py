@@ -56,7 +56,14 @@ class Query:
         return self._f(lambda r: r.get(c) is not None and r.get(c) <= v)
 
     def lt(self, c, v):
-        return self._f(lambda r: r.get(c) is not None and str(r.get(c)) < str(v))
+        def fn(r):
+            x = r.get(c)
+            if x is None:
+                return False
+            if isinstance(x, (int, float)) and isinstance(v, (int, float)):
+                return x < v
+            return str(x) < str(v)
+        return self._f(fn)
 
     def ilike(self, c, pat):
         g = pat.replace("%", "*").replace("_", "?").lower()
@@ -144,6 +151,8 @@ class Query:
             match = match[self.lo:self.hi + 1]
         if self.lim is not None:
             match = match[:self.lim]
+        if self.db.max_rows is not None:          # PostgREST max-rows: silently caps every response
+            match = match[:self.db.max_rows]
         if self.cols not in ("*", None):
             keep = [c.strip() for c in self.cols.split(",")]
             self.db.selected_columns.append((self.table, tuple(keep)))
@@ -203,6 +212,7 @@ class FakeDB:
         self.selected_columns = []
         self.auth_calls = 0
         self.consumed = []
+        self.max_rows = None
 
     def add_user(self, token, email, confirmed=True, plan="free", uid=None, users_row=True):
         u = FakeUser(id=uid or str(uuid.uuid4()), email=email,
