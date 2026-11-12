@@ -86,11 +86,21 @@ app = FastAPI(
 GENERIC_ERROR = "Something went wrong on our side. Please try again in a minute."
 
 
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://tikprofitpro.shop,https://www.tikprofitpro.shop,http://localhost:8080,http://localhost:5173").split(",") if o.strip()]
+
+
 @app.exception_handler(Exception)
 async def _unhandled_error(request: Request, exc: Exception):
     # Never send exception text to clients (it leaks schema / upstream details). Log it instead.
     logger.exception("unhandled error on %s %s", request.method, request.url.path)
-    return JSONResponse({"detail": GENERIC_ERROR}, status_code=500)
+    resp = JSONResponse({"detail": GENERIC_ERROR}, status_code=500)
+    # Starlette runs this handler OUTSIDE CORSMiddleware, so without these headers the browser
+    # hides the 500 and the site shows "Couldn't reach the server" instead of a real error.
+    origin = request.headers.get("origin")
+    if origin and origin in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+    return resp
 
 
 def server_error(where: str) -> HTTPException:
@@ -167,7 +177,7 @@ if os.getenv("RUN_SCHEDULER", "false") == "true":
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://tikprofitpro.shop,https://www.tikprofitpro.shop,http://localhost:8080,http://localhost:5173").split(",") if o.strip()],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
