@@ -1,7 +1,7 @@
 # "Find suppliers" button on tikprofitpro.shop/admin/upload starts this.
 # You can also start it by hand: GitHub > Actions > Find suppliers > Run workflow.
 # Repo secrets needed (Settings > Secrets and variables > Actions):
-#   SUPABASE_URL, SUPABASE_KEY (service_role), OXYLABS_USER, OXYLABS_PASS
+#   SUPABASE_URL, SUPABASE_KEY (service_role), and OXYLABS_WEB_API_KEY (or OXYLABS_USER + OXYLABS_PASS)
 name: Find suppliers
 run-name: Find suppliers (${{ inputs.mode }}, max ${{ inputs.max_requests }}) ${{ inputs.started_by }}
 
@@ -39,6 +39,7 @@ jobs:
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       OXYLABS_USER: ${{ secrets.OXYLABS_USER }}
       OXYLABS_PASS: ${{ secrets.OXYLABS_PASS }}
+      OXYLABS_WEB_API_KEY: ${{ secrets.OXYLABS_WEB_API_KEY }}
       SOURCING_MIN_SIMILARITY: ${{ vars.SOURCING_MIN_SIMILARITY || '0.80' }}
       SOURCING_REVIEW_MIN_SIMILARITY: ${{ vars.SOURCING_REVIEW_MIN_SIMILARITY || '0.60' }}
       SOURCING_MATCHING: ${{ vars.SOURCING_MATCHING || 'off' }}
@@ -72,9 +73,12 @@ jobs:
 
       - name: Check secrets
         run: |
-          for v in SUPABASE_URL SUPABASE_KEY OXYLABS_USER OXYLABS_PASS; do
+          for v in SUPABASE_URL SUPABASE_KEY; do
             if [ -z "${!v}" ]; then echo "::error::Repo secret $v is missing"; exit 1; fi
           done
+          if [ -z "$OXYLABS_WEB_API_KEY" ] && { [ -z "$OXYLABS_USER" ] || [ -z "$OXYLABS_PASS" ]; }; then
+            echo "::error::Set repo secret OXYLABS_WEB_API_KEY (or OXYLABS_USER + OXYLABS_PASS)"; exit 1
+          fi
 
       - name: Find suppliers
         # Inputs arrive through env, never pasted into the script, and are validated before use
