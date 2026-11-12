@@ -43,7 +43,8 @@ class Budget:
 def scrape(payload: dict, budget: Budget, retries: int = 2) -> str:
     """Returns page HTML. Raises OxylabsError on auth problems or repeated failure."""
     if not (USER and PASS):
-        raise OxylabsError("OXYLABS_USER / OXYLABS_PASS are not set")
+        # Not a run-stopper: the free direct photo search is the main path, Oxylabs only the fallback.
+        raise RuntimeError("blocked and no Oxylabs fallback (OXYLABS_USER / OXYLABS_PASS not set)")
     last = "unknown"
     for attempt in range(retries + 1):
         budget.take()

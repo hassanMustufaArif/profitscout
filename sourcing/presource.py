@@ -73,6 +73,7 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
     price = product.get("tiktok_price") or 0
     kw = keyword_from_title(product.get("product_name") or "")
     tried, top, near_all = [], 0.0, []
+    answered = False          # did the marketplace actually return a result list?
 
     photo = (lambda: alibaba_by_image(ref, budget)) if platform == "alibaba" else (lambda: aliexpress_by_image(ref, budget))
     text = (lambda: alibaba_by_text(kw, budget)) if platform == "alibaba" else (lambda: aliexpress_by_text(kw, budget))
@@ -92,6 +93,7 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
         except Exception as e:
             tried.append(f"{method}: {type(e).__name__}: {e}"[:160])
             continue
+        answered = True
         if not config.MATCHING:
             if not offers and method == "photo":
                 tried.append("photo: 0 results")
@@ -112,7 +114,7 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
             return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": len(near_all)}
     if config.MATCHING:
         _save_review(product["id"], platform, near_all)
-    else:
+    elif answered:            # only when the search really ran; a block keeps the old rows
         try:
             clear_auto_suppliers(sb, product["id"], platform)
         except Exception as e:
