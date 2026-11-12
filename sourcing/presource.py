@@ -23,7 +23,9 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -173,6 +175,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-requests", type=int, default=300, help="hard cap on paid Oxylabs results this run")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--workers", type=int, default=int(os.getenv("SOURCING_WORKERS", "8")),
+                    help="products sourced at the same time (default 8)")
     a = ap.parse_args()
     platforms = PLATFORMS if a.platform == "both" else (a.platform,)
     budget = Budget(a.max_requests)
@@ -194,19 +198,33 @@ def main() -> None:
 
     stats = {"done": 0, "no_match": 0, "failed": 0}
     t0 = time.time()
-    with httpx.Client(headers=IMG_UA, follow_redirects=True) as client:
-        for i, (p, pl) in enumerate(targets, 1):
-            try:
+    stop = threading.Event()
+
+    def work(item):
+        i, (p, pl) = item
+        if stop.is_set():
+            return
+        try:
+            with httpx.Client(headers=IMG_UA, follow_redirects=True) as client:
                 res = source_one(p, pl, budget, client)
-            except OxylabsError as e:
+        except OxylabsError as e:
+            if not stop.is_set():
                 print(f"\nSTOPPED: {e}")
-                break
+            stop.set()
+            return
+        except Exception as e:                      # one bad product must not stop the run
+            res = {"status": "failed", "error": f"{type(e).__name__}: {e}"[:300]}
+        with lock:
             stats[res["status"]] += 1
-            if not a.product:
-                _record(p["id"], pl, res)
-            print(f"[{i}/{len(targets)}] {pl:10} {res['status']:8} {(p.get('product_name') or '')[:50]}  {res.get('error') or res.get('method', '')}")
-            if a.product:
-                print(json.dumps(res, indent=2, default=str))
+        if not a.product:
+            _record(p["id"], pl, res)
+        print(f"[{i}/{len(targets)}] {pl:10} {res['status']:8} {(p.get('product_name') or '')[:50]}  {res.get('error') or res.get('method', '')}")
+        if a.product:
+            print(json.dumps(res, indent=2, default=str))
+
+    lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
+        list(pool.map(work, enumerate(targets, 1)))
     print(f"\n{stats} · {budget.used} Oxylabs results used · {time.time() - t0:.0f}s")
 
 

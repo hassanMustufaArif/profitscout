@@ -8,6 +8,7 @@ Env: OXYLABS_USER / OXYLABS_PASS   (OXYLABS_USERNAME / OXYLABS_PASSWORD also acc
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import httpx
@@ -30,11 +31,13 @@ class Budget:
     def __init__(self, max_requests: int):
         self.max = max_requests
         self.used = 0
+        self._lock = threading.Lock()   # shared by parallel workers
 
     def take(self) -> None:
-        if self.used >= self.max:
-            raise OxylabsError(f"request budget of {self.max} reached")
-        self.used += 1
+        with self._lock:
+            if self.used >= self.max:
+                raise OxylabsError(f"request budget of {self.max} reached")
+            self.used += 1
 
 
 def scrape(payload: dict, budget: Budget, retries: int = 2) -> str:
