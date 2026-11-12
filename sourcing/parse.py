@@ -38,11 +38,13 @@ def _walk(obj: Any) -> Iterable[dict]:
     stack = [obj]
     while stack:
         cur = stack.pop()
+        # Push children in reverse so they pop in page order. Plain extend() reversed every list,
+        # so "top 3" was really the LAST 3 of 40 results (the weakest look-alikes).
         if isinstance(cur, dict):
             yield cur
-            stack.extend(cur.values())
+            stack.extend(reversed(list(cur.values())))
         elif isinstance(cur, list):
-            stack.extend(cur)
+            stack.extend(reversed(cur))
 
 
 def json_blobs_from_html(html: str) -> list:

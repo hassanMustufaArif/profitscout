@@ -33,7 +33,7 @@ from supabase import create_client
 from . import config, match
 from .http_sources import aliexpress_by_image, aliexpress_by_text, alibaba_by_image, alibaba_by_text, keyword_from_title
 from .oxylabs import Budget, OxylabsError
-from .store import save_candidates, save_suppliers
+from .store import clear_auto_suppliers, save_candidates, save_suppliers
 
 from db_paging import fetch_all  # repo root (run as python -m sourcing.presource)
 
@@ -72,8 +72,15 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
     kw = keyword_from_title(product.get("product_name") or "")
     tried, top, near_all = [], 0.0, []
 
-    steps = [("photo", lambda: alibaba_by_image(ref, budget)), ("text", lambda: alibaba_by_text(kw, budget))] \
-        if platform == "alibaba" else [("photo", lambda: aliexpress_by_image(ref, budget)), ("text", lambda: aliexpress_by_text(kw, budget))]
+    photo = (lambda: alibaba_by_image(ref, budget)) if platform == "alibaba" else (lambda: aliexpress_by_image(ref, budget))
+    text = (lambda: alibaba_by_text(kw, budget)) if platform == "alibaba" else (lambda: aliexpress_by_text(kw, budget))
+    if config.MATCHING:
+        steps = [("photo", photo), ("text", text)]
+    else:
+        # No photo check: a keyword search returns look-alike categories, not the product, and
+        # nothing would catch it. Photo search only (tried twice); otherwise no_match, so the
+        # product shows "no suppliers" instead of wrong ones.
+        steps = [("photo", photo), ("photo-retry", photo)]
 
     for method, run in steps:
         try:
@@ -84,12 +91,15 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
             tried.append(f"{method}: {type(e).__name__}: {e}"[:160])
             continue
         if not config.MATCHING:
+            if not offers and method == "photo":
+                tried.append("photo: 0 results")
+                continue
             best = match.top_raw(offers, price, config.KEEP_TOP)
             tried.append(f"{method}: {len(offers)} results, kept {len(best)}")
             if best:
                 save_suppliers(sb, product["id"], platform, best, "auto")
                 return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": 0}
-            continue
+            break   # photo search answered, nothing usable: retrying gives the same list
         best, near, s = _check(offers, ref, price, client)
         near_all += [dict(o, _method=method) for o in near]
         top = max(top, s)
@@ -100,6 +110,11 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
             return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": len(near_all)}
     if config.MATCHING:
         _save_review(product["id"], platform, near_all)
+    else:
+        try:
+            clear_auto_suppliers(sb, product["id"], platform)
+        except Exception as e:
+            print(f"  old suppliers not cleared: {e}")
     return {"status": "no_match", "error": "; ".join(tried) or "no results", "best": round(top, 2), "review": len(near_all)}
 
 

@@ -83,7 +83,9 @@ def top_raw(offers: list[dict], tiktok_price: float, keep: int) -> list[dict]:
     for o in offers:
         if o.get("welcome_deal") or not o.get("price_min"):
             continue
-        if tiktok_price and o["price_min"] >= tiktok_price * 0.7:
+        # Keep the platform's order: its top hits are the closest look-alikes. Only drop prices
+        # at or above the TikTok price (no margin at all). The old 70% cut skipped exact matches.
+        if tiktok_price and o["price_min"] >= tiktok_price:
             continue
         key = ("id", str(o["product_id"])) if o.get("product_id") else \
               ("name", (o.get("supplier_name") or "").strip().lower(), round(float(o["price_min"] or 0), 2))
