@@ -263,3 +263,34 @@ def test_fastmoss_date_range_column_wins():
     assert p["window_days"] == 28
     out, err = k.parse_fastmoss_product(_fm_row(**{"Date Range": "2099-01-01~2099-01-07"}))
     assert out is None and "future" in err
+
+
+# ---------------------------------------------------------------------------
+# Unhandled 500s keep CORS headers, so the site shows a real error, not "Couldn't reach the server"
+# ---------------------------------------------------------------------------
+def test_unhandled_500_has_cors_header():
+    prods = seed_products(5)
+    pid = prods[0]["id"]
+    DB.add_user("p", "pro@example.com", plan="pro")
+    DB.fail_tables["suppliers"] = "boom"
+    r = client.get(f"/products/{pid}/suppliers/alibaba",
+                   headers=H("p", Origin="https://tikprofitpro.shop"))
+    assert r.status_code == 500
+    assert r.headers.get("access-control-allow-origin") == "https://tikprofitpro.shop"
+    assert "boom" not in r.text
+    r = client.get(f"/products/{pid}/suppliers/alibaba", headers=H("p", Origin="https://evil.example"))
+    assert r.status_code == 500 and "access-control-allow-origin" not in r.headers
+
+
+def test_auto_suppliers_with_uuid_ids_do_not_crash():
+    prods = seed_products(5)
+    pid = prods[0]["id"]
+    DB.add_user("p", "pro@example.com", plan="pro")
+    DB.tables["suppliers"] = [
+        auto_supplier(pid, str(uuid.uuid4()), external_product_id="a", sourced_at="2026-11-12T02:50:00+00:00"),
+        auto_supplier(pid, str(uuid.uuid4()), external_product_id="b", sourced_at="2026-11-12T02:50:00+00:00"),
+        auto_supplier(pid, str(uuid.uuid4()), external_product_id="c", sourced_at="2026-11-12T02:50:00+00:00"),
+    ]
+    r = client.get(f"/products/{pid}/suppliers/alibaba", headers=H("p"))
+    assert r.status_code == 200, r.text
+    assert [s["external_product_id"] for s in r.json()["suppliers"]] == ["a", "b", "c"]
