@@ -84,8 +84,8 @@ def _web_api_scrape(payload: dict, budget: Budget, retries: int = 2) -> str:
 
 def scrape(payload: dict, budget: Budget, retries: int = 2) -> str:
     """Returns page HTML. Raises OxylabsError on auth problems or repeated failure.
-    Uses OXYLABS_USER/OXYLABS_PASS (Web Scraper API) when set, else OXYLABS_WEB_API_KEY."""
-    if not (USER and PASS) and WEB_API_KEY:
+    Uses OXYLABS_WEB_API_KEY when set, else OXYLABS_USER/OXYLABS_PASS (classic Web Scraper API)."""
+    if WEB_API_KEY:
         return _web_api_scrape(payload, budget, retries)
     if not (USER and PASS):
         # Not a run-stopper: the free direct photo search is the main path, Oxylabs only the fallback.
