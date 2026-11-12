@@ -280,3 +280,17 @@ def test_unhandled_500_has_cors_header():
     assert "boom" not in r.text
     r = client.get(f"/products/{pid}/suppliers/alibaba", headers=H("p", Origin="https://evil.example"))
     assert r.status_code == 500 and "access-control-allow-origin" not in r.headers
+
+
+def test_auto_suppliers_with_uuid_ids_do_not_crash():
+    prods = seed_products(5)
+    pid = prods[0]["id"]
+    DB.add_user("p", "pro@example.com", plan="pro")
+    DB.tables["suppliers"] = [
+        auto_supplier(pid, str(uuid.uuid4()), external_product_id="a", sourced_at="2026-11-12T02:50:00+00:00"),
+        auto_supplier(pid, str(uuid.uuid4()), external_product_id="b", sourced_at="2026-11-12T02:50:00+00:00"),
+        auto_supplier(pid, str(uuid.uuid4()), external_product_id="c", sourced_at="2026-11-12T02:50:00+00:00"),
+    ]
+    r = client.get(f"/products/{pid}/suppliers/alibaba", headers=H("p"))
+    assert r.status_code == 200, r.text
+    assert [s["external_product_id"] for s in r.json()["suppliers"]] == ["a", "b", "c"]

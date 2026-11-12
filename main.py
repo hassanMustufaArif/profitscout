@@ -702,7 +702,10 @@ def verified_suppliers(product: dict, platform: str, keep: int | None = None) ->
 
     def order(r):  # scored rows by match then price; unscored auto rows keep the search order (insert id)
         if r.get("match_method") == "auto" and r.get("similarity") is None:
-            return (1, 0, int(r.get("id") or 0))
+            # Supplier ids are UUIDs, so int(id) crashed here (500 on every auto row). Keep the
+            # search order instead: oldest batch first; inside a batch the stable sort keeps the
+            # order the rows came back in.
+            return (1, 0, str(r.get("sourced_at") or ""))
         return (0, -round(score(r), 2), float(r.get("unit_cost_min") or 1e9))
 
     keep = keep or SUPPLIER_KEEP
