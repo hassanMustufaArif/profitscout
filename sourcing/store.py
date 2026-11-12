@@ -92,3 +92,11 @@ def save_candidates(sb, product_id: str, platform: str, offers: list[dict]) -> N
     sb.table("supplier_candidates").delete().eq("tiktok_product_id", pid).eq("platform", platform).eq("status", "pending").execute()
     if rows:
         sb.table("supplier_candidates").insert(rows).execute()
+
+
+def clear_auto_suppliers(sb, product_id: str, platform: str) -> None:
+    """Drop the previous automatic set (never hand-approved or hidden rows). Used when a re-run
+    finds no photo match, so old wrong suppliers don't stay on the product."""
+    (sb.table("suppliers").delete()
+     .eq("tiktok_product_id", product_id).eq("platform", platform).eq("match_method", "auto")
+     .not_.is_("hidden", "true").execute())
