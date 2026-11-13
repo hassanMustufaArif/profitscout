@@ -114,11 +114,18 @@ def test_free_gate_same_top10_whatever_the_filters():
     expected = [r["id"] for r in rows[:10]]
     variants = ["/products", "/products?max_score=60", "/products?min_score=0&max_score=75&category=Kitchen",
                 "/products?min_price=20&max_price=30&offset=50&limit=100", "/products?trend_phase=peak",
-                "/search?q=lipstick", "/search?q=mug&offset=20", "/products/tier/watch", "/products/tier/pass?offset=5"]
+                "/search?q=lipstick", "/search?q=mug&offset=20"]
     for v in variants:
         r = client.get(v, headers=H())
         assert r.status_code == 200, v
         assert _ids(r) == expected, v
+    # Tier routes: only the members of the same fixed top 10 that are really in the tier
+    # (scores 100..91 here), never rows from outside it.
+    for v, want in [("/products/tier/hot", expected), ("/products/tier/watch", []),
+                    ("/products/tier/pass?offset=5", [])]:
+        r = client.get(v, headers=H())
+        assert r.status_code == 200, v
+        assert _ids(r) == want, v
 
 
 def test_free_gate_applies_to_null_and_odd_plans():
