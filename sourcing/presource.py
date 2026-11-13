@@ -8,10 +8,9 @@ Users never trigger a search; the app only reads the saved suppliers.
   python -m sourcing.presource --product <id>        # one product, prints what it found
   python -m sourcing.presource --new --dry-run       # list what would be sourced, spend nothing
 
-Per product and platform (Oxylabs Web Scraper API, ~1 paid result per step):
-  Alibaba:    photo search -> if no photo match, text search
-  AliExpress: text search (keyword from the title, no AI)
-Every candidate is checked against the TikTok photo with CLIP + pHash; only real look-alikes are saved.
+Per product and platform (matching off, the default): photo search only, the same list a person
+gets from the camera button on alibaba.com / aliexpress.us. Top 3 in the site's order are saved.
+Oxylabs is only used when a site blocks the direct request (about 1 paid result then).
 
 Cost guard: --max-requests (default 300) stops the run before it can overspend.
 Typical cost: 1-2 results per product per platform, about $0.003-0.005 per product for both.
@@ -43,6 +42,9 @@ load_dotenv()
 sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 IMG_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 PLATFORMS = ("alibaba", "aliexpress")
+# One Supabase client is shared by all workers; its HTTP/2 connection is not thread-safe
+# (on Windows: "WinError 10035 ... non-blocking socket"). Every database call takes this lock.
+DB_LOCK = threading.Lock()
 
 
 def _download(client: httpx.Client, url: str | None) -> bytes | None:
@@ -73,6 +75,7 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
     price = product.get("tiktok_price") or 0
     kw = keyword_from_title(product.get("product_name") or "")
     tried, top, near_all = [], 0.0, []
+    answered = False          # did the marketplace actually return a result list?
 
     photo = (lambda: alibaba_by_image(ref, budget)) if platform == "alibaba" else (lambda: aliexpress_by_image(ref, budget))
     text = (lambda: alibaba_by_text(kw, budget)) if platform == "alibaba" else (lambda: aliexpress_by_text(kw, budget))
@@ -92,6 +95,7 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
         except Exception as e:
             tried.append(f"{method}: {type(e).__name__}: {e}"[:160])
             continue
+        answered = True
         if not config.MATCHING:
             if not offers and method == "photo":
                 tried.append("photo: 0 results")
@@ -99,7 +103,8 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
             best = match.top_raw(offers, price, config.KEEP_TOP)
             tried.append(f"{method}: {len(offers)} results, kept {len(best)}")
             if best:
-                save_suppliers(sb, product["id"], platform, best, "auto")
+                with DB_LOCK:
+                    save_suppliers(sb, product["id"], platform, best, "auto")
                 return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": 0}
             break   # photo search answered, nothing usable: retrying gives the same list
         best, near, s = _check(offers, ref, price, client)
@@ -107,14 +112,20 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
         top = max(top, s)
         tried.append(f"{method}: {len(offers)} results, best look-alike {s:.2f}")
         if best:
-            save_suppliers(sb, product["id"], platform, best, method)
+            with DB_LOCK:
+                save_suppliers(sb, product["id"], platform, best, method)
             _save_review(product["id"], platform, near_all)
             return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": len(near_all)}
+    if not answered:
+        # Blocked / challenge page / no Oxylabs: NOT a "no match". Old rows stay, and the
+        # product is picked up again by the next run (failed jobs are not counted as sourced).
+        return {"status": "failed", "error": "; ".join(tried) or "search did not answer"}
     if config.MATCHING:
         _save_review(product["id"], platform, near_all)
-    else:
+    elif answered:            # only when the search really ran; a block keeps the old rows
         try:
-            clear_auto_suppliers(sb, product["id"], platform)
+            with DB_LOCK:
+                clear_auto_suppliers(sb, product["id"], platform)
         except Exception as e:
             print(f"  old suppliers not cleared: {e}")
     return {"status": "no_match", "error": "; ".join(tried) or "no results", "best": round(top, 2), "review": len(near_all)}
@@ -122,12 +133,18 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
 
 def _save_review(product_id, platform: str, near: list[dict]) -> None:
     try:
-        save_candidates(sb, product_id, platform, near)
+        with DB_LOCK:
+            save_candidates(sb, product_id, platform, near)
     except Exception as e:                      # the review queue must never break sourcing
         print(f"  review queue not saved: {e}")
 
 
 def _record(product_id: str, platform: str, res: dict) -> None:
+    with DB_LOCK:
+        _record_unlocked(product_id, platform, res)
+
+
+def _record_unlocked(product_id: str, platform: str, res: dict) -> None:
     sb.table("sourcing_jobs").insert({
         "product_id": str(product_id), "platform": platform, "status": res["status"], "charged": False,
         "error": (res.get("error") or "; ".join(res.get("tried", [])))[:500],
@@ -217,7 +234,10 @@ def main() -> None:
         with lock:
             stats[res["status"]] += 1
         if not a.product:
-            _record(p["id"], pl, res)
+            try:
+                _record(p["id"], pl, res)
+            except Exception as e:
+                print(f"  job not recorded: {type(e).__name__}: {e}"[:200])
         print(f"[{i}/{len(targets)}] {pl:10} {res['status']:8} {(p.get('product_name') or '')[:50]}  {res.get('error') or res.get('method', '')}")
         if a.product:
             print(json.dumps(res, indent=2, default=str))

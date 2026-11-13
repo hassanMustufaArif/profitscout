@@ -145,21 +145,30 @@ def stage(growth_pct, launch: date | None, creators: int, end: date):
 
 
 def momentum_score(rev_per_day, growth_pct, creators, conv_pct, rating):
-    """0-100. Log-scaled revenue so a $3k/day product isn't 'Pass' next to a $300k/day one."""
-    s = 0.0
+    """0-100. Log-scaled revenue so a $3k/day product isn't 'Pass' next to a $300k/day one.
+
+    creators / conv_pct / rating = None means "the export doesn't have it" (FastMoss Sales Rank has
+    none of the three). Those parts are left out of the maximum instead of scoring 0, so a FastMoss
+    row is on the same 0-100 scale as a Kalodata row (before: FastMoss topped out at 70 of 100 and
+    the 80+ "hot" tier was unreachable). 0 is a real value and still scores 0."""
+    s, top = 0.0, 70.0                                                   # revenue 40 + growth 30
     if rev_per_day:
         s += min(40, max(0, (math.log10(rev_per_day + 1) - 2) * 16))   # $100/day≈0 … $31k/day≈40
     if growth_pct is not None:
         s += max(0, min(30, growth_pct / 5 + 10))                        # -50%→0, 0%→10, +100%→30
     else:
         s += 10                                                          # neutral when unknown
-    if creators:
-        s += min(15, math.log10(creators + 1) * 6)
-    if conv_pct:
-        s += min(10, conv_pct / 5)
-    if rating:
-        s += max(0, (rating - 4.0) * 5)                                  # 4.0→0, 5.0→5
-    return int(round(min(s, 100)))
+    if creators is not None:
+        top += 15
+        if creators > 0:
+            s += min(15, math.log10(creators + 1) * 6)
+    if conv_pct is not None:
+        top += 10
+        s += max(0, min(10, conv_pct / 5))
+    if rating is not None:
+        top += 5
+        s += max(0, min(5, (rating - 4.0) * 5))                          # 4.0→0, 5.0→5
+    return int(round(min(100.0, s / top * 100)))
 
 
 # ─── FastMoss .xlsx exports (no openpyxl needed) ─────────────────────────────
@@ -260,6 +269,7 @@ def parse_fastmoss_product(row):
         days = FASTMOSS_WINDOW_DAYS
         end = fastmoss_end_date(row.get("_file", ""))
         start = end - timedelta(days=days - 1)
+    date_guessed = not window and not re.search(r"(20\d{6})_\d{6}", str(row.get("_file") or ""))
     pmin, pmax = price_range(col(row, "Price"))
     revenue = num(col(row, "Revenue"))
     orders = num(col(row, "Orders"))
@@ -289,12 +299,14 @@ def parse_fastmoss_product(row):
         "units_sold_7d": int(orders / days * 7) if orders else 0,
         "live_revenue": None,
         "video_revenue": None,
+        "shop_name": (col(row, "Shop Name") or "").strip()[:300] or None,
         "tiktok_product_url": http_url(col(row, "TikTok Product Detail")) or f"https://www.tiktok.com/shop/pdp/{pid}",
         "thumbnail_url": http_url(col(row, "Product Image")) or "",
         "scraped_at": datetime.now(timezone.utc).isoformat(),
         "is_active": (str(col(row, "Product Status") or "Available").strip().lower() != "unavailable"),
         "_fastmoss_growth": growth,
         "_total_units": num(col(row, "Total Units Sold")),
+        "_date_guessed": date_guessed,
     }
     snap = {
         "tiktok_product_id": pid, "data_start_date": str(start), "data_end_date": str(end),
@@ -306,7 +318,7 @@ def parse_fastmoss_product(row):
 
 
 # ─── products ────────────────────────────────────────────────────────────────
-def load_rows(paths):
+def load_rows(paths, log=print):
     rows = []
     for p in paths:
         # Uploaded files are passed as exact paths; only fall back to glob for CLI patterns, so
@@ -316,7 +328,7 @@ def load_rows(paths):
                 try:
                     rows += [dict(r, _file=os.path.basename(f)) for r in _xlsx_dicts(f)]
                 except Exception as e:
-                    print(f"could not read {f}: {e}")
+                    log(f"  could not read {os.path.basename(f)}: {type(e).__name__}: {str(e)[:200]}")
                 continue
             try:
                 with open(f, newline="", encoding="utf-8-sig") as fh:
@@ -398,33 +410,172 @@ def quality_flags(p):
     return flags
 
 
-def rehost_image(sb: Client, pid: str, url: str) -> str | None:
+def _image_type(img: bytes) -> str:
+    if img[:4] == b"RIFF" and img[8:12] == b"WEBP":
+        return "image/webp"
+    if img[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if img[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+def rehost_image(sb: Client, pid: str, url: str, log=print) -> str | None:
+    """Copy one image to Storage. None = failed (the caller keeps the row's old copy)."""
     from image_search import fetch_image_bytes
     img = fetch_image_bytes(url)
     if not img:
         return None
-    path = f"products/{pid}.jpg"
+    path = f"products/{pid}.jpg"            # path kept for existing links; the real type is in content-type
     try:
-        sb.storage.from_("product-images").upload(path, img, {"content-type": "image/jpeg", "upsert": "true"})
+        sb.storage.from_("product-images").upload(path, img, {"content-type": _image_type(img), "upsert": "true"})
         return sb.storage.from_("product-images").get_public_url(path)
     except Exception as e:
-        print(f"  image upload failed for {pid}: {e}")
+        log(f"  image upload failed for {pid}: {type(e).__name__}: {str(e)[:150]}")
         return None
 
 
+def _chunks(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def table_columns(sb: Client, table: str):
+    """Column names of a live table from one row, or None when unknown (empty table / read failed)."""
+    try:
+        sample = sb.table(table).select("*").limit(1).execute().data or []
+    except Exception:
+        return None
+    return set(sample[0]) if sample else None
+
+
+def only_columns(records, have, table, log, warnings):
+    """Drop keys the live table doesn't have (prod drift), and say so in the job log + warnings."""
+    if not have or not records:
+        return records
+    missing = sorted({k for r in records for k in r} - have)
+    if not missing:
+        return records
+    msg = f"{table}: skipping columns the table doesn't have: {', '.join(missing)}"
+    log("  " + msg)
+    warnings.append(msg)
+    return [{k: v for k, v in r.items() if k in have} for r in records]
+
+
 def growth_from_history(sb: Client, pid: str, end: str, days: int):
-    """% change in revenue/day vs the previous snapshot with the same window length."""
-    res = (
-        sb.table("product_snapshots").select("revenue, window_days, data_end_date")
-        .eq("tiktok_product_id", pid).lt("data_end_date", end)
-        .order("data_end_date", desc=True).limit(5).execute()
-    )
-    prev = next((r for r in res.data or [] if r["window_days"] == days and r["revenue"]), None)
-    return prev
+    """Previous snapshot with the same window length, or None (one product; see history_for)."""
+    return history_for(sb, [pid], end, days).get(pid)
+
+
+def history_for(sb: Client, pids, end: str, days: int, max_gap_days: int | None = None):
+    """{pid: previous snapshot} for products whose export ends on `end` with a `days` window.
+    Only a snapshot that ended within max(7, days) days before `end` counts: comparing today's
+    1-day FastMoss window with one from a month ago is not "growth". One query per 100 products
+    (was one query per product)."""
+    gap = max_gap_days if max_gap_days is not None else max(7, days or 1)
+    try:
+        floor = str(parse_date(end) - timedelta(days=gap))
+    except Exception:
+        floor = None
+    out = {}
+    for chunk in _chunks(list(pids), 100):
+        q = (sb.table("product_snapshots").select("tiktok_product_id, revenue, window_days, data_end_date")
+             .in_("tiktok_product_id", chunk).lt("data_end_date", end))
+        if floor:
+            q = q.gte("data_end_date", floor)
+        for r in q.order("data_end_date", desc=True).execute().data or []:
+            pid = r.get("tiktok_product_id")
+            if pid in out or r.get("window_days") != days or not r.get("revenue"):
+                continue
+            out[pid] = r
+    return out
+
+
+def existing_end_dates(sb: Client, pids):
+    """{tiktok_product_id: data_end_date} already in tiktok_products (str dates)."""
+    out = {}
+    for chunk in _chunks(list(pids), 100):
+        try:
+            rows = (sb.table("tiktok_products").select("tiktok_product_id, data_end_date")
+                    .in_("tiktok_product_id", chunk).execute().data or [])
+        except Exception:
+            return {}
+        for r in rows:
+            if r.get("tiktok_product_id") and r.get("data_end_date"):
+                out[r["tiktok_product_id"]] = str(r["data_end_date"])[:10]
+    return out
+
+
+V1_STAGES = {"emerging": "hot", "rising": "rising", "peaking": "watch", "saturated": "pass", "unknown": "watch"}
+
+
+def _is_trend_check(e) -> bool:
+    return "trend_phase_check" in str(e)
+
+
+def _is_creator_not_null(e) -> bool:
+    s = str(e)
+    return "creator_count" in s and ("23502" in s or "null value" in s.lower())
+
+
+def same_keys(rows):
+    """Split rows into groups with identical keys. supabase-py sends a bulk upsert with
+    columns=<union of keys> and missing keys become NULL, so a row that left a key out on purpose
+    (no new image copy, no shop name, no e-mail in this export) would blank the stored value."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(tuple(sorted(r)), []).append(r)
+    return list(groups.values())
+
+
+def upsert_grouped(sb: Client, table: str, rows, on_conflict: str):
+    for group in same_keys(rows):
+        for chunk in _chunks(group, BATCH):
+            sb.table(table).upsert(chunk, on_conflict=on_conflict).execute()
+
+
+def upsert_products(sb: Client, records, log, warnings):
+    """Upsert in batches. Known prod drift is handled once and remembered for later batches:
+    the old tiktok_products_trend_phase_check (v1 stage names only) and creator_count NOT NULL.
+    Each is fixed independently, so a NULL creator count stays NULL ("unknown") unless the DB
+    really refuses it. Anything else raises: the job must show failed, not done."""
+    v1, zero_creators = False, False
+    written = 0
+    for batch in _chunks(records, BATCH):
+        for _ in range(3):
+            send = batch
+            if v1:
+                send = [dict(r, trend_phase=V1_STAGES.get(r.get("trend_phase"), "watch")) for r in send]
+            if zero_creators:
+                send = [dict(r, creator_count=0) if "creator_count" in r and r["creator_count"] is None else r
+                        for r in send]
+            try:
+                for group in same_keys(send):
+                    sb.table("tiktok_products").upsert(group, on_conflict="tiktok_product_id").execute()
+                break
+            except Exception as e:
+                if _is_trend_check(e) and not v1:
+                    v1 = True
+                    msg = ("tiktok_products: the DB still has the old trend_phase check, so v1 stage names "
+                           "were written (drop tiktok_products_trend_phase_check to keep v2 names)")
+                    log("  " + msg)
+                    warnings.append(msg)
+                elif _is_creator_not_null(e) and not zero_creators:
+                    zero_creators = True
+                    msg = "tiktok_products: creator_count is NOT NULL in the DB, unknown counts written as 0 (run 20261111_launch_day.sql)"
+                    log("  " + msg)
+                    warnings.append(msg)
+                else:
+                    raise
+        else:                                   # pragma: no cover - three different errors in a row
+            raise RuntimeError("tiktok_products upsert kept failing")
+        written += len(batch)
+        log(f"  upserted {written}/{len(records)}")
+    return written
 
 
 def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=print):
-    rows = load_rows(paths)
+    rows = load_rows(paths, log=log)
     log(f"{len(rows)} rows from {len(paths)} file pattern(s)")
     parsed, problems = {}, []
     for r in rows:
@@ -438,6 +589,13 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
             continue
         parsed[p["tiktok_product_id"]] = (p, snap)
 
+    warnings = []
+    guessed = sum(1 for p, _ in parsed.values() if p.get("_date_guessed"))
+    if guessed:
+        msg = (f"{guessed} FastMoss rows: no date in the file name or a date column, so the data date was "
+               f"set to yesterday. Keep FastMoss's original file name (..._YYYYMMDD_HHMMSS.xlsx).")
+        log("  ⚠ " + msg)
+        warnings.append(msg)
     flagged = [(p["product_name"][:60], quality_flags(p)) for p, _ in parsed.values() if quality_flags(p)]
     log(f"{len(parsed)} unique products, {len(problems)} skipped, {len(flagged)} with quality flags")
     for name, f in flagged[:25]:
@@ -447,70 +605,114 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
 
     if not parsed:
         log("No products found in these files. Is this a Kalodata or FastMoss product export?")
-        return {"products": 0, "skipped": len(problems), "flagged": 0}
+        return {"products": 0, "skipped": len(problems), "flagged": 0, "warnings": warnings}
     if dry_run:
+        # Read-only check against the live tables, so "Check" catches schema drift before "Import"
+        # (2026-11-12: Check passed, Import then failed on live_revenue / video_revenue).
+        sb = None
+        if os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY"):
+            try:
+                sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+            except Exception:
+                sb = None
+        if sb is not None:
+            sample_p = [dict(p, trend_phase=None, growth_source=None, gmv_growth_pct=None, virality_score=None)
+                        for p, _ in parsed.values()]
+            for k in ("_fastmoss_growth", "_total_units", "_date_guessed"):
+                for p in sample_p:
+                    p.pop(k, None)
+            if rehost:
+                for p in sample_p:
+                    p["image_storage_url"] = None
+            only_columns(sample_p, table_columns(sb, "tiktok_products"), "tiktok_products", log, warnings)
+            only_columns([s for _, s in parsed.values()], table_columns(sb, "product_snapshots"),
+                         "product_snapshots", log, warnings)
         log("Dry run: nothing written.")
-        return {"products": len(parsed), "skipped": len(problems), "flagged": len(flagged)}
+        return {"products": len(parsed), "skipped": len(problems), "flagged": len(flagged), "warnings": warnings}
 
     sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
     items = list(parsed.values())
 
     # 1) snapshots first, so growth can be computed against history
-    snaps = [s for _, s in items]
-    for i in range(0, len(snaps), BATCH):
-        sb.table("product_snapshots").upsert(snaps[i:i + BATCH], on_conflict="tiktok_product_id,data_end_date,window_days").execute()
+    snaps = only_columns([s for _, s in items], table_columns(sb, "product_snapshots"), "product_snapshots", log, warnings)
+    for chunk in _chunks(snaps, BATCH):
+        sb.table("product_snapshots").upsert(chunk, on_conflict="tiktok_product_id,data_end_date,window_days").execute()
+    log(f"  snapshots saved: {len(snaps)}")
 
-    # 2) products with real growth / stage / score
-    records = []
-    for p, s in items:
-        prev = growth_from_history(sb, p["tiktok_product_id"], p["data_end_date"], p["window_days"])
+    # 2) an older export must not overwrite newer data (re-uploading March over November)
+    have_end = existing_end_dates(sb, [p["tiktok_product_id"] for p, _ in items])
+    older = [(p, s) for p, s in items if have_end.get(p["tiktok_product_id"], "") > p["data_end_date"]]
+    if older:
+        msg = f"{len(older)} products kept their newer data (this file is older than what's stored)"
+        log("  " + msg)
+        warnings.append(msg)
+    keep = [(p, s) for p, s in items if have_end.get(p["tiktok_product_id"], "") <= p["data_end_date"]]
+
+    # 3) products with real growth / stage / score
+    history = {}
+    for (end, days), group in _group(keep).items():
+        history.update(history_for(sb, group, end, days))
+    records, image_failures = [], 0
+    for p, s in keep:
+        prev = history.get(p["tiktok_product_id"])
         rev_day = (p["revenue_window"] or 0) / (p["window_days"] or 1)
         fm_growth = p.pop("_fastmoss_growth", None)
         p.pop("_total_units", None)
-        if prev and prev["revenue"]:
+        p.pop("_date_guessed", None)
+        if fm_growth is not None:
+            growth = round(fm_growth, 1)             # FastMoss "Order Growth Rate": same-length previous period
+            p["growth_source"] = "fastmoss"
+        elif prev and prev["revenue"]:
             prev_day = prev["revenue"] / prev["window_days"]
             growth = round((rev_day - prev_day) / prev_day * 100, 1) if prev_day else None
             p["growth_source"] = "snapshot"
-        elif fm_growth is not None:
-            growth = round(fm_growth, 1)             # FastMoss "Order Growth Rate" vs the previous period
-            p["growth_source"] = "fastmoss"
         else:
             growth = None
             p["growth_source"] = "unknown"
         p["gmv_growth_pct"] = growth
         launch = parse_date(p["launch_date"]) if p["launch_date"] else None
         p["trend_phase"] = stage(growth, launch, p["creator_count"] or 0, parse_date(p["data_end_date"]))
-        p["virality_score"] = momentum_score(rev_day, growth, p["creator_count"] or 0, p["creator_conversion_pct"], p["rating"])
+        p["virality_score"] = momentum_score(rev_day, growth, p["creator_count"], p["creator_conversion_pct"], p["rating"])
+        if p.get("shop_name") is None:
+            p.pop("shop_name", None)                 # unknown: don't blank a stored shop name
         if rehost and p["thumbnail_url"]:
-            p["image_storage_url"] = rehost_image(sb, p["tiktok_product_id"], p["thumbnail_url"])
-        records.append(p)
-
-    for i in range(0, len(records), BATCH):
-        batch = records[i:i + BATCH]
-        try:
-            sb.table("tiktok_products").upsert(batch, on_conflict="tiktok_product_id").execute()
-        except Exception as e:
-            # creator_count still NOT NULL (migration 20261111_launch_day.sql not run): store 0 as before.
-            if "creator_count" in str(e) and ("23502" in str(e) or "null value" in str(e).lower()):
-                log("  creator_count is NOT NULL in the DB; writing 0 (run 20261111_launch_day.sql)")
-                batch = [dict(r, creator_count=r["creator_count"] if r["creator_count"] is not None else 0) for r in batch]
-                sb.table("tiktok_products").upsert(batch, on_conflict="tiktok_product_id").execute()
+            url = rehost_image(sb, p["tiktok_product_id"], p["thumbnail_url"], log=log)
+            if url:
+                p["image_storage_url"] = url
             else:
-                raise
-        log(f"  upserted {min(i + BATCH, len(records))}/{len(records)}")
+                image_failures += 1                  # keep the row's previous copy, if any
+        records.append(p)
+    if image_failures:
+        msg = f"{image_failures} images could not be copied to Storage (the CDN link is used)"
+        log("  " + msg)
+        warnings.append(msg)
 
-    # 3) cached suppliers were matched against the old title/price: keep them, the
+    # Write only the columns the live table has (2026-11-13: prod had no live_revenue / video_revenue,
+    # so every upsert failed and the dashboard kept the March data). Missing ones are logged.
+    records = only_columns(records, table_columns(sb, "tiktok_products"), "tiktok_products", log, warnings)
+    written = upsert_products(sb, records, log, warnings)
+
+    # 4) cached suppliers were matched against the old title/price: keep them, the
     #    profit is recalculated live from tiktok_price on every request.
 
-    # 4) retire stale rows: v1 rows (no data_end_date) and anything not seen for 3+ weeks
+    # 5) retire stale rows: v1 rows (no data_end_date) and anything not seen for 3+ weeks
     if deactivate:
         newest = min(max(parse_date(p["data_end_date"]) for p, _ in items), latest_allowed_date())
         cutoff = str(newest - timedelta(days=21))
         sb.table("tiktok_products").update({"is_active": False}).is_("data_end_date", "null").execute()
         sb.table("tiktok_products").update({"is_active": False}).lt("data_end_date", cutoff).execute()
         log(f"  retired v1 rows and products last seen before {cutoff}")
-    log("Done.")
-    return {"products": len(records), "skipped": len(problems), "flagged": len(flagged)}
+    log("Done." if not warnings else f"Done, with {len(warnings)} warning(s).")
+    return {"products": written, "snapshots": len(snaps), "kept_newer": len(older), "skipped": len(problems),
+            "flagged": len(flagged), "warnings": warnings}
+
+
+def _group(items):
+    """{(data_end_date, window_days): [pid, ...]}"""
+    g = {}
+    for p, _ in items:
+        g.setdefault((p["data_end_date"], p["window_days"]), []).append(p["tiktok_product_id"])
+    return g
 
 
 def detect_kind(path: str) -> str | None:
@@ -555,7 +757,7 @@ CREATOR_MAP = {
 
 
 def import_creators(paths, dry_run=False, log=print):
-    rows = load_rows(paths)
+    rows = load_rows(paths, log=log)
     if rows:
         known = {n for names in CREATOR_MAP.values() for n in names} | {"_file", "Date Range", "KalodataUrl"}
         unmapped = [c for c in rows[0].keys() if c not in known]
@@ -588,13 +790,14 @@ def import_creators(paths, dry_run=False, log=print):
         rec["data_end_date"] = str(end) if end and end <= latest_allowed_date() else None
         records[handle] = {k: v for k, v in rec.items() if v is not None}
     log(f"{len(records)} creators parsed")
+    warnings = []
     if dry_run or not records:
-        return
+        return {"creators": len(records), "warnings": warnings}
     sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-    vals = list(records.values())
-    for i in range(0, len(vals), BATCH):
-        sb.table("creators").upsert(vals[i:i + BATCH], on_conflict="tiktok_handle").execute()
+    vals = only_columns(list(records.values()), table_columns(sb, "creators"), "creators", log, warnings)
+    upsert_grouped(sb, "creators", vals, "tiktok_handle")
     log("Done.")
+    return {"creators": len(vals), "warnings": warnings}
 
 
 
@@ -620,7 +823,7 @@ SHOP_MAP = {   # field names = what the app reads (Products page > New shops tab
 
 
 def import_shops(paths, dry_run=False, log=print):
-    rows = load_rows(paths)
+    rows = load_rows(paths, log=log)
     if rows:
         known = {n for names in SHOP_MAP.values() for n in names} | {"_file", "Date Range", "KalodataUrl", "img_url"}
         unmapped = [c for c in rows[0].keys() if c not in known]
@@ -650,13 +853,16 @@ def import_shops(paths, dry_run=False, log=print):
         rec["data_end_date"] = str(end) if end and end <= latest_allowed_date() else None
         records[name.lower()] = {k: v for k, v in rec.items() if v is not None}
     log(f"{len(records)} shops parsed")
+    warnings = []
     if dry_run or not records:
-        return
+        return {"shops": len(records), "warnings": warnings}
     sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-    vals = list(records.values())
-    for i in range(0, len(vals), BATCH):
-        sb.table("shops").upsert(vals[i:i + BATCH], on_conflict="shop_name").execute()
+    # prod shops has no gmv_growth_pct (never migrated): without this a shops export with a
+    # growth column failed the whole job.
+    vals = only_columns(list(records.values()), table_columns(sb, "shops"), "shops", log, warnings)
+    upsert_grouped(sb, "shops", vals, "shop_name")
     log("Done.")
+    return {"shops": len(vals), "warnings": warnings}
 
 
 if __name__ == "__main__":

@@ -235,7 +235,9 @@ def get_user_plan(request: Request) -> str:
     except Exception:
         logger.exception("get_user_plan failed")
         return "free"
-    ensure_user_credits(user.email, plan)  # Auto-create credits if not exist
+    # No ensure_user_credits() here any more: get_credit_balance() takes a FOR UPDATE row lock and
+    # ran on every list page (5 parallel /products calls per Products load). /credits and
+    # consume_credit() both create / roll over the credit row themselves.
     return plan
 
 
@@ -267,12 +269,91 @@ def _cached_top(name: str, loader) -> list:
     return [dict(r) for r in rows]
 
 
+# The prod table still has the old trend_phase check, so import_kalodata.py writes v1 names
+# (emerging->hot, peaking/unknown->watch, saturated->pass). The UI filters and labels by v2 names,
+# so "Emerging" / "Peaking" / "Saturated" matched nothing and "pass" showed as "New data".
+# v2 rows (data_end_date set) are mapped back exactly: stage() only returns "unknown" when growth
+# is unknown, and only "peaking" when it is known.
+_V1_TO_V2 = {"hot": "emerging", "pass": "saturated", "rising": "rising"}
+V2_STAGES = ("emerging", "rising", "peaking", "saturated", "unknown")
+
+
+def product_stage(p: dict) -> Optional[str]:
+    phase = (p.get("trend_phase") or "").strip().lower() or None
+    if not p.get("data_end_date") or phase in V2_STAGES:
+        return phase
+    if phase == "watch":
+        return "unknown" if p.get("gmv_growth_pct") is None else "peaking"
+    return _V1_TO_V2.get(phase, phase)
+
+
+def present_product(p: dict) -> dict:
+    """API view of a tiktok_products row: v2 stage name, plus the real per-day revenue so the UI
+    does not have to show a 1-day window multiplied by 7 as "7-day" revenue."""
+    out = dict(p)
+    out["trend_phase"] = product_stage(p)
+    w = p.get("window_days")
+    rev = p.get("revenue_window")
+    try:
+        out["revenue_per_day"] = round(float(rev) / float(w), 2) if rev is not None and w else None
+    except (TypeError, ValueError):
+        out["revenue_per_day"] = None
+    out["gmv_7d_estimated"] = bool(w) and isinstance(w, (int, float)) and 0 < w < 7
+    return out
+
+
+def present_products(rows) -> list:
+    return [present_product(r) for r in rows or []]
+
+
+def _stage_query_values(stage: str) -> list:
+    """DB values that can hold this (v2 or v1) stage name."""
+    stage = stage.strip().lower()
+    back = {"emerging": ["emerging", "hot"], "saturated": ["saturated", "pass"],
+            "peaking": ["peaking", "watch"], "unknown": ["unknown", "watch"],
+            "hot": ["hot", "emerging"], "pass": ["pass", "saturated"],
+            "watch": ["watch", "peaking", "unknown"]}
+    return back.get(stage, [stage])
+
+
+# Paid catalogue pages and /stats are the same for every caller and only change on an import:
+# cache them briefly per process (cleared after an admin import).
+LIST_CACHE_SECONDS = int(os.getenv("LIST_CACHE_SECONDS", "120"))
+_LIST_CACHE_MAX = 512
+
+
+def _cached(key, loader, ttl: int):
+    now = time.time()
+    with _free_cache_lock:
+        hit = _free_cache.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    val = loader()
+    with _free_cache_lock:
+        if len(_free_cache) >= _LIST_CACHE_MAX:
+            _free_cache.clear()
+        _free_cache[key] = (now, val)
+    return val
+
+
+def clear_list_caches() -> None:
+    with _free_cache_lock:
+        _free_cache.clear()
+
+
+def _order_products(q):
+    # Ties are common (FastMoss scores top out at 70, nine products share it): break them by
+    # revenue, then id, so pages are stable and the free top 10 is the 10 biggest sellers.
+    return (q.order("virality_score", desc=True)
+             .order("gmv_7d", desc=True, nullsfirst=False)
+             .order("id"))
+
+
 def free_top_products() -> list:
-    return _cached_top("products", lambda: (
-        supabase.table("tiktok_products").select("*")
-        .eq("is_active", True)
-        .order("virality_score", desc=True).order("id")
-        .limit(FREE_PRODUCT_LIMIT).execute().data))
+    return present_products(_cached_top("products", lambda: (
+        _order_products(supabase.table("tiktok_products").select("*")
+                        .eq("is_active", True))
+        .limit(FREE_PRODUCT_LIMIT).execute().data)))
 
 
 def free_top_product_ids() -> set:
@@ -341,35 +422,38 @@ def get_products(
             return {"success": True, "count": len(rows), "offset": 0, "limit": FREE_PRODUCT_LIMIT,
                     "plan": plan, "products": rows}
 
-        query = (
-            supabase.table("tiktok_products")
-            .select("*")
-            .eq("is_active", True)
-            .gte("virality_score", min_score)
-            .lte("virality_score", max_score)
-            .order("virality_score", desc=True)
-            .order("id")                      # stable tiebreaker: many products share a score
-            .range(offset, offset + limit - 1)
-        )
+        def load():
+            query = (
+                supabase.table("tiktok_products")
+                .select("*")
+                .eq("is_active", True)
+                .gte("virality_score", min_score)
+                .lte("virality_score", max_score)
+            )
+            if trend_phase:
+                query = query.in_("trend_phase", _stage_query_values(trend_phase))
+            if category:
+                query = query.ilike("category", f"%{category}%")
+            if min_price is not None:
+                query = query.gte("tiktok_price", min_price)
+            if max_price is not None:
+                query = query.lte("tiktok_price", max_price)
+            rows = present_products(_order_products(query).range(offset, offset + limit - 1).execute().data)
+            want = (trend_phase or "").strip().lower()
+            if want in V2_STAGES:   # v1 "watch" holds both peaking and unknown
+                rows = [r for r in rows if r.get("trend_phase") == want]
+            return rows
 
-        if trend_phase:
-            query = query.eq("trend_phase", trend_phase)
-        if category:
-            query = query.ilike("category", f"%{category}%")
-        if min_price is not None:
-            query = query.gte("tiktok_price", min_price)
-        if max_price is not None:
-            query = query.lte("tiktok_price", max_price)
-
-        result = query.execute()
+        key = ("paid-products", min_score, max_score, trend_phase, category, min_price, max_price, limit, offset)
+        rows = _cached(key, load, LIST_CACHE_SECONDS)
 
         return {
             "success":  True,
-            "count":    len(result.data),
+            "count":    len(rows),
             "offset":   offset,
             "limit":    limit,
             "plan":     plan,
-            "products": result.data
+            "products": rows
         }
 
     except Exception:
@@ -393,6 +477,7 @@ def get_product(product_id: str, request: Request, api_key: str = Security(verif
             supabase.table("tiktok_products")
             .select("*")
             .eq("id", pid)
+            .eq("is_active", True)            # retired (hidden March) rows are not in the catalogue
             .limit(1)
             .execute()
         ).data
@@ -401,7 +486,7 @@ def get_product(product_id: str, request: Request, api_key: str = Security(verif
         # Suppliers are NOT returned here: they cost a credit via /products/{id}/suppliers/{platform}.
         return {
             "success": True,
-            "product": rows[0]
+            "product": present_product(rows[0])
         }
 
     except HTTPException:
@@ -422,7 +507,7 @@ def get_products_by_tier(
     offset:  int = Query(default=0,  ge=0),
     api_key: str = Security(verify_api_key),
 ):
-    tier_ranges = {
+    tier_ranges = {           # (min inclusive, max inclusive); queried as >= min and < next floor
         "hot":    (80, 100),
         "rising": (65, 79),
         "watch":  (50, 64),
@@ -439,20 +524,22 @@ def get_products_by_tier(
     plan = get_user_plan(request)
 
     try:
+        upper = max_score + 1            # exclusive bound, so a 79.5 score is not lost between tiers
         if not is_paid(plan):
-            rows = free_top_products()
+            # Still only the fixed top 10, but only the ones really in this tier (was: the whole
+            # top 10 returned under every tier label, e.g. score-70 rows as "hot 80-100").
+            rows = [r for r in free_top_products()
+                    if min_score <= float(r.get("virality_score") or 0) < upper]
         else:
-            rows = (
-                supabase.table("tiktok_products")
-                .select("*")
-                .eq("is_active", True)
-                .gte("virality_score", min_score)
-                .lte("virality_score", max_score)
-                .order("virality_score", desc=True)
-                .order("id")                  # stable tiebreaker for paging
+            rows = _cached(("tier", tier, limit, offset), lambda: present_products(
+                _order_products(
+                    supabase.table("tiktok_products")
+                    .select("*")
+                    .eq("is_active", True)
+                    .gte("virality_score", min_score)
+                    .lt("virality_score", upper))
                 .range(offset, offset + limit - 1)
-                .execute()
-            ).data
+                .execute().data), LIST_CACHE_SECONDS)
 
         return {
             "success":  True,
@@ -473,43 +560,60 @@ def get_products_by_tier(
 @limiter.limit(LIST_LIMIT, key_func=ip_key)
 def get_stats(request: Request, api_key: str = Security(verify_api_key)):
     try:
-        # Exact counts (PostgREST caps a plain select at max-rows, default 1000).
-        def n(lo=None, below=None):
-            def build():
-                q = supabase.table("tiktok_products").select("id", count="exact").eq("is_active", True)
-                if lo is not None:
-                    q = q.gte("virality_score", lo)
-                if below is not None:
-                    q = q.lt("virality_score", below)
-                return q
-            return count_exact(build)
-
-        total  = n()
-        hot    = n(80)
-        rising = n(65, 80)
-        watch  = n(50, 65)
-
-        rows = fetch_all(lambda: supabase.table("tiktok_products").select("id, category")
-                         .eq("is_active", True).order("id"))
-        categories = {}
-        for p in rows:
-            cat = p.get("category") or "Other"
-            categories[cat] = categories.get(cat, 0) + 1
-        top_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:5]
-
-        return {
-            "success": True,
-            "stats": {
-                "total_products": total,
-                "hot":            hot,
-                "rising":         rising,
-                "watch":          watch,
-                "top_categories": [{"name": k, "count": v} for k, v in top_categories]
-            }
-        }
-
+        return _cached("stats", _load_stats, LIST_CACHE_SECONDS)
     except Exception:
         raise server_error("/stats")
+
+
+def _load_stats() -> dict:
+    # Exact counts (PostgREST caps a plain select at max-rows, default 1000).
+    def n(lo=None, below=None):
+        def build():
+            q = supabase.table("tiktok_products").select("id", count="exact").eq("is_active", True)
+            if lo is not None:
+                q = q.gte("virality_score", lo)
+            if below is not None:
+                q = q.lt("virality_score", below)
+            return q
+        return count_exact(build)
+
+    total  = n()
+    hot    = n(80)
+    rising = n(65, 80)
+    watch  = n(50, 65)
+
+    rows = fetch_all(lambda: supabase.table("tiktok_products")
+                     .select("id, category, trend_phase, gmv_growth_pct, data_end_date, window_days")
+                     .eq("is_active", True).order("id"))
+    categories = {}
+    stages = {s: 0 for s in V2_STAGES}
+    end_dates, windows = set(), set()
+    for p in rows:
+        cat = p.get("category") or "Other"
+        categories[cat] = categories.get(cat, 0) + 1
+        st = product_stage(p) or "unknown"
+        stages[st] = stages.get(st, 0) + 1
+        if p.get("data_end_date"):
+            end_dates.add(str(p["data_end_date"])[:10])
+        if p.get("window_days"):
+            windows.add(p["window_days"])
+    top_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    return {
+        "success": True,
+        "stats": {
+            "total_products": total,
+            # score buckets (labelled "Score 80+" etc. in the UI)
+            "hot":            hot,
+            "rising":         rising,
+            "watch":          watch,
+            # life-cycle stages, v2 names, active rows only
+            "stages":         stages,
+            "data_end_date":  max(end_dates) if end_dates else None,
+            "window_days":    sorted(windows)[0] if len(windows) == 1 else (sorted(windows) or None),
+            "top_categories": [{"name": k, "count": v} for k, v in top_categories]
+        }
+    }
 
 
 # ==============================================================================
@@ -630,21 +734,22 @@ def search_products(
             return {"success": True, "query": q, "count": len(rows), "plan": plan, "products": rows}
 
         result = (
-            supabase.table("tiktok_products")
-            .select("*")
-            .eq("is_active", True)
-            .ilike("product_name", f"%{q}%")
-            .order("virality_score", desc=True)
-            .order("id")                      # stable tiebreaker for paging
+            _order_products(
+                supabase.table("tiktok_products")
+                .select("*")
+                .eq("is_active", True)
+                .ilike("product_name", f"%{q}%"))
             .range(offset, offset + limit - 1)
             .execute()
         )
+        rows = present_products(result.data)
 
         return {
             "success":  True,
             "query":    q,
-            "count":    len(result.data),
-            "products": result.data
+            "count":    len(rows),
+            "plan":     plan,
+            "products": rows
         }
 
     except Exception:
@@ -791,13 +896,17 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
         raise HTTPException(status_code=404, detail="Product not found")
     rows = (
         supabase.table("tiktok_products")
-        .select("id, product_name, tiktok_price, thumbnail_url, image_storage_url")
+        .select("id, product_name, tiktok_price, thumbnail_url, image_storage_url, is_active")
         .eq("id", pid).limit(1).execute().data
     )
     if not rows:
         raise HTTPException(status_code=404, detail="Product not found")
     product = rows[0]
     product_id = pid
+    # Retired products (the 728 hidden March rows still have ~3.9k supplier rows) are out of the
+    # catalogue: nobody starts paying for them. A user who already unlocked one keeps it, free.
+    if product.get("is_active") is False and not _safe_is_unlocked(user_email, product_id, platform):
+        raise HTTPException(status_code=404, detail="Product not found")
 
     # Free plan: suppliers only for the fixed top 10 (audit S3). Checked before any charge.
     # A product the user already unlocked (e.g. it left the top 10 since) stays free to reopen.
@@ -1592,7 +1701,8 @@ def get_shops(
 
         res = supabase.table("shops")\
                 .select("*", count="exact")\
-                .order(order_col, desc=True)\
+                .order(order_col, desc=True, nullsfirst=False)\
+                .order("id")\
                 .range(offset, offset + limit - 1)\
                 .execute()
         return {
@@ -1602,8 +1712,8 @@ def get_shops(
             "offset": offset
         }
     except Exception:
-        logger.exception("/shops failed")
-        return {"shops": [], "error": "Shops are temporarily unavailable"}
+        # Was a 200 with an empty list, so the page said "no shops" during an outage.
+        raise server_error("/shops")
 
 # ─── Get Creators ─────────────────────────────────────────────────
 @app.get("/creators")
@@ -1628,8 +1738,7 @@ def get_creators(
         res = query.order(order_col, desc=True, nullsfirst=False).range(offset, offset + limit - 1).execute()
         return {"creators": res.data or [], "plan": plan}
     except Exception:
-        logger.exception("/creators failed")
-        return {"creators": [], "error": "Creators are temporarily unavailable"}
+        raise server_error("/creators")
 
 # ================================================================
 # /api/jobs — real jobs from Remotive + Adzuna
@@ -2235,17 +2344,26 @@ def _run_import(job: dict, files: list, dry_run: bool, rehost: bool, deactivate:
             summary["products"] = _kalo.import_products(groups["products"], dry_run, rehost, deactivate, log=log)
         if groups["creators"]:
             log(f"== Creators ({len(groups['creators'])} file(s))")
-            _kalo.import_creators(groups["creators"], dry_run, log=log)
+            summary["creators"] = _kalo.import_creators(groups["creators"], dry_run, log=log)
         if groups["shops"]:
             log(f"== Shops ({len(groups['shops'])} file(s))")
-            _kalo.import_shops(groups["shops"], dry_run, log=log)
+            summary["shops"] = _kalo.import_shops(groups["shops"], dry_run, log=log)
         job["summary"] = summary
+        # Skipped columns, v1 stage fallback, images not copied...: the import worked but the UI
+        # must not show a plain green "done" (2026-11-12/13 drift was only visible in the log).
+        job["warnings"] = [w for part in summary.values() if isinstance(part, dict)
+                           for w in (part.get("warnings") or [])]
         job["status"] = "done"
     except Exception as e:
         job["status"] = "failed"
-        job["error"] = type(e).__name__
+        # the reason, not just "APIError" (admin-only endpoint; the full text is in the log too)
+        job["error"] = f"{type(e).__name__}: {str(e)[:200]}"
         log(f"Stopped: {type(e).__name__}: {str(e)[:300]}")
+        if not dry_run:
+            log("Some rows may already be written (snapshots are saved first). Fix the error and run it again; it's safe to repeat.")
     finally:
+        if not dry_run:
+            clear_list_caches()          # also after a failure: snapshots / some batches may be written
         job["finished_at"] = _now()
         _shutil.rmtree(job["dir"], ignore_errors=True)
         if not dry_run and _IMPORT_LOCK.locked():
@@ -2344,8 +2462,13 @@ async def admin_import(
         _IMPORT_JOBS[job["id"]] = job
         for old in sorted(_IMPORT_JOBS, key=lambda j: _IMPORT_JOBS[j]["started_at"])[:-10]:
             _IMPORT_JOBS.pop(old, None)
+        try:
+            _threading.Thread(target=_run_import, args=(job, saved, False, rehost, deactivate), daemon=True).start()
+        except BaseException:
+            _IMPORT_JOBS.pop(job["id"], None)
+            _IMPORT_LOCK.release()           # else every later import is 409 until a restart
+            raise
         handed_off = True
-        _threading.Thread(target=_run_import, args=(job, saved, False, rehost, deactivate), daemon=True).start()
         return {k: v for k, v in job.items() if k != "dir"}
     finally:
         await form.close()
@@ -2393,6 +2516,9 @@ def admin_sourcing_run(body: SourcingRun, request: Request, user=Depends(resolve
     admin = require_admin_user(request)
     if body.mode not in ("new", "all"):
         raise HTTPException(status_code=400, detail="mode must be new or all")
+    if _IMPORT_LOCK.locked():
+        # "new" picks products that have no suppliers yet: started mid-import it misses the rest
+        raise HTTPException(status_code=409, detail="An import is still running. Start Find suppliers when it's done.")
     max_req = max(10, min(int(body.max_requests), 5000))
     url = f"https://api.github.com/repos/{_GH_REPO}/actions/workflows/{_GH_WORKFLOW}/dispatches"
     payload = {"ref": _GH_REF, "inputs": {"mode": body.mode, "max_requests": str(max_req),

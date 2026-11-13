@@ -23,7 +23,7 @@ from urllib.parse import quote
 import httpx
 
 from . import parse
-from .oxylabs import Budget, scrape
+from .oxylabs import Budget, OxylabsError, scrape
 
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
@@ -33,12 +33,18 @@ UA = {
 SIGN_URL = "https://open-s.alibaba.com/openservice/ossUploadSecretKeyDataService?appKey=a5m1ismomeptugvfmkkjnwwqnwyrhpb1&appName=magellan"
 
 
+class MarketplaceBlocked(RuntimeError):
+    """The marketplace answered with a challenge / empty shell instead of a result list.
+    NOT a 'no match': the product keeps its old suppliers and is retried next run."""
+
+
 def _rand(k: int) -> str:
     return "".join(random.choices(string.ascii_letters, k=k))
 
 
-def alibaba_upload(photo: bytes) -> str:
-    """Upload exactly like alibaba.com's camera button does. Returns the imageAddress key."""
+def alibaba_upload(photo: bytes, with_host: bool = False):
+    """Signed OSS upload (open-s, free, works from datacenter IPs). Returns the imageAddress key,
+    or (host, key) with with_host=True."""
     sign = httpx.get(SIGN_URL, headers=UA, timeout=20).json().get("data") or {}
     for k in ("host", "policy", "accessid", "signature", "imagePath"):
         if not sign.get(k):
@@ -53,7 +59,7 @@ def alibaba_upload(photo: bytes) -> str:
     r = httpx.post(sign["host"], files=files, headers=UA, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"alibaba upload failed: HTTP {r.status_code}")
-    return key
+    return (sign["host"].rstrip("/"), key) if with_host else key
 
 
 def _alibaba_from_html(html: str) -> list[dict]:
@@ -89,28 +95,107 @@ def _as_jpeg(photo: bytes) -> bytes:
         return photo
 
 
+def _site_jpeg(photo: bytes) -> bytes:
+    """Exactly what alibaba.com's search bar uploads: white background, longer side 500 px, JPEG q80.
+    The detected object regions are in this image's pixels, so both calls must use it."""
+    import io
+    from PIL import Image
+    try:
+        im = Image.open(io.BytesIO(photo))
+        im = im.convert("RGBA")
+        canvas = Image.new("RGB", im.size, "white")
+        canvas.paste(im, mask=im.split()[-1])
+        canvas.thumbnail((500, 500))
+        buf = io.BytesIO()
+        canvas.save(buf, "JPEG", quality=80)
+        return buf.getvalue()
+    except Exception:
+        return _as_jpeg(photo)
+
+
+ITS_API = "https://www.alibaba.com/search/api/imageTextSearch"
+
+
+def _json_from(text: str) -> dict:
+    """JSON body, also when a scraper wrapped it in <html><pre>...</pre>."""
+    import html as _html
+    try:
+        return json.loads(text)
+    except Exception:
+        i = text.find("{")
+        j = text.rfind("}")
+        if i < 0 or j <= i:
+            return {}
+        try:
+            return json.loads(_html.unescape(text[i : j + 1]))
+        except Exception:
+            return {}
+
+
+def _get_direct(url: str) -> str | None:
+    """Plain GET with a browser TLS fingerprint when curl_cffi is installed (Akamai blocks
+    python's default fingerprint), else httpx. None when blocked."""
+    hdr = {"Referer": "https://www.alibaba.com/", "Accept": "application/json, text/plain, */*",
+           "Accept-Language": "en-US,en;q=0.9"}
+    try:
+        try:
+            from curl_cffi import requests as cr
+            r = cr.get(url, headers=hdr, impersonate="chrome", timeout=30)
+        except ImportError:
+            r = httpx.get(url, headers={**UA, **hdr}, timeout=30)
+        if r.status_code == 200 and '"success"' in r.text[:200]:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
 def alibaba_by_image(photo: bytes, budget: Budget) -> list[dict]:
-    """Alibaba's own image-search JSON API (the one its results page calls). Free; Oxylabs only if blocked."""
-    key = alibaba_upload(_as_jpeg(photo))
+    """Alibaba photo search that returns the SAME list as alibaba.com's camera button
+    (verified 2026-11-13: identical order to the site's results page).
+
+    1. upload the 500 px image (free)
+    2. imageSearchViewService (free) -> the object regions Alibaba detects in it
+    3. /search/api/imageTextSearch with imagePath + the first two regions = the site's own list.
+       Direct first; through Oxylabs (1 paid result) when Akamai blocks this IP.
+    If step 3 fails entirely, the step-2 list is used (older image-only ranking, close but not identical)."""
+    img = _site_jpeg(photo)
+    host, key = alibaba_upload(img, with_host=True)
     # appKey below is Alibaba's PUBLIC web client id (sent by every browser on alibaba.com), not a secret.
     params = {"appName": "magellan", "appKey": "a5m1ismomeptugvfmkkjnwwqnwyrhpb1", "imageType": "oss",  # gitleaks:allow
               "imageAddress": "/" + key, "beginPage": 1, "pageSize": 40, "language": "en_US"}
-    data = None
+    view = {}
     try:
-        r = httpx.get(IMG_SEARCH_API, params=params, headers=UA, timeout=30)
-        j = r.json()
+        j = httpx.get(IMG_SEARCH_API, params=params, headers=UA, timeout=30).json()
         if "SUCCESS" in " ".join(j.get("ret") or []):
-            data = j.get("data") or {}
+            view = j.get("data") or {}
     except Exception:
         pass
-    if data is None:  # rate-limited / challenge: same request through Oxylabs (1 paid result)
-        url = str(httpx.URL(IMG_SEARCH_API, params=params))
-        raw = scrape({"source": "universal", "url": url, "geo_location": "United States"}, budget)
+    regions = [r for r in (view.get("regions") or []) if isinstance(r, str)][:2]
+    if not regions and view.get("region"):
+        regions = [view["region"]]
+
+    its_url = str(httpx.URL(ITS_API, params={
+        "imagePath": f"{host}/{key}", "regions": json.dumps(regions, separators=(",", ":")),
+        "tab": "all", "from": "pcHomeContent"}))
+    text = _get_direct(its_url)
+    if text is None:
         try:
-            data = json.loads(raw).get("data") or {}
+            text = scrape({"source": "universal", "url": its_url, "geo_location": "United States"}, budget)
+        except OxylabsError:
+            raise
         except Exception:
-            data = {}
-    return parse.alibaba_offers([data.get("offers") or []])
+            text = None
+    if text:
+        model = (_json_from(text).get("model") or {})
+        offers = parse.alibaba_its_offers(model.get("offers") or [])
+        if offers:
+            return offers
+    if view.get("offers"):
+        return parse.alibaba_offers([view.get("offers") or []])
+    if not view and not text:
+        raise MarketplaceBlocked("Alibaba image search did not answer")
+    return []
 
 
 def alibaba_by_text(keyword: str, budget: Budget) -> list[dict]:
@@ -154,13 +239,18 @@ def aliexpress_upload(photo: bytes) -> str:
     import base64
     params = {"platform": "pc", "page": 1, "pageSize": 60, "isNewImageSearch": True, "osf": "pc_web_image_search",
               "clientType": "pc", "searchBizScene": "imageSearch", "subScenario": "imageUpload",
-              "image_base64": base64.b64encode(_as_jpeg(photo)).decode(), "shpt_co": "US", "_currency": "USD",
-              "sortType": "default", "sortOrder": "default", "contentType": "imageUpload", "lang": "en",
+              "image_base64": base64.b64encode(_as_jpeg(photo)).decode(), "shpt_co": "US", "shipToCountry": "US",
+              "currency": "USD", "_currency": "USD", "x-appKey": int(AE_MTOP_KEY), "DEBUG_": False,
+              "sortType": "default", "sortOrder": "default", "contentType": "imageUpload", "lang": "en_US",
               "locale": "en_US"}
     data = json.dumps({"appId": 21738, "params": json.dumps(params)}, separators=(",", ":"))
     with httpx.Client(follow_redirects=True, cookies=AE_COOKIES) as c:
         j = _ae_mtop(c, data)                      # 1st call only hands out the session token
-        if "TOKEN" in " ".join(j.get("ret") or []):
+        for _ in range(2):                         # token handout, or a transient FAIL_SYS_* from the gateway
+            ret = " ".join(j.get("ret") or [])
+            if (j.get("data") or {}).get("fileId") or not ("TOKEN" in ret or "FAIL_SYS" in ret or "FAILSYS" in ret):
+                break
+            time.sleep(1.5)
             j = _ae_mtop(c, data)
     d = j.get("data") or {}
     if not d.get("fileId"):
@@ -168,22 +258,65 @@ def aliexpress_upload(photo: bytes) -> str:
     return d["fileId"]
 
 
-def aliexpress_by_image(photo: bytes, budget: Budget) -> list[dict]:
-    """AliExpress photo search: upload (free), then read the results page directly; Oxylabs only if blocked."""
-    file_id = aliexpress_upload(photo)
-    url = "https://www.aliexpress.com/w/wholesale-.html?isNewImageSearch=y&filename=" + quote(file_id, safe="")
-    html = ""
+def _ae_debug(html: str, why: str) -> None:
+    import os
+    d = os.getenv("SOURCING_DEBUG_DIR", "sourcing_debug")
     try:
-        r = httpx.get(url, headers={**UA, "Accept-Language": "en-US"}, cookies=AE_COOKIES,
-                      follow_redirects=True, timeout=40)
-        html = r.text if r.status_code == 200 else ""
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"aliexpress_{int(time.time() * 1000)}.html"), "w", encoding="utf-8") as f:
+            f.write(f"<!-- {why} -->\n" + (html or ""))
     except Exception:
         pass
-    offers = parse.aliexpress_offers(parse.json_blobs_from_html(html)) if html else []
-    if not offers:   # challenge page / blocked: same page through Oxylabs (1 paid result)
-        html = scrape({"source": "universal", "url": url, "render": "html", "geo_location": "United States"}, budget)
-        offers = parse.aliexpress_offers(parse.json_blobs_from_html(html))
-    return offers
+
+
+def _ae_page_offers(html: str) -> list[dict]:
+    """Result cards from the server-rendered results page (window._dida_config_ ... "itemList").
+    Raises MarketplaceBlocked when the page is a challenge or has no result block at all."""
+    if not html:
+        raise MarketplaceBlocked("AliExpress results page empty")
+    if "_____tmd_____" in html or "punish" in html[:5000] or "x5secdata" in html:
+        _ae_debug(html, "challenge")
+        raise MarketplaceBlocked(f"AliExpress challenge page ({len(html)} bytes)")
+    offers = parse.aliexpress_offers(parse.aliexpress_init_data(html) + parse.json_blobs_from_html(html))
+    if offers:
+        return offers
+    if '"itemList"' in html and '"content":[]' in html.replace(" ", ""):
+        return []                       # a real, empty result list
+    _ae_debug(html, "no itemList")
+    title = (re.search(r"<title>(.*?)</title>", html, re.S | re.I) or [None, ""])[1].strip()[:60]
+    raise MarketplaceBlocked(f"AliExpress page had no result list ({len(html)} bytes, title '{title}')")
+
+
+def aliexpress_by_image(photo: bytes, budget: Budget) -> list[dict]:
+    """AliExpress photo search, exactly like its camera button: upload (free) -> fileId, then the
+    results page /w/wholesale-.html?isNewImageSearch=y&filename=<fileId>&imageId=<ms>, which is
+    server-rendered with the 60 cards embedded. Direct first; Oxylabs only if blocked."""
+    file_id = aliexpress_upload(photo)
+    stamp = int(time.time() * 1000)
+    q = "/w/wholesale-.html?isNewImageSearch=y&filename=" + quote(file_id, safe="") + f"&imageId={stamp}"
+    # www.aliexpress.com (global site, ship-to US, USD) serves the results page server-rendered with the
+    # 60 cards between /*!-->init-data-start--*/ markers (~550 KB). aliexpress.us returned a ~220 KB
+    # JavaScript-only shell with no cards (laptop run 2026-11-13), so it is not used.
+    url = "https://www.aliexpress.com" + q
+    last = None
+    try:
+        r = httpx.get(url, headers={**UA, "Referer": "https://www.aliexpress.com/", "Accept-Language": "en-US,en;q=0.9",
+                                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                      cookies=AE_COOKIES, follow_redirects=True, timeout=40)
+        if r.status_code == 200:
+            return _ae_page_offers(r.text)
+    except MarketplaceBlocked as e:
+        last = e
+    except Exception:
+        pass
+    # blocked from this IP: same page through Oxylabs (1 paid result), no JavaScript rendering
+    try:
+        html = scrape({"source": "universal", "url": url, "geo_location": "United States"}, budget)
+    except OxylabsError:
+        if last:
+            raise last
+        raise
+    return _ae_page_offers(html)
 
 
 def keyword_from_title(title: str, words: int = 6) -> str:
