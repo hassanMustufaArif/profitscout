@@ -81,7 +81,7 @@ def top_raw(offers: list[dict], tiktok_price: float, keep: int) -> list[dict]:
     drop welcome-deal prices, prices with no margin left, and duplicate listings."""
     seen, out = set(), []
     for o in offers:
-        if o.get("welcome_deal") or not o.get("price_min"):
+        if not o.get("price_min"):     # welcome-deal rows are priced at their normal price in parse
             continue
         # Keep the platform's order: its top hits are the closest look-alikes. Only drop prices
         # at or above the TikTok price (no margin at all). The old 70% cut skipped exact matches.

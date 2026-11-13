@@ -8,10 +8,9 @@ Users never trigger a search; the app only reads the saved suppliers.
   python -m sourcing.presource --product <id>        # one product, prints what it found
   python -m sourcing.presource --new --dry-run       # list what would be sourced, spend nothing
 
-Per product and platform (Oxylabs Web Scraper API, ~1 paid result per step):
-  Alibaba:    photo search -> if no photo match, text search
-  AliExpress: text search (keyword from the title, no AI)
-Every candidate is checked against the TikTok photo with CLIP + pHash; only real look-alikes are saved.
+Per product and platform (matching off, the default): photo search only, the same list a person
+gets from the camera button on alibaba.com / aliexpress.us. Top 3 in the site's order are saved.
+Oxylabs is only used when a site blocks the direct request (about 1 paid result then).
 
 Cost guard: --max-requests (default 300) stops the run before it can overspend.
 Typical cost: 1-2 results per product per platform, about $0.003-0.005 per product for both.
@@ -117,6 +116,10 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
                 save_suppliers(sb, product["id"], platform, best, method)
             _save_review(product["id"], platform, near_all)
             return {"status": "done", "method": method, "count": len(best), "tried": tried, "review": len(near_all)}
+    if not answered:
+        # Blocked / challenge page / no Oxylabs: NOT a "no match". Old rows stay, and the
+        # product is picked up again by the next run (failed jobs are not counted as sourced).
+        return {"status": "failed", "error": "; ".join(tried) or "search did not answer"}
     if config.MATCHING:
         _save_review(product["id"], platform, near_all)
     elif answered:            # only when the search really ran; a block keeps the old rows

@@ -7,3 +7,4 @@ imagehash==4.3.1
 open_clip_torch==2.26.1
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.8.0   # >=2.6 for CVE-2025-32434; works with open_clip_torch 2.26.1 (torch>=1.9)
+curl_cffi>=0.7        # browser TLS fingerprint for alibaba.com's own photo-search list (optional)

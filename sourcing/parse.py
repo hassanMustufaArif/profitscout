@@ -114,6 +114,9 @@ def aliexpress_offers(blobs: list) -> list[dict]:
             # 85%+ off = new-user welcome deal (not a real cost). Coupon pricing: prefer the pre-coupon price.
             welcome = (_f(sale.get("discount")) or 0) >= 85
             if welcome or prices.get("builderType") == "skuCoupon":
+                # New-user prices (e.g. $1.09, -85%) are not what a repeat buyer pays: use the
+                # pre-discount price as the cost. These rows are KEPT (dropping them dropped
+                # almost every AliExpress result, 2026-11-13).
                 pmin = _f(orig.get("minPrice")) or (None if welcome else _f(sale.get("minPrice")))
             else:
                 pmin = _f(sale.get("minPrice")) or _f(orig.get("minPrice"))
@@ -195,6 +198,51 @@ def alibaba_offers(blobs: list) -> list[dict]:
                     "welcome_deal": False,
                 }
             )
+    return out
+
+
+def alibaba_its_offers(raw: list) -> list[dict]:
+    """alibaba.com/search/api/imageTextSearch `model.offers` (the site's own photo-search list),
+    in page order. Shape verified 2026-11-13: productId, title, price "$0.45-2.65",
+    moq "Min. order: 12 pieces", productUrl "//...", multiImage [..], companyName, goldSupplierYears."""
+    import html as _html
+    out, seen = [], set()
+    for d in raw or []:
+        if not isinstance(d, dict):
+            continue
+        pid = str(d.get("productId") or "").strip()
+        url = _abs(d.get("productUrl"))
+        if not pid and url:
+            m = re.search(r"_(\d{8,})\.html", url)
+            pid = m.group(1) if m else ""
+        title = _html.unescape(re.sub(r"<[^>]+>", "", str(d.get("title") or ""))).strip()
+        nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", str(d.get("price") or "").replace(",", ""))]
+        if not pid or not title or not nums or pid in seen:
+            continue
+        seen.add(pid)
+        if url:
+            url = url.split("?")[0]
+        imgs = d.get("multiImage") or []
+        img = imgs[0] if isinstance(imgs, list) and imgs else d.get("mainImage")
+        if isinstance(img, dict):
+            img = img.get("url") or img.get("normal")
+        moq = re.search(r"([\d,]+)", str(d.get("moq") or ""))
+        out.append({
+            "platform": "alibaba",
+            "product_id": pid,
+            "title": title[:300],
+            "price_min": round(min(nums), 2),
+            "price_max": round(max(nums), 2),
+            "moq": int(moq.group(1).replace(",", "")) if moq else 1,
+            "url": url or f"https://www.alibaba.com/product-detail/_{pid}.html",
+            "image_url": _abs(img),
+            "supplier_name": d.get("companyName") or "Alibaba supplier",
+            "supplier_years": _f(d.get("goldSupplierYears")),
+            "verified": bool(d.get("goldSupplierIcon") or d.get("verifiedSupplier")),
+            "orders": None,
+            "rating": _f(d.get("reviewScore")),
+            "welcome_deal": False,
+        })
     return out
 
 

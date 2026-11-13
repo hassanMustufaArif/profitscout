@@ -97,6 +97,9 @@ def save_candidates(sb, product_id: str, platform: str, offers: list[dict]) -> N
 def clear_auto_suppliers(sb, product_id: str, platform: str) -> None:
     """Drop the previous automatic set (never hand-approved or hidden rows). Used when a re-run
     finds no photo match, so old wrong suppliers don't stay on the product."""
+    # Every automatic row, whatever run made it ('auto', and the older 'photo' / 'text' rows):
+    # only hand-approved ('manual') and hidden rows stay. Clearing only 'auto' left old wrong
+    # keyword-search suppliers on products (audit 2026-11-13).
     (sb.table("suppliers").delete()
-     .eq("tiktok_product_id", product_id).eq("platform", platform).eq("match_method", "auto")
+     .eq("tiktok_product_id", product_id).eq("platform", platform).neq("match_method", "manual")
      .not_.is_("hidden", "true").execute())
