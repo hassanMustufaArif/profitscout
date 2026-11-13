@@ -239,13 +239,18 @@ def aliexpress_upload(photo: bytes) -> str:
     import base64
     params = {"platform": "pc", "page": 1, "pageSize": 60, "isNewImageSearch": True, "osf": "pc_web_image_search",
               "clientType": "pc", "searchBizScene": "imageSearch", "subScenario": "imageUpload",
-              "image_base64": base64.b64encode(_as_jpeg(photo)).decode(), "shpt_co": "US", "_currency": "USD",
-              "sortType": "default", "sortOrder": "default", "contentType": "imageUpload", "lang": "en",
+              "image_base64": base64.b64encode(_as_jpeg(photo)).decode(), "shpt_co": "US", "shipToCountry": "US",
+              "currency": "USD", "_currency": "USD", "x-appKey": int(AE_MTOP_KEY), "DEBUG_": False,
+              "sortType": "default", "sortOrder": "default", "contentType": "imageUpload", "lang": "en_US",
               "locale": "en_US"}
     data = json.dumps({"appId": 21738, "params": json.dumps(params)}, separators=(",", ":"))
     with httpx.Client(follow_redirects=True, cookies=AE_COOKIES) as c:
         j = _ae_mtop(c, data)                      # 1st call only hands out the session token
-        if "TOKEN" in " ".join(j.get("ret") or []):
+        for _ in range(2):                         # token handout, or a transient FAIL_SYS_* from the gateway
+            ret = " ".join(j.get("ret") or [])
+            if (j.get("data") or {}).get("fileId") or not ("TOKEN" in ret or "FAIL_SYS" in ret or "FAILSYS" in ret):
+                break
+            time.sleep(1.5)
             j = _ae_mtop(c, data)
     d = j.get("data") or {}
     if not d.get("fileId"):
@@ -272,7 +277,7 @@ def _ae_page_offers(html: str) -> list[dict]:
     if "_____tmd_____" in html or "punish" in html[:5000] or "x5secdata" in html:
         _ae_debug(html, "challenge")
         raise MarketplaceBlocked(f"AliExpress challenge page ({len(html)} bytes)")
-    offers = parse.aliexpress_offers(parse.json_blobs_from_html(html))
+    offers = parse.aliexpress_offers(parse.aliexpress_init_data(html) + parse.json_blobs_from_html(html))
     if offers:
         return offers
     if '"itemList"' in html and '"content":[]' in html.replace(" ", ""):
@@ -287,19 +292,30 @@ def aliexpress_by_image(photo: bytes, budget: Budget) -> list[dict]:
     results page /w/wholesale-.html?isNewImageSearch=y&filename=<fileId>&imageId=<ms>, which is
     server-rendered with the 60 cards embedded. Direct first; Oxylabs only if blocked."""
     file_id = aliexpress_upload(photo)
-    url = ("https://www.aliexpress.us/w/wholesale-.html?isNewImageSearch=y&filename=" + quote(file_id, safe="")
-           + f"&imageId={int(time.time() * 1000)}")
+    stamp = int(time.time() * 1000)
+    q = "/w/wholesale-.html?isNewImageSearch=y&filename=" + quote(file_id, safe="") + f"&imageId={stamp}"
+    # www.aliexpress.com (global site, ship-to US, USD) serves the results page server-rendered with the
+    # 60 cards between /*!-->init-data-start--*/ markers (~550 KB). aliexpress.us returned a ~220 KB
+    # JavaScript-only shell with no cards (laptop run 2026-11-13), so it is not used.
+    url = "https://www.aliexpress.com" + q
+    last = None
     try:
-        r = httpx.get(url, headers={**UA, "Origin": "https://www.aliexpress.us", "Referer": "https://www.aliexpress.us/",
-                                    "Accept-Language": "en-US"},
+        r = httpx.get(url, headers={**UA, "Referer": "https://www.aliexpress.com/", "Accept-Language": "en-US,en;q=0.9",
+                                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
                       cookies=AE_COOKIES, follow_redirects=True, timeout=40)
         if r.status_code == 200:
             return _ae_page_offers(r.text)
+    except MarketplaceBlocked as e:
+        last = e
     except Exception:
         pass
-    # blocked from this IP: same page through Oxylabs (1 paid result). The page is server-rendered,
-    # so no JavaScript rendering is needed (JS rendering rewrote the page and lost the data).
-    html = scrape({"source": "universal", "url": url, "geo_location": "United States"}, budget)
+    # blocked from this IP: same page through Oxylabs (1 paid result), no JavaScript rendering
+    try:
+        html = scrape({"source": "universal", "url": url, "geo_location": "United States"}, budget)
+    except OxylabsError:
+        if last:
+            raise last
+        raise
     return _ae_page_offers(html)
 
 

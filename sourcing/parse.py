@@ -47,6 +47,26 @@ def _walk(obj: Any) -> Iterable[dict]:
             stack.extend(reversed(cur))
 
 
+def aliexpress_init_data(html: str) -> list:
+    """AliExpress results page: the data sits between /*!-->init-data-start--*/ and
+    /*!-->init-data-end--*/ as a JavaScript object `= { data: {...} }` (key `data` unquoted)."""
+    a, b = "/*!-->init-data-start--*/", "/*!-->init-data-end--*/"
+    if a not in html or b not in html:
+        return []
+    block = html.split(a, 1)[1].split(b, 1)[0]
+    i = block.find("data:")
+    if i < 0:
+        i = block.find('"data":')
+    start = block.find("{", i)
+    if i < 0 or start < 0:
+        return []
+    chunk = _balanced(block, start)
+    try:
+        return [json.loads(chunk)] if chunk else []
+    except Exception:
+        return []
+
+
 def json_blobs_from_html(html: str) -> list:
     """Embedded JSON: window._dida_config_, window.runParams, __INIT_DATA__, etc."""
     blobs = []
