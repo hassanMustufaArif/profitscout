@@ -485,13 +485,33 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
             p["image_storage_url"] = rehost_image(sb, p["tiktok_product_id"], p["thumbnail_url"])
         records.append(p)
 
+    # Write only the columns the live table has (2026-11-13: prod had no live_revenue / video_revenue,
+    # so every upsert failed and the dashboard kept the March data). Missing ones are logged.
+    try:
+        sample = sb.table("tiktok_products").select("*").limit(1).execute().data or []
+    except Exception:
+        sample = []
+    if sample and records:
+        have = set(sample[0])
+        missing = sorted({k for r in records for k in r} - have)
+        if missing:
+            log(f"  skipping columns the table doesn't have: {', '.join(missing)}")
+            records = [{k: v for k, v in r.items() if k in have} for r in records]
+
     for i in range(0, len(records), BATCH):
         batch = records[i:i + BATCH]
         try:
             sb.table("tiktok_products").upsert(batch, on_conflict="tiktok_product_id").execute()
         except Exception as e:
             # creator_count still NOT NULL (migration 20261111_launch_day.sql not run): store 0 as before.
-            if "creator_count" in str(e) and ("23502" in str(e) or "null value" in str(e).lower()):
+            if "trend_phase_check" in str(e):
+                # old DB check only allows the v1 stage names; the UI shows both sets
+                log("  DB still has the old trend_phase check; writing v1 stage names (drop tiktok_products_trend_phase_check to keep v2 names)")
+                v1 = {"emerging": "hot", "rising": "rising", "peaking": "watch", "saturated": "pass", "unknown": "watch"}
+                batch = [dict(r, trend_phase=v1.get(r.get("trend_phase"), "watch"),
+                              creator_count=r["creator_count"] if r.get("creator_count") is not None else 0) for r in batch]
+                sb.table("tiktok_products").upsert(batch, on_conflict="tiktok_product_id").execute()
+            elif "creator_count" in str(e) and ("23502" in str(e) or "null value" in str(e).lower()):
                 log("  creator_count is NOT NULL in the DB; writing 0 (run 20261111_launch_day.sql)")
                 batch = [dict(r, creator_count=r["creator_count"] if r["creator_count"] is not None else 0) for r in batch]
                 sb.table("tiktok_products").upsert(batch, on_conflict="tiktok_product_id").execute()
