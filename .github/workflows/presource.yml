@@ -44,6 +44,8 @@ jobs:
       SOURCING_REVIEW_MIN_SIMILARITY: ${{ vars.SOURCING_REVIEW_MIN_SIMILARITY || '0.60' }}
       SOURCING_MATCHING: ${{ vars.SOURCING_MATCHING || 'off' }}
       SOURCING_KEEP_TOP: ${{ vars.SOURCING_KEEP_TOP || '3' }}
+      SOURCING_WORKERS: '1'           # one product at a time (user, 2026-11-14)
+      SOURCING_AE_CONCURRENCY: '1'
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1

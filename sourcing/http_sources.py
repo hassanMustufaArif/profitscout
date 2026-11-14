@@ -67,7 +67,7 @@ def scrape(payload: dict, budget: Budget) -> str:
 # AliExpress started refusing the image-upload call when 8 workers hit it at once from one runner IP
 # (the sequential 2026-11-12 run sourced 561 AliExpress products; the 8-worker 2026-11-14 run got
 # non-JSON answers). Keep AliExpress calls to a few at a time, with a short gap.
-_AE_SLOTS = threading.BoundedSemaphore(max(1, int(os.getenv("SOURCING_AE_CONCURRENCY", "2"))))
+_AE_SLOTS = threading.BoundedSemaphore(max(1, int(os.getenv("SOURCING_AE_CONCURRENCY", "1"))))
 _AE_GAP_SECONDS = float(os.getenv("SOURCING_AE_GAP_SECONDS", "1.5"))
 
 

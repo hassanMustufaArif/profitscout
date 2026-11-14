@@ -212,8 +212,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-requests", type=int, default=300, help="hard cap on paid Oxylabs results this run")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--workers", type=int, default=int(os.getenv("SOURCING_WORKERS", "8")),
-                    help="products sourced at the same time (default 8)")
+    ap.add_argument("--workers", type=int, default=int(os.getenv("SOURCING_WORKERS", "1")),
+                    help="products sourced at the same time (default 1: one at a time)")
     ap.add_argument("--allow-no-oxylabs", action="store_true",
                     help="run without OXYLABS_WEB_API_KEY (free direct searches only)")
     a = ap.parse_args()
